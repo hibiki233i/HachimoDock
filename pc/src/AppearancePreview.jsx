@@ -13,7 +13,7 @@ function useResolvedPreviewUrl(media) {
   const [assetFailed, setAssetFailed] = useState(false);
   const [blobUrl, setBlobUrl] = useState("");
   const [blobFailed, setBlobFailed] = useState(false);
-  const key = `${media?.kind || ""}:${media?.src || ""}:${media?.path || ""}`;
+  const key = `${media?.kind || ""}:${media?.src || ""}:${media?.path || ""}:${media?.revision || ""}`;
   const preferLocalBlob = Boolean(media?.kind === "image" && media?.path);
 
   useEffect(() => {
@@ -44,7 +44,7 @@ function useResolvedPreviewUrl(media) {
       cancelled = true;
       if (created) URL.revokeObjectURL(created);
     };
-  }, [assetFailed, media?.mime, media?.path, media?.src, preferLocalBlob]);
+  }, [assetFailed, media?.mime, media?.path, media?.src, media?.revision, preferLocalBlob]);
 
   return {
     url: preferLocalBlob && !blobFailed ? blobUrl : assetFailed ? blobUrl : media?.src || blobUrl,
@@ -110,7 +110,7 @@ export default function AppearancePreview({ media, className, emptyClassName, pl
   const videoRef = useRef(null);
   const { url, assetFailed, blobFailed, preferLocalBlob, markAssetFailed } = useResolvedPreviewUrl(media);
   const fallbackMedia = media?.fallback;
-  const mediaKey = `${media?.kind || ""}:${media?.src || ""}:${media?.path || ""}`;
+  const mediaKey = `${media?.kind || ""}:${media?.src || ""}:${media?.path || ""}:${media?.revision || ""}`;
   const shouldPlay = usePreviewPlaybackAllowed(
     videoRef,
     playing && media?.kind === "video" && Boolean(url),
@@ -147,6 +147,7 @@ export default function AppearancePreview({ media, className, emptyClassName, pl
   if (media?.kind === "video" && url) {
     return (
       <video
+        key={mediaKey}
         ref={videoRef}
         className={className}
         src={url}

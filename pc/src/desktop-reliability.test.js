@@ -61,9 +61,13 @@ test("API configured badges count persisted values, not unsaved input", () => {
 
 test("async credential persistence cannot admit duplicate single-state generations", () => {
   const source=read("./AppearanceDetail.jsx");
-  assert.match(source,/singleSubmitting.current \|\| singleStateStatus/);
-  assert.ok(source.indexOf("singleSubmitting.current = true") < source.indexOf("await persistSingleStateProviderConfig()"));
-  assert.match(source,/finally \{\s*singleSubmitting.current = false;\s*setExitReason\(exitId,""\)/);
+  const generation = source.slice(source.indexOf("const handleSingleStateGenerate"), source.indexOf("const handleSyncSingleStateToDevice"));
+  assert.match(generation, /singleSubmitting.current \|\| operationBusy/);
+  assert.match(source, /operationBusy = [^;]*singleStateStatus === "generating"/);
+  assert.ok(generation.indexOf("if (!beginOperation()) return") < generation.indexOf("singleSubmitting.current = true"));
+  assert.ok(generation.indexOf("singleSubmitting.current = true") < generation.indexOf("await persistSingleStateProviderConfig()"));
+  assert.match(generation, /catch \(error\) \{[\s\S]*?singleSubmitting.current = false;\s*endOperation\(\);/);
+  assert.match(generation, /finally \{\s*singleSubmitting.current = false;\s*endOperation\(\);\s*setExitReason\(exitId,""\)/);
   const wizard=read("./CustomAvatarWizard.jsx");
   assert.ok(wizard.indexOf("if (!mountedRef.current)") < wizard.indexOf("startGenerationTask({"));
 });

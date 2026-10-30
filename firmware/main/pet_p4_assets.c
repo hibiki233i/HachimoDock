@@ -11,7 +11,6 @@
 #define PET_P4_ASSET_DEFAULT_HEIGHT 480
 #define PET_P4_ASSET_DEFAULT_FPS 10
 #define PET_P4_ASSET_MAX_JPEG_BYTES (512 * 1024)
-#define PET_P4_ASSET_MAX_STREAM_BYTES (4 * 1024 * 1024)
 
 static bool family_is_selftest(const char *family, const char *path) {
   return (family && strstr(family, "selftest")) || (path && strstr(path, "selftest"));
@@ -398,7 +397,7 @@ bool pet_p4_asset_catalog_parse(pet_p4_asset_catalog_t *catalog, const char *man
       for (uint16_t frame = 0; frame < entry->frames; frame += 1) {
         stream_bytes += entry->frame_sizes[frame];
       }
-      if (stream_bytes == 0 || stream_bytes > UINT32_MAX) goto parse_failed;
+      if (stream_bytes == 0 || stream_bytes > PET_P4_ASSET_MAX_STREAM_BYTES) goto parse_failed;
       entry->stream_bytes = (uint32_t) stream_bytes;
     }
     if (entry->fps == 0) entry->fps = parsed->fps;

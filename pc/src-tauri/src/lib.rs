@@ -10,7 +10,8 @@
  *          current-followed-Agent daily Token telemetry, SSH state fallback, and
  *          active speech sync plus immediate reconnect replay, a P4 host
  *          heartbeat, and verified USB binding refresh, built-in
- *          appearance default/override WAV cue sync plus P4 cached-slot reuse,
+ *          appearance default/override WAV cue sync, P4 quality inspection and
+ *          forced rebuild plus cached-slot reuse,
  *          persistent USB transfer diagnostics, and serialized, exact-board
  *          native-only appearance attempts,
  *          USB desktop identity propagation,
@@ -6773,6 +6774,22 @@ fn builtin_terrier_has_audio_overrides(local_dir: &Path) -> Result<bool, String>
     }
 }
 
+fn read_builtin_video_overrides(local_dir: &Path, base: &Path) -> Result<HashMap<String, String>, String> {
+    let path = local_dir.join("video-overrides.json");
+    let overrides: HashMap<String, String> = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| "内置形象视频设置损坏，请重新保存。".to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => return Err(format!("无法读取内置形象视频设置: {error}")),
+    };
+    for (family, relative) in &overrides {
+        let expected = format!("custom-appearances/builtin-terrier/video-overrides/{family}.mp4");
+        if family.is_empty() || family.contains('/') || family.contains('\\') || *relative != expected || !base.join(relative).is_file() {
+            return Err(format!("内置形象 {family} 的替换视频无效或不存在，请重新上传。"));
+        }
+    }
+    Ok(overrides)
+}
+
 fn ensure_builtin_terrier_source(
     app_local_data_dir: &Path,
     clips_dir: &Path,
@@ -6790,11 +6807,18 @@ fn ensure_builtin_terrier_source(
     let videos_dir = appearance_dir.join("videos");
     fs::create_dir_all(&videos_dir)
         .map_err(|error| format!("create built-in appearance directory failed: {error}"))?;
-    let audio_overrides: HashMap<String, String> =
-        fs::read_to_string(appearance_dir.join("audio-overrides.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+    let audio_overrides: HashMap<String, String> = match fs::read(appearance_dir.join("audio-overrides.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| "内置形象音效设置损坏，请重新保存。".to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => return Err(format!("无法读取内置形象音效设置: {error}")),
+    };
+    for (family, relative) in &audio_overrides {
+        let expected = format!("custom-appearances/builtin-terrier/audio-overrides/{family}.wav");
+        if family.is_empty() || family.contains('/') || family.contains('\\') || *relative != expected || !app_local_data_dir.join(relative).is_file() {
+            return Err(format!("内置形象 {family} 的音效无效或不存在，请重新上传。"));
+        }
+    }
+    let video_overrides = read_builtin_video_overrides(&appearance_dir, app_local_data_dir)?;
     let mut entries = fs::read_dir(clips_dir)
         .map_err(|error| format!("read built-in appearance resources failed: {error}"))?
         .filter_map(Result::ok)
@@ -6827,7 +6851,7 @@ fn ensure_builtin_terrier_source(
         let mut family_entry = serde_json::json!({
             "family": family.clone(),
             "ok": true,
-            "videoPath": format!("custom-appearances/builtin-terrier/videos/{name}"),
+            "videoPath": video_overrides.get(&family).cloned().unwrap_or_else(|| format!("custom-appearances/builtin-terrier/videos/{name}")),
         });
         let audio_override = audio_overrides
             .get(&family)
@@ -6852,6 +6876,18 @@ fn ensure_builtin_terrier_source(
         }
         families.push(family_entry);
     }
+    let mut override_families: Vec<_> = video_overrides.iter().collect();
+    override_families.sort_by(|a, b| a.0.cmp(b.0));
+    for (family, relative) in override_families {
+        if !families.iter().any(|entry| entry["family"] == *family) {
+            let mut entry = serde_json::json!({"family": family, "ok": true, "videoPath": relative});
+            if let Some(audio) = audio_overrides.get(family) {
+                entry["audioPath"] = serde_json::json!(audio);
+                entry["audioSource"] = serde_json::json!("custom");
+            }
+            families.push(entry);
+        }
+    }
     if families.is_empty() {
         return Err("built-in appearance contains no MP4 videos".to_string());
     }
@@ -6869,9 +6905,34 @@ fn ensure_builtin_terrier_source(
     Ok(appearance_dir)
 }
 
+fn with_builtin_pending_reset<T>(
+    dir: &Path,
+    settings: Option<usb_serial::P4AppearanceSettings>,
+    prepare: impl FnOnce(Option<usb_serial::P4AppearanceSettings>, bool) -> Result<T, String>,
+) -> Result<T, String> {
+    let marker = dir.join("factory-settings-reset");
+    let pending = marker.is_file();
+    let explicit = settings.is_some();
+    let effective = if pending && !explicit { Some(usb_serial::P4AppearanceSettings::default()) } else { settings };
+    let result = prepare(effective, pending || explicit)?;
+    if explicit {
+        fs::write(dir.join("custom-p4-settings"), b"1").map_err(|e| e.to_string())?;
+    }
+    if pending { fs::remove_file(marker).map_err(|e| e.to_string())?; }
+    Ok(result)
+}
+
+fn prepare_builtin_p4(dir: &Path, base: &Path, settings: Option<usb_serial::P4AppearanceSettings>) -> Result<usb_serial::PreparedP4Appearance, String> {
+    with_builtin_pending_reset(dir, settings, |settings, force| {
+        if force { usb_serial::rebuild_p4_appearance(dir, base, settings.expect("forced settings")) }
+        else { usb_serial::prepare_p4_appearance(dir, base) }
+    })
+}
+
 fn prepare_p4_appearance_by_id(
     app_handle: &tauri::AppHandle,
     appearance_id: &str,
+    settings: Option<usb_serial::P4AppearanceSettings>,
 ) -> Result<usb_serial::PreparedP4Appearance, String> {
     let appearance_id = validate_appearance_id(appearance_id)?;
     let app_local_data_dir = app_handle
@@ -6891,7 +6952,14 @@ fn prepare_p4_appearance_by_id(
             .join(appearance_id);
         dir
     };
-    usb_serial::prepare_p4_appearance(&appearance_dir, &app_local_data_dir)
+    if appearance_id == "builtin-terrier" {
+        prepare_builtin_p4(&appearance_dir, &app_local_data_dir, settings)
+    } else {
+        match settings {
+            Some(settings) => usb_serial::rebuild_p4_appearance(&appearance_dir, &app_local_data_dir, settings),
+            None => usb_serial::prepare_p4_appearance(&appearance_dir, &app_local_data_dir),
+        }
+    }
 }
 
 #[tauri::command]
@@ -6900,10 +6968,30 @@ async fn prepare_p4_appearance(
     appearance_id: String,
 ) -> Result<usb_serial::PreparedP4Appearance, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        prepare_p4_appearance_by_id(&app_handle, &appearance_id)
+        prepare_p4_appearance_by_id(&app_handle, &appearance_id, None)
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn rebuild_p4_appearance(
+    app_handle: tauri::AppHandle, appearance_id: String, settings: usb_serial::P4AppearanceSettings,
+) -> Result<usb_serial::PreparedP4Appearance, String> {
+    tauri::async_runtime::spawn_blocking(move || prepare_p4_appearance_by_id(&app_handle, &appearance_id, Some(settings)))
+        .await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn inspect_p4_appearance(
+    app_handle: tauri::AppHandle, appearance_id: String,
+) -> Result<usb_serial::PreparedP4Appearance, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let id = validate_appearance_id(&appearance_id)?;
+        let base = app_handle.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let dir = base.join("custom-appearances").join(id);
+        usb_serial::inspect_prepared_p4_appearance(&dir)
+    }).await.map_err(|error| error.to_string())?
 }
 
 fn start_p4_ready_migration(app_handle: tauri::AppHandle) {
@@ -7014,15 +7102,14 @@ async fn usb_sync_appearance(
         let local_dir = app_local_data_dir
             .join("custom-appearances")
             .join("builtin-terrier");
-        let has_overrides = builtin_terrier_has_audio_overrides(&local_dir)?;
+        let has_overrides = builtin_terrier_has_audio_overrides(&local_dir)?
+            || !read_builtin_video_overrides(&local_dir, &app_local_data_dir)?.is_empty()
+            || local_dir.join("custom-p4-settings").is_file();
         match sync_runtime {
-            UsbAppearanceSyncRuntime::EspP4
-                if has_overrides && usb_serial::inspect_prepared_p4_appearance(&local_dir).is_ok() =>
-            {
-                local_dir
-            }
             UsbAppearanceSyncRuntime::EspP4 if has_overrides => {
-                return Err("专属音效素材尚未准备好，请重新保存音效后再切换。".into());
+                ensure_builtin_terrier_source(&app_local_data_dir, &clips_dir, false)?;
+                prepare_builtin_p4(&local_dir, &app_local_data_dir, None)?;
+                local_dir
             }
             UsbAppearanceSyncRuntime::EspP4 => clips_dir.clone(),
             UsbAppearanceSyncRuntime::Linux => {
@@ -10325,6 +10412,8 @@ pub fn run() {
             usb_update_firmware,
             usb_update_bundled_firmware,
             prepare_p4_appearance,
+            rebuild_p4_appearance,
+            inspect_p4_appearance,
             usb_cancel_appearance_sync,
             usb_sync_appearance,
             resolve_builtin_clawpkg_path,
@@ -12331,6 +12420,69 @@ mod tests {
         assert!(!builtin_terrier_has_audio_overrides(tmp.path()).unwrap());
         fs::write(&path, "broken").unwrap();
         assert!(builtin_terrier_has_audio_overrides(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn builtin_pending_factory_reset_survives_failure_and_retries_with_standard_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("factory-settings-reset");
+        fs::write(&marker, b"1").unwrap();
+        let failed = with_builtin_pending_reset(temp.path(), None, |settings, force| {
+            assert!(force);
+            assert_eq!(settings.unwrap().quality, "standard");
+            Err::<(), String>("encoding failed".into())
+        });
+        assert!(failed.is_err());
+        assert!(marker.exists());
+        let result = with_builtin_pending_reset(temp.path(), None, |settings, force| {
+            assert!(force);
+            assert_eq!(settings.unwrap().quality, "standard");
+            Ok::<_, String>(())
+        });
+        assert!(result.is_ok());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn builtin_added_family_order_is_stable_across_repeated_manifest_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clips = tmp.path().join("clips");
+        let local = tmp.path().join("custom-appearances/builtin-terrier");
+        fs::create_dir_all(&clips).unwrap();
+        fs::create_dir_all(local.join("video-overrides")).unwrap();
+        fs::write(clips.join("idle.mp4"), b"factory").unwrap();
+        for family in ["zeta", "alpha", "middle", "beta"] {
+            fs::write(local.join(format!("video-overrides/{family}.mp4")), b"custom").unwrap();
+        }
+        fs::write(local.join("video-overrides.json"), r#"{"zeta":"custom-appearances/builtin-terrier/video-overrides/zeta.mp4","alpha":"custom-appearances/builtin-terrier/video-overrides/alpha.mp4","middle":"custom-appearances/builtin-terrier/video-overrides/middle.mp4","beta":"custom-appearances/builtin-terrier/video-overrides/beta.mp4"}"#).unwrap();
+        let mut previous = None;
+        for _ in 0..32 {
+            ensure_builtin_terrier_source(tmp.path(), &clips, false).unwrap();
+            let bytes = fs::read(local.join("manifest.json")).unwrap();
+            let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let families: Vec<_> = manifest["families"].as_array().unwrap().iter().map(|x| x["family"].as_str().unwrap()).collect();
+            assert_eq!(families, ["idle", "alpha", "beta", "middle", "zeta"]);
+            if let Some(ref prior) = previous { assert_eq!(prior, &bytes); }
+            previous = Some(bytes);
+        }
+    }
+
+    #[test]
+    fn builtin_video_overrides_preserve_factory_and_add_new_families() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clips = tmp.path().join("clips");
+        let local = tmp.path().join("custom-appearances/builtin-terrier");
+        fs::create_dir_all(&clips).unwrap();
+        fs::create_dir_all(local.join("video-overrides")).unwrap();
+        fs::write(clips.join("idle.mp4"), b"factory").unwrap();
+        fs::write(local.join("video-overrides/working.mp4"), b"custom").unwrap();
+        fs::write(local.join("video-overrides.json"), r#"{"working":"custom-appearances/builtin-terrier/video-overrides/working.mp4"}"#).unwrap();
+        ensure_builtin_terrier_source(tmp.path(), &clips, false).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(local.join("manifest.json")).unwrap()).unwrap();
+        assert!(manifest["families"].as_array().unwrap().iter().any(|f| f["family"] == "working" && f["videoPath"].as_str().unwrap().contains("video-overrides")));
+        assert_eq!(fs::read(clips.join("idle.mp4")).unwrap(), b"factory");
+        fs::remove_file(local.join("video-overrides/working.mp4")).unwrap();
+        assert!(ensure_builtin_terrier_source(tmp.path(), &clips, false).is_err());
     }
 
     #[cfg(target_os = "macos")]

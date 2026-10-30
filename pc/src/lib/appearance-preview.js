@@ -37,6 +37,7 @@ export function mediaFromFamily(family, record) {
     kind: "video",
     src: family.videoSrc || "",
     path: family.videoPath || "",
+    ...(family.videoRevision ? { revision: family.videoRevision } : {}),
     mime: "video/mp4",
     label: family.family || "Video preview",
     fallback: mediaFromSourcePreview(record) || mediaFromSourceImage(record),

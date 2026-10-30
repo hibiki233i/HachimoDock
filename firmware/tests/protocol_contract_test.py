@@ -1536,7 +1536,7 @@ def test_p4_mjpeg_prefers_hardware_decoder_with_software_fallback():
     assert "using TJPGD fallback" in renderer
 
 
-def test_p4_h264_uses_the_v9_single_slice_full_duration_aspect_fit_contract():
+def test_p4_h264_uses_v10_quality_and_single_slice_full_duration_aspect_fit_contract():
     renderer = read("main/pet_p4_renderer.c")
     cmake = read("main/CMakeLists.txt")
     component = read("main/idf_component.yml")
@@ -1548,8 +1548,11 @@ def test_p4_h264_uses_the_v9_single_slice_full_duration_aspect_fit_contract():
     assert "P4_APPEARANCE_HEIGHT: u32 = 480" in desktop
     assert "P4_APPEARANCE_FPS: u32 = 15" in desktop
     assert "P4_APPEARANCE_MAX_FRAMES: u32 = 225" in desktop
-    assert "P4_APPEARANCE_H264_CRF: u32 = 27" in desktop
-    assert "P4_READY_PROFILE_VERSION: u32 = 9" in desktop
+    assert "P4_READY_PROFILE_VERSION: u32 = 10" in desktop
+    assert 'v9-640x480-15fps-225f-h264-crf27' in desktop
+    assert 'settings.bitrates_kbps.get(name)' in desktop
+    assert 'scaler == "nearest"' in desktop
+    assert 'codex-row-' in desktop
     assert '"p4-h264-v1"' in desktop
     assert '"annex-b"' in desktop
     assert "force_original_aspect_ratio=decrease" in desktop
@@ -2494,7 +2497,7 @@ if __name__ == "__main__":
         test_p4_runtime_renders_pet_frames_to_lcd,
         test_p4_behavior_rotates_native_families_without_per_frame_manifest_parsing,
         test_p4_mjpeg_prefers_hardware_decoder_with_software_fallback,
-        test_p4_h264_uses_the_v9_single_slice_full_duration_aspect_fit_contract,
+        test_p4_h264_uses_v10_quality_and_single_slice_full_duration_aspect_fit_contract,
         test_saved_and_codex_imported_appearances_are_prepared_before_sync,
         test_p4_15fps_h264_assets_use_rgb565_and_ppa_render_scheduler,
         test_p4_rgb565_output_uses_matching_rgb_panel_order,

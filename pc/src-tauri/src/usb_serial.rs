@@ -5,7 +5,8 @@
  *          reusable port handles, verified-rate reconnect caching and
  *          lifecycle-updated status snapshots during bulk writes;
  *          persistent prebuilt P4 H.264 Annex-B/WAV ready packs plus
- *          LGPL-safe VideoToolbox/Media Foundation custom-media encoding with
+ *          budgeted VideoToolbox/Media Foundation encoding directly from
+ *          original community atlas crops or saved video, settings-aware cache,
  *          native-SPS structural and full-decode validation, plus paced
  *          4 Mbaud JSON control frames plus the hardware-proven 8KiB raw
  *          chunks and 64-byte macOS CH343 drain pacing,
@@ -214,10 +215,11 @@ const P4_APPEARANCE_WIDTH: u32 = 640;
 const P4_APPEARANCE_HEIGHT: u32 = 480;
 const P4_APPEARANCE_FPS: u32 = 15;
 const P4_APPEARANCE_MAX_FRAMES: u32 = 225;
-const P4_APPEARANCE_H264_CRF: u32 = 27;
 const P4_READY_DIR_NAME: &str = "p4-ready";
-const P4_READY_PROFILE_VERSION: u32 = 9;
+const P4_READY_PROFILE_VERSION: u32 = 10;
 const P4_APPEARANCE_AUDIO_MAX_BYTES: usize = 1024 * 1024;
+const P4_APPEARANCE_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
+const P4_APPEARANCE_SLOT_MAX_BYTES: u64 = 10_481_664;
 // Keep the logical raw chunk bounded so each checksum/ACK retry stays cheap.
 // The physical CH343 write must still be paced below because this link has no
 // RTS/CTS and silently drops bytes when macOS queues one large write.
@@ -5196,6 +5198,20 @@ pub struct PreparedP4Appearance {
     pub pack_id: String,
     pub file_count: u32,
     pub byte_count: u64,
+    pub settings: P4AppearanceSettings,
+    pub actual_bitrates_kbps: std::collections::BTreeMap<String, u32>,
+    pub slot_limit_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct P4AppearanceSettings {
+    pub quality: String,
+    pub scaler: String,
+    pub bitrates_kbps: std::collections::BTreeMap<String, u32>,
+}
+impl Default for P4AppearanceSettings {
+    fn default() -> Self { Self { quality: "standard".into(), scaler: "smooth".into(), bitrates_kbps: Default::default() } }
 }
 
 fn p4_ready_profile_id() -> &'static str {
@@ -5203,13 +5219,12 @@ fn p4_ready_profile_id() -> &'static str {
     PROFILE
         .get_or_init(|| {
             format!(
-                "v{}-{}x{}-{}fps-{}f-h264-crf{}",
+                "v{}-{}x{}-{}fps-{}f-h264",
                 P4_READY_PROFILE_VERSION,
                 P4_APPEARANCE_WIDTH,
                 P4_APPEARANCE_HEIGHT,
                 P4_APPEARANCE_FPS,
-                P4_APPEARANCE_MAX_FRAMES,
-                P4_APPEARANCE_H264_CRF
+                P4_APPEARANCE_MAX_FRAMES
             )
         })
         .as_str()
@@ -5221,9 +5236,10 @@ fn p4_ready_prepare_lock() -> &'static Mutex<()> {
 }
 
 fn p4_ready_profile_root(appearance_dir: &Path) -> PathBuf {
-    appearance_dir
-        .join(P4_READY_DIR_NAME)
-        .join(p4_ready_profile_id())
+    let ready = appearance_dir.join(P4_READY_DIR_NAME);
+    let current = ready.join(p4_ready_profile_id());
+    let factory = ready.join("v9-640x480-15fps-225f-h264-crf27");
+    if appearance_dir.file_name().is_some_and(|name| name == "terrier-clips") && !current.exists() && factory.is_dir() { factory } else { current }
 }
 
 fn p4_ready_asset_path(profile_root: &Path, device_path: &str) -> Result<PathBuf, String> {
@@ -5254,14 +5270,23 @@ fn prepared_p4_summary(
                 )
             })?
             .len();
+        if asset.kind == "p4-manifest" && size >= 65_536 {
+            return Err("P4 manifest exceeds firmware capacity; use fewer actions".to_string());
+        }
         Ok::<u64, String>(total.saturating_add(size))
     })?;
+    if byte_count > P4_APPEARANCE_SLOT_MAX_BYTES {
+        return Err("P4 appearance exceeds slot storage; use standard or lower bitrate, or shorter/simpler content".to_string());
+    }
     Ok(PreparedP4Appearance {
         profile: p4_ready_profile_id().to_string(),
         pack_id,
         file_count: u32::try_from(assets.len())
             .map_err(|_| "P4 ready pack contains too many files".to_string())?,
         byte_count,
+        settings: P4AppearanceSettings::default(),
+        actual_bitrates_kbps: Default::default(),
+        slot_limit_bytes: P4_APPEARANCE_SLOT_MAX_BYTES,
     })
 }
 
@@ -5424,7 +5449,16 @@ fn load_p4_pack_from_profile_root(
             "P4 ready pack checksum mismatch: manifest={pack_id} computed={computed_pack_id}"
         ));
     }
-    let summary = prepared_p4_summary(&assets, pack_id)?;
+    let mut summary = prepared_p4_summary(&assets, pack_id)?;
+    if profile_root.file_name().is_some_and(|name| name == "v9-640x480-15fps-225f-h264-crf27") {
+        summary.profile = "v9-640x480-15fps-225f-h264-crf27".to_string();
+    }
+    if let Ok(bytes) = std::fs::read(profile_root.join("settings.json")) {
+        summary.settings = serde_json::from_slice(&bytes).map_err(|error| format!("invalid P4 settings: {error}"))?;
+    }
+    if let Ok(bytes) = std::fs::read(profile_root.join("bitrates.json")) {
+        summary.actual_bitrates_kbps = serde_json::from_slice(&bytes).map_err(|error| format!("invalid P4 bitrate metadata: {error}"))?;
+    }
     Ok((assets, summary))
 }
 
@@ -5454,13 +5488,40 @@ pub fn prepared_p4_requires_system_cues(appearance_dir: &Path) -> Result<bool, S
     Ok(manifest["systemCues"] == true)
 }
 
+#[cfg(test)]
+thread_local! {
+    static P4_TEST_PREPARE_QUEUED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn prepare_p4_appearance(
     appearance_dir: &Path,
     app_data_dir: &Path,
 ) -> Result<PreparedP4Appearance, String> {
+    #[cfg(test)]
+    P4_TEST_PREPARE_QUEUED.with(|sender| {
+        if let Some(sender) = sender.borrow_mut().take() { sender.send(()).unwrap(); }
+    });
+    prepare_p4_appearance_with_settings(appearance_dir, app_data_dir, None, false)
+}
+
+pub fn rebuild_p4_appearance(
+    appearance_dir: &Path,
+    app_data_dir: &Path,
+    settings: P4AppearanceSettings,
+) -> Result<PreparedP4Appearance, String> {
+    prepare_p4_appearance_with_settings(appearance_dir, app_data_dir, Some(settings), true)
+}
+
+fn prepare_p4_appearance_with_settings(
+    appearance_dir: &Path, app_data_dir: &Path, settings: Option<P4AppearanceSettings>, force: bool,
+) -> Result<PreparedP4Appearance, String> {
     let _guard = p4_ready_prepare_lock()
         .lock()
         .map_err(|error| format!("lock P4 ready preparation failed: {error}"))?;
+    let settings = settings.unwrap_or_else(|| inspect_prepared_p4_appearance(appearance_dir).map(|value| value.settings).unwrap_or_default());
+    if !["standard", "high"].contains(&settings.quality.as_str()) || !["smooth", "nearest"].contains(&settings.scaler.as_str()) || settings.bitrates_kbps.values().any(|rate| *rate == 0 || *rate > 10_000) {
+        return Err("Invalid appearance quality, scaler, or bitrate".into());
+    }
     let manifest_path = appearance_dir.join("manifest.json");
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest_path).map_err(|error| {
@@ -5486,50 +5547,102 @@ pub fn prepare_p4_appearance(
         .tempdir_in(&ready_base)
         .map_err(|error| format!("create P4 ready staging directory failed: {error}"))?;
     let ffmpeg = crate::codex_import::resolve_ffmpeg()?;
-    stage_p4_appearance_pack_with_exporter(
-        families,
-        appearance_dir,
-        app_data_dir,
-        staging.path(),
+    let atlas_frames = tempfile::Builder::new().prefix(".atlas-").tempdir_in(&ready_base)
+        .map_err(|error| format!("create atlas frame directory failed: {error}"))?;
+    let mut export_families = families.clone();
+    if manifest["type"] == "codex-import" {
+        let atlas = appearance_dir.join("source.webp");
+        for family in &mut export_families {
+            let name = family["family"].as_str().unwrap_or("unknown").to_string();
+            if family["ok"] == true && family["taskId"].as_str().is_some_and(|id| id.starts_with("codex-row-")) {
+                if !atlas.is_file() {
+                    return Err(format!("Original atlas is missing: {}. Re-import this appearance.", atlas.display()));
+                }
+                let concat = crate::codex_import::atlas_action_concat(&atlas, &name, &atlas_frames.path().join(p4_safe_family_file_stem(&name)))?;
+                family["videoPath"] = serde_json::json!(concat);
+            }
+        }
+    }
+    let encoder = crate::codex_import::platform_h264_encoder(&ffmpeg)?;
+    let mut encoder_identity = crate::command_for_host(&ffmpeg).arg("-version").output()
+        .map_err(|e| format!("read ffmpeg identity failed: {e}"))?.stdout;
+    if Path::new(&ffmpeg).is_file() {
+        encoder_identity.extend_from_slice(p4_file_sha256_hex(Path::new(&ffmpeg))?.as_bytes());
+    }
+    let target_for = |name: &str| {
+        let default_target = if settings.quality == "high" {
+            if name.starts_with("working") || name.starts_with("idle") { 1800 } else { 1500 }
+        } else { 900 };
+        settings.bitrates_kbps.get(name).copied().unwrap_or(default_target)
+    };
+    let mut groups: HashMap<(String, u32), u64> = HashMap::new();
+    let mut inputs = Vec::new();
+    let mut audio_bytes = 0u64;
+    let mut budget_specs = Vec::new();
+    for family in &export_families {
+        if family["ok"] != true { continue; }
+        let name = family["family"].as_str().unwrap_or("unknown");
+        let input = family_video_path(family, name, appearance_dir, app_data_dir)
+            .filter(|path| path.is_file()).ok_or_else(|| format!("Original video for {name} is missing; re-import it"))?;
+        let source = if input.extension().is_some_and(|ext| ext == "txt") {
+            format!("{}:{}", p4_file_sha256_hex(&appearance_dir.join("source.webp"))?, crate::codex_import::atlas_action_identity(name)?)
+        } else { p4_file_sha256_hex(&input)? };
+        let target = target_for(name);
+        let duration = probe_video_duration_ms(&ffmpeg, &input)?;
+        groups.insert((source.clone(), target), duration);
+        let audio_path = if let Some(audio) = p4_custom_audio_path(family, name, &input, appearance_dir, app_data_dir).filter(|p| p.is_file()) {
+            let output = atlas_frames.path().join("audio").join(format!("{}.wav", p4_safe_family_file_stem(name)));
+            stage_p4_audio_cue(&audio, &output)?;
+            audio_bytes += std::fs::metadata(&output).map_err(|e| e.to_string())?.len();
+            Some(format!("p4/audio/{}.wav", p4_safe_family_file_stem(name)))
+        } else { None };
+        budget_specs.push(P4FrameSpec { family_name: name.into(), device_path: format!("p4/families/sha256-{}.h264", "0".repeat(24)), frames: 225, stream_bytes: 2_097_152, fps: 15, frame_duration_ms: u32::MAX, duration_ms: u32::MAX, audio_device_path: audio_path });
+        inputs.push((name.to_string(), source, target, duration));
+    }
+    let budget_manifest = build_p4_h264_manifest(&budget_specs, P4_APPEARANCE_WIDTH, P4_APPEARANCE_HEIGHT, P4_APPEARANCE_FPS, &"0".repeat(64));
+    let manifest_bytes = serde_json::to_vec_pretty(&budget_manifest).map_err(|e| e.to_string())?.len() as u64;
+    let video_budget = P4_APPEARANCE_SLOT_MAX_BYTES.saturating_sub(audio_bytes + manifest_bytes);
+    let expected: f64 = groups.iter().map(|((_, rate), duration)| *duration as f64 * *rate as f64 / 8.0).sum();
+    if video_budget == 0 || expected == 0.0 { return Err("Appearance exceeds storage budget; use shorter or simpler content".into()); }
+    let scale = (video_budget as f64 * 0.8 / expected).min(1.0);
+    let mut identities = HashMap::new();
+    let mut rates = HashMap::new();
+    let mut actual_rates = std::collections::BTreeMap::new();
+    for (name, source_hash, target, duration) in inputs {
+        let rate = p4_rate_with_budget(target, duration, scale);
+        if rate == 0 { return Err("Appearance exceeds storage budget; use shorter or simpler content".into()); }
+        let key = p4_export_identity(&source_hash, rate, &settings.scaler, &encoder_identity, encoder.codec_name());
+        actual_rates.insert(name.clone(), rate);
+        identities.insert(name, key.clone());
+        rates.insert(key[..24].to_string(), rate);
+    }
+    stage_p4_appearance_pack_with_identity(
+        &export_families, appearance_dir, app_data_dir, staging.path(),
         |input, output| {
-            if existing_is_valid {
-                if let Ok(relative) = output.strip_prefix(staging.path()) {
-                    let cached = final_root.join(relative);
-                    if cached.is_file() {
-                        if let Some(parent) = output.parent() {
-                            std::fs::create_dir_all(parent).map_err(|error| {
-                                format!("create cached P4 output directory failed: {error}")
-                            })?;
-                        }
-                        if std::fs::copy(&cached, output).is_ok() {
-                            if let Ok(bytes) = std::fs::read(output) {
-                                if let (Ok(stream), Ok(duration_ms)) = (
-                                    parse_p4_h264_stream(
-                                        &bytes,
-                                        P4_APPEARANCE_WIDTH,
-                                        P4_APPEARANCE_HEIGHT,
-                                    ),
-                                    probe_video_duration_ms(&ffmpeg, input),
-                                ) {
-                                    return p4_exported_stream(
-                                        duration_ms,
-                                        stream.frames,
-                                        stream.stream_bytes,
-                                    );
-                                }
-                            }
-                            let _ = std::fs::remove_file(output);
-                        }
-                    }
+            let stem = output.file_stem().and_then(|s| s.to_str()).unwrap_or("").trim_start_matches("sha256-");
+            let rate = *rates.get(stem).ok_or("missing encoder rate")?;
+            if !force && existing_is_valid {
+                let relative = output.strip_prefix(staging.path()).map_err(|e| e.to_string())?;
+                let cached = final_root.join(relative);
+                if cached.is_file() {
+                    let bytes = std::fs::read(&cached).map_err(|e| e.to_string())?;
+                    let stream = parse_p4_h264_stream(&bytes, P4_APPEARANCE_WIDTH, P4_APPEARANCE_HEIGHT)?;
+                    std::fs::write(output, &bytes).map_err(|e| e.to_string())?;
+                    return p4_exported_stream(probe_video_duration_ms(&ffmpeg, input)?, stream.frames, stream.stream_bytes);
                 }
             }
-            export_p4_h264_stream(&ffmpeg, input, output)
+            export_p4_h264_stream_with_settings(&ffmpeg, input, output, rate, &settings.scaler)
         },
+        |_, name| identities.get(name).cloned().ok_or_else(|| format!("missing source identity for {name}")),
     )?;
+    std::fs::write(staging.path().join("settings.json"), serde_json::to_vec(&settings).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("write P4 settings failed: {e}"))?;
+    std::fs::write(staging.path().join("bitrates.json"), serde_json::to_vec(&actual_rates).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("write P4 bitrate metadata failed: {e}"))?;
     let (_, prepared) = load_p4_pack_from_profile_root(staging.path())?;
 
     if let Ok((_, existing)) = load_p4_pack_from_profile_root(&final_root) {
-        if existing.pack_id == prepared.pack_id {
+        if existing.pack_id == prepared.pack_id && serde_json::to_vec(&existing.settings).ok() == serde_json::to_vec(&prepared.settings).ok() && existing.actual_bitrates_kbps == prepared.actual_bitrates_kbps {
             return Ok(existing);
         }
     }
@@ -5753,6 +5866,21 @@ fn p4_file_sha256_hex(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn p4_export_identity(source: &str, rate: u32, scaler: &str, encoder_identity: &[u8], codec: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(source.as_bytes());
+    digest.update(rate.to_le_bytes());
+    digest.update(scaler.as_bytes());
+    digest.update(encoder_identity);
+    digest.update(codec.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn p4_rate_with_budget(target: u32, duration_ms: u64, scale: f64) -> u32 {
+    let cap = (P4_APPEARANCE_STREAM_MAX_BYTES as u64 * 8 * 4 / 5 / duration_ms.max(1)).min(u64::from(u32::MAX)) as u32;
+    ((target as f64 * scale) as u32).min(cap)
+}
+
 fn p4_content_addressed_video_path(sha256: &str) -> Result<String, String> {
     let prefix = sha256
         .get(..24)
@@ -5832,8 +5960,10 @@ pub(crate) fn ffmpeg_container_duration_ms(stderr: &[u8]) -> Option<u64> {
 }
 
 fn probe_video_duration_ms(ffmpeg: &str, input: &Path) -> Result<u64, String> {
-    let output = crate::command_for_host(ffmpeg)
-        .args(["-hide_banner", "-nostdin", "-i"])
+    let mut command = crate::command_for_host(ffmpeg);
+    command.args(["-hide_banner", "-nostdin"]);
+    if input.extension().is_some_and(|ext| ext == "txt") { command.args(["-f", "concat", "-safe", "0"]); }
+    let output = command.arg("-i")
         .arg(input)
         .args([
             "-map",
@@ -5928,11 +6058,14 @@ fn build_p4_h264_ffmpeg_args(
         "-v".to_string(),
         "error".to_string(),
         "-nostdin".to_string(),
-        "-i".to_string(),
-        input.display().to_string(),
-        "-vf".to_string(),
+    ];
+    if input.extension().is_some_and(|ext| ext == "txt") {
+        args.extend(["-f".to_string(), "concat".to_string(), "-safe".to_string(), "0".to_string()]);
+    }
+    args.extend([
+        "-i".to_string(), input.display().to_string(), "-vf".to_string(),
         format!(
-            "fps={sampling_fps:.6},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+            "fps={sampling_fps:.6},scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
         ),
         "-frames:v".to_string(),
         max_frames.to_string(),
@@ -5957,7 +6090,7 @@ fn build_p4_h264_ffmpeg_args(
         "1200k".to_string(),
         "-bufsize".to_string(),
         "2400k".to_string(),
-    ];
+    ]);
     encoder.append_quality_args(&mut args);
     // Do not insert an additional AUD into Media Foundation output. The P4
     // parser below still rejects missing/invalid frame boundaries. Retain the
@@ -6037,6 +6170,9 @@ fn p4_annex_b_nals(bytes: &[u8]) -> Vec<P4AnnexBNal> {
 }
 
 fn parse_p4_h264_stream(bytes: &[u8], width: u32, height: u32) -> Result<P4H264Stream, String> {
+    if bytes.len() > P4_APPEARANCE_STREAM_MAX_BYTES {
+        return Err("P4 H.264 stream exceeds 2 MiB; use standard or lower bitrate, or shorter/simpler content".to_string());
+    }
     if width == 0 || height == 0 || width & 1 != 0 || height & 1 != 0 {
         return Err("P4 H.264 width and height must be positive even values".to_string());
     }
@@ -6294,6 +6430,7 @@ fn collect_p4_asset_pack(
     Ok(assets)
 }
 
+#[cfg(test)]
 fn stage_p4_appearance_pack_with_exporter<F>(
     families: &[serde_json::Value],
     appearance_dir: &Path,
@@ -6304,6 +6441,14 @@ fn stage_p4_appearance_pack_with_exporter<F>(
 where
     F: Fn(&Path, &Path) -> Result<P4ExportedStream, String>,
 {
+    stage_p4_appearance_pack_with_identity(families, appearance_dir, app_data_dir, staging_dir, exporter, |path, _| p4_file_sha256_hex(path))
+}
+
+fn stage_p4_appearance_pack_with_identity<F, K>(
+    families: &[serde_json::Value], appearance_dir: &Path, app_data_dir: &Path,
+    staging_dir: &Path, exporter: F, identity: K,
+) -> Result<Vec<AppearanceAssetEntry>, String>
+where F: Fn(&Path, &Path) -> Result<P4ExportedStream, String>, K: Fn(&Path, &str) -> Result<String, String> {
     let frames_dir = staging_dir.join("p4").join("families");
     std::fs::create_dir_all(&frames_dir).map_err(|e| format!("创建 P4 帧目录失败: {}", e))?;
 
@@ -6328,7 +6473,7 @@ where
             continue;
         }
 
-        let source_sha256 = p4_file_sha256_hex(&video_path)?;
+        let source_sha256 = identity(&video_path, &family_name)?;
         let (device_path, exported) =
             if let Some(shared) = shared_videos.get(&source_sha256).cloned() {
                 shared
@@ -6398,11 +6543,22 @@ fn p4_custom_audio_path(
     family_audio_path(family, family_name, video_path, appearance_dir, app_data_dir)
 }
 
+#[cfg(test)]
 fn export_p4_h264_stream(
     ffmpeg: &str,
     input: &Path,
     output: &Path,
 ) -> Result<P4ExportedStream, String> {
+    export_p4_h264_stream_with_settings(ffmpeg, input, output, 900, "smooth")
+}
+#[cfg(test)]
+static P4_TEST_EXPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn export_p4_h264_stream_with_settings(
+    ffmpeg: &str, input: &Path, output: &Path, bitrate_kbps: u32, scaler: &str,
+) -> Result<P4ExportedStream, String> {
+    #[cfg(test)]
+    P4_TEST_EXPORT_COUNT.fetch_add(1, Ordering::SeqCst);
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             format!(
@@ -6414,7 +6570,7 @@ fn export_p4_h264_stream(
     }
     let encoder = crate::codex_import::platform_h264_encoder(ffmpeg)?;
     let duration_ms = probe_video_duration_ms(ffmpeg, input)?;
-    let args = build_p4_h264_ffmpeg_args(
+    let mut args = build_p4_h264_ffmpeg_args(
         input,
         output,
         P4_APPEARANCE_WIDTH,
@@ -6423,6 +6579,12 @@ fn export_p4_h264_stream(
         P4_APPEARANCE_MAX_FRAMES,
         encoder,
     );
+    for i in 0..args.len() {
+        if args[i] == "-b:v" { args[i + 1] = format!("{bitrate_kbps}k"); }
+        if args[i] == "-maxrate" { args[i + 1] = format!("{}k", bitrate_kbps * 4 / 3); }
+        if args[i] == "-bufsize" { args[i + 1] = format!("{}k", bitrate_kbps * 8 / 3); }
+        if scaler == "nearest" && args[i].contains("flags=lanczos") { args[i] = args[i].replace("flags=lanczos", "flags=neighbor"); }
+    }
     let result = crate::command_for_host(ffmpeg)
         .args(&args)
         .output()
@@ -7878,6 +8040,169 @@ mod tests {
         assert!(parse_p4_h264_stream(&multi_slice, 640, 480)
             .unwrap_err()
             .contains("exactly one slice"));
+    }
+
+    #[test]
+    fn p4_h264_rejects_streams_over_device_limit() {
+        let mut bytes = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1e, 0, 0, 0, 1, 0x68, 0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x65];
+        bytes.resize(2 * 1024 * 1024, 0xff);
+        assert!(parse_p4_h264_stream(&bytes, 640, 480).is_ok());
+        bytes.push(0xff);
+        assert!(parse_p4_h264_stream(&bytes, 640, 480).is_err());
+    }
+
+    #[test]
+    fn p4_pack_summary_rejects_total_above_slot_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("asset");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(10_481_664).unwrap();
+        let assets = vec![AppearanceAssetEntry { family_name: "video".into(), kind: "p4-h264", source_path: path, device_path: "p4/video.h264".into() }];
+        assert!(prepared_p4_summary(&assets, "test".into()).is_ok());
+        file.set_len(10_481_665).unwrap();
+        assert!(prepared_p4_summary(&assets, "test".into()).is_err());
+    }
+
+    #[test]
+    fn p4_pack_summary_rejects_manifest_too_large_for_firmware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("manifest");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(65_536).unwrap();
+        let assets = vec![AppearanceAssetEntry { family_name: "manifest".into(), kind: "p4-manifest", source_path: path, device_path: "p4/manifest.json".into() }];
+        assert!(prepared_p4_summary(&assets, "test".into()).is_err());
+    }
+
+    #[test]
+    fn p4_default_scaler_is_explicitly_smooth() {
+        let args = build_p4_h264_ffmpeg_args(Path::new("source.mp4"), Path::new("out.h264"), 640, 480, 15.0, 225, crate::codex_import::PlatformH264Encoder::VideoToolbox);
+        assert!(args.iter().any(|arg| arg.contains("flags=lanczos")));
+    }
+
+    #[test]
+    fn invalid_rebuild_settings_leave_existing_pack_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = p4_ready_profile_root(tmp.path());
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("existing");
+        std::fs::write(&marker, b"valid pack marker").unwrap();
+        let settings = P4AppearanceSettings { quality: "invalid".into(), ..Default::default() };
+        assert!(rebuild_p4_appearance(tmp.path(), tmp.path(), settings).is_err());
+        assert_eq!(std::fs::read(marker).unwrap(), b"valid pack marker");
+    }
+
+    #[test]
+    fn export_identity_tracks_source_rate_scaler_and_encoder() {
+        let first = p4_export_identity("source-a", 900, "smooth", b"ffmpeg-a", "codec-a");
+        assert_ne!(first, p4_export_identity("source-b", 900, "smooth", b"ffmpeg-a", "codec-a"));
+        assert_ne!(first, p4_export_identity("source-a", 901, "smooth", b"ffmpeg-a", "codec-a"));
+        assert_ne!(first, p4_export_identity("source-a", 900, "nearest", b"ffmpeg-a", "codec-a"));
+        assert_ne!(first, p4_export_identity("source-a", 900, "smooth", b"ffmpeg-b", "codec-a"));
+        assert_ne!(first, p4_export_identity("source-a", 900, "smooth", b"ffmpeg-a", "codec-b"));
+    }
+
+    #[test]
+    fn bitrate_budget_respects_duration_and_selected_target() {
+        assert_eq!(p4_rate_with_budget(900, 1_000, 1.0), 900);
+        assert_eq!(p4_rate_with_budget(1800, 1_000, 1.0), 1800);
+        assert_eq!(p4_rate_with_budget(1800, 1_000, 0.5), 900);
+        assert!(p4_rate_with_budget(1800, 20_000, 1.0) < 900);
+    }
+
+    #[test]
+    #[ignore = "requires audited platform FFmpeg and hardware encoder"]
+    fn p4_synthetic_atlas_encodes_directly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let atlas = tmp.path().join("source.webp");
+        image::RgbaImage::from_pixel(1536, 1872, image::Rgba([20, 80, 160, 255])).save(&atlas).unwrap();
+        let input = crate::codex_import::atlas_action_concat(&atlas, "idle.default", &tmp.path().join("frames")).unwrap();
+        let ffmpeg = crate::codex_import::resolve_ffmpeg().unwrap();
+        let exported = export_p4_h264_stream_with_settings(&ffmpeg, &input, &tmp.path().join("out.h264"), 900, "smooth").unwrap();
+        assert!(exported.frames > 0 && exported.frames <= 225);
+    }
+
+    #[test]
+    #[ignore = "requires audited platform FFmpeg and hardware encoder"]
+    fn p4_rebuild_from_atlas_tracks_settings_and_preserves_pack_on_missing_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let atlas = tmp.path().join("source.webp");
+        image::RgbaImage::from_pixel(1536, 1872, image::Rgba([20, 80, 160, 255])).save(&atlas).unwrap();
+        std::fs::write(tmp.path().join("manifest.json"), serde_json::to_vec(&serde_json::json!({"type":"codex-import", "families":[{"ok":true,"family":"idle.default","taskId":"codex-row-0","videoPath":"missing-preview.mp4"}]})).unwrap()).unwrap();
+        let first = rebuild_p4_appearance(tmp.path(), tmp.path(), P4AppearanceSettings::default()).unwrap();
+        let high = P4AppearanceSettings { quality: "high".into(), scaler: "nearest".into(), ..Default::default() };
+        let second = rebuild_p4_appearance(tmp.path(), tmp.path(), high).unwrap();
+        assert!(second.actual_bitrates_kbps["idle.default"] > first.actual_bitrates_kbps["idle.default"]);
+        assert_ne!(first.pack_id, second.pack_id);
+        std::fs::remove_file(&atlas).unwrap();
+        assert!(rebuild_p4_appearance(tmp.path(), tmp.path(), P4AppearanceSettings::default()).unwrap_err().contains("Original atlas"));
+        assert_eq!(inspect_prepared_p4_appearance(tmp.path()).unwrap().pack_id, second.pack_id);
+    }
+
+    #[test]
+    #[ignore = "requires audited platform FFmpeg and hardware encoder"]
+    fn p4_queued_prepare_reads_settings_after_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let atlas = tmp.path().join("source.webp");
+        image::RgbaImage::from_pixel(1536, 1872, image::Rgba([20, 80, 160, 255])).save(&atlas).unwrap();
+        std::fs::write(tmp.path().join("manifest.json"), serde_json::to_vec(&serde_json::json!({"type":"codex-import", "families":[{"ok":true,"family":"idle.default","taskId":"codex-row-0","videoPath":"missing-preview.mp4"}]})).unwrap()).unwrap();
+        rebuild_p4_appearance(tmp.path(), tmp.path(), P4AppearanceSettings::default()).unwrap();
+        let guard = p4_ready_prepare_lock().lock().unwrap();
+        let path = tmp.path().to_path_buf();
+        let (started, receiver) = std::sync::mpsc::channel();
+        let queued = std::thread::spawn(move || {
+            P4_TEST_PREPARE_QUEUED.with(|sender| *sender.borrow_mut() = Some(started));
+            prepare_p4_appearance(&path, &path).unwrap()
+        });
+        receiver.recv().unwrap();
+        let settings = P4AppearanceSettings { quality: "high".into(), scaler: "nearest".into(), ..Default::default() };
+        std::fs::write(p4_ready_profile_root(tmp.path()).join("settings.json"), serde_json::to_vec(&settings).unwrap()).unwrap();
+        drop(guard);
+        let result = queued.join().unwrap();
+        assert_eq!(result.settings.quality, "high");
+        assert_eq!(result.settings.scaler, "nearest");
+    }
+
+    #[test]
+    #[ignore = "requires audited platform FFmpeg and hardware encoder"]
+    fn p4_prepare_reuses_cache_invalidates_source_and_prefers_video_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let atlas = tmp.path().join("source.webp");
+        let save_atlas = |pixel| image::RgbaImage::from_pixel(1536, 1872, image::Rgba(pixel)).save(&atlas).unwrap();
+        save_atlas([20, 80, 160, 255]);
+        let manifest_path = tmp.path().join("manifest.json");
+        let mut manifest = serde_json::json!({"type":"codex-import", "families":[{"ok":true,"family":"idle.default","taskId":"codex-row-0","videoPath":"missing-preview.mp4"}]});
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let first = rebuild_p4_appearance(tmp.path(), tmp.path(), P4AppearanceSettings::default()).unwrap();
+        let count = P4_TEST_EXPORT_COUNT.load(Ordering::SeqCst);
+        let cached = prepare_p4_appearance(tmp.path(), tmp.path()).unwrap();
+        assert_eq!(cached.pack_id, first.pack_id);
+        assert_eq!(P4_TEST_EXPORT_COUNT.load(Ordering::SeqCst), count, "unchanged preparation must reuse the stream");
+        save_atlas([180, 30, 70, 255]);
+        let changed = prepare_p4_appearance(tmp.path(), tmp.path()).unwrap();
+        assert_eq!(P4_TEST_EXPORT_COUNT.load(Ordering::SeqCst), count + 1);
+        assert_ne!(changed.pack_id, first.pack_id);
+
+        // Make a real saved MP4 while leaving the atlas available. Changing the
+        // atlas after selecting the override must not invalidate the video.
+        let concat = crate::codex_import::atlas_action_concat(&atlas, "idle.default", &tmp.path().join("mp4-frames")).unwrap();
+        let ffmpeg = crate::codex_import::resolve_ffmpeg().unwrap();
+        let encoder = crate::codex_import::platform_h264_encoder(&ffmpeg).unwrap();
+        let video = tmp.path().join("override.mp4");
+        let mut args = build_p4_h264_ffmpeg_args(&concat, &video, 640, 480, 15.0, 225, encoder);
+        let format_index = args.iter().rposition(|arg| arg == "-f").unwrap();
+        args[format_index + 1] = "mp4".into();
+        let output = crate::command_for_host(&ffmpeg).args(&args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        manifest["families"][0]["taskId"] = serde_json::json!("local-upload");
+        manifest["families"][0]["videoPath"] = serde_json::json!(video);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let overridden = prepare_p4_appearance(tmp.path(), tmp.path()).unwrap();
+        assert_eq!(P4_TEST_EXPORT_COUNT.load(Ordering::SeqCst), count + 2);
+        assert_ne!(overridden.pack_id, changed.pack_id);
+        save_atlas([10, 200, 20, 255]);
+        let again = prepare_p4_appearance(tmp.path(), tmp.path()).unwrap();
+        assert_eq!(again.pack_id, overridden.pack_id);
+        assert_eq!(P4_TEST_EXPORT_COUNT.load(Ordering::SeqCst), count + 2);
     }
 
     #[test]

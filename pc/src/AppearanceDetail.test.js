@@ -260,3 +260,14 @@ test("appearance detail renders every known state so missing videos can be repla
   assert.match(source, /\{generatedFamilies\.length\}\/\{stateFamilyRecords\.length\} 个已有素材/);
   assert.match(source, /familyRecord\.ok \? "已生成" : "可上传替换"/);
 });
+
+test("deletion shares the operation gate and keeps confirmation before deletion", () => {
+  const source = readFileSync(new URL("./AppearanceDetail.jsx", import.meta.url), "utf8");
+  const handler = source.slice(source.indexOf("const handleDelete"), source.indexOf("const handleAudioFileChange"));
+  assert.match(source, /operationBusy = [^;]*deleteState === "deleting"/);
+  assert.match(handler, /if \(!record \|\| operationBusy\) return/);
+  assert.ok(handler.indexOf('deleteState !== "confirm"') < handler.indexOf('beginOperation()'));
+  assert.ok(handler.indexOf('beginOperation()') < handler.indexOf('await deleteAppearance'));
+  assert.match(handler, /finally \{\s*endOperation\(\)/);
+  assert.match(source, /onClick=\{handleDelete\}\s+disabled=\{operationBusy\}/);
+});
