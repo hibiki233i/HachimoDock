@@ -48,6 +48,7 @@ import { buildUsageHelp } from "./lib/usage-help.js";
 import PersonaVoiceModal from "./PersonaVoiceModal.jsx";
 import { useToast } from "./shell/ToastStack.jsx";
 import DeviceStatusBar from "./dashboard/DeviceStatusBar.jsx";
+import WifiLinkCard from "./dashboard/WifiLinkCard.jsx";
 import ChannelMatrixCard from "./dashboard/ChannelMatrixCard.jsx";
 import BoardButtonPanel from "./dashboard/BoardButtonPanel.jsx";
 import VoiceAssistantPanel, { buildVoiceSummary, formatVoiceSessionOption } from "./dashboard/VoiceAssistantPanel.jsx";
@@ -1249,9 +1250,11 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
   }, [applyVoiceConfigOverUsb, usb.connected, usb.runtime, voiceConfig]);
 
   useEffect(() => {
+    // Device voice is USB-only: the board would stream microphone PCM over the unencrypted WiFi link.
     if (
       !isP4Runtime
       || !usb.connected
+      || usb.transport === "wifi"
       || !p4TargetBoardDeviceId
       || buttonConfigHydratedFor !== p4TargetBoardDeviceId
       || !runtimeVoiceEnabled
@@ -1312,6 +1315,7 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     runtimeVoiceEnabled,
     sendAudioBridgeSignal,
     usb.connected,
+    usb.transport,
   ]);
 
   // ---------- Audio bridge toggle ----------
@@ -1342,7 +1346,7 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
   }, [activeVoiceTriggerId, binding.boardDeviceId, isP4Runtime, onlineBoardDeviceId, sendAudioBridgeSignal, usb.boardDeviceId]);
 
   const resumeDeviceVoiceAfterCredentialAccess = useCallback(() => {
-    if (!isP4Runtime || !runtimeVoiceEnabled || !usb.connected || !p4TargetBoardDeviceId) {
+    if (!isP4Runtime || !runtimeVoiceEnabled || !usb.connected || usb.transport === "wifi" || !p4TargetBoardDeviceId) {
       return undefined;
     }
     return toggleAudioBridge("start");
@@ -1352,6 +1356,7 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     runtimeVoiceEnabled,
     toggleAudioBridge,
     usb.connected,
+    usb.transport,
   ]);
 
   // This controller stays mounted across tabs; VoiceAssistantPanel does not.
@@ -1498,6 +1503,8 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
       <Card>
         <DeviceStatusBar />
       </Card>
+
+      <WifiLinkCard />
 
       {realtimeChat?.error && !isRecoveringAsr(realtimeChat) && <div role="alert" className="message-banner message-banner--error">
         实时对话失败：{realtimeChat.error}。详情与诊断日志见下方「实时对话」。
