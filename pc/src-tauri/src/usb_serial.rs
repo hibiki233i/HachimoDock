@@ -5622,13 +5622,14 @@ fn prepare_p4_appearance_with_settings(
             let stem = output.file_stem().and_then(|s| s.to_str()).unwrap_or("").trim_start_matches("sha256-");
             let rate = *rates.get(stem).ok_or("missing encoder rate")?;
             if !force && existing_is_valid {
-                let relative = output.strip_prefix(staging.path()).map_err(|e| e.to_string())?;
-                let cached = final_root.join(relative);
-                if cached.is_file() {
-                    let bytes = std::fs::read(&cached).map_err(|e| e.to_string())?;
-                    let stream = parse_p4_h264_stream(&bytes, P4_APPEARANCE_WIDTH, P4_APPEARANCE_HEIGHT)?;
-                    std::fs::write(output, &bytes).map_err(|e| e.to_string())?;
-                    return p4_exported_stream(probe_video_duration_ms(&ffmpeg, input)?, stream.frames, stream.stream_bytes);
+                if let Ok(relative) = output.strip_prefix(staging.path()) {
+                    let cached = final_root.join(relative);
+                    if cached.is_file() {
+                        if let Some(reused) = reuse_cached_p4_stream(&cached, output, || probe_video_duration_ms(&ffmpeg, input)) {
+                            return Ok(reused);
+                        }
+                        eprintln!("[p4-ready] cached stream unusable, encoding again: {}", cached.display());
+                    }
                 }
             }
             export_p4_h264_stream_with_settings(&ffmpeg, input, output, rate, &settings.scaler)
@@ -5681,6 +5682,27 @@ struct P4ExportedStream {
     fps: u32,
     frame_duration_ms: u32,
     duration_ms: u32,
+}
+
+/// Reuse a stream from the previously valid pack instead of encoding it again. Any failure removes
+/// the staged output and returns `None`, so the caller encodes the action as it would without a cache.
+fn reuse_cached_p4_stream(
+    cached: &Path,
+    output: &Path,
+    probe_duration_ms: impl FnOnce() -> Result<u64, String>,
+) -> Option<P4ExportedStream> {
+    let reused = (|| {
+        let bytes = std::fs::read(cached).ok()?;
+        let stream = parse_p4_h264_stream(&bytes, P4_APPEARANCE_WIDTH, P4_APPEARANCE_HEIGHT).ok()?;
+        let duration_ms = probe_duration_ms().ok()?;
+        std::fs::create_dir_all(output.parent()?).ok()?;
+        std::fs::write(output, &bytes).ok()?;
+        p4_exported_stream(duration_ms, stream.frames, stream.stream_bytes).ok()
+    })();
+    if reused.is_none() {
+        let _ = std::fs::remove_file(output);
+    }
+    reused
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8049,6 +8071,50 @@ mod tests {
         assert!(parse_p4_h264_stream(&bytes, 640, 480).is_ok());
         bytes.push(0xff);
         assert!(parse_p4_h264_stream(&bytes, 640, 480).is_err());
+    }
+
+    fn p4_test_baseline_stream() -> Vec<u8> {
+        vec![
+            0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1e, 0xda, 0x02, 0x80, 0xbf, 0xe5, 0x84, 0, 0, 3, 0, 4,
+            0, 0, 3, 0, 0x7a, 0x3c, 0x58, 0xba, 0x80, 0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, 0, 0, 0,
+            1, 0x09, 0xf0, 0, 0, 0, 1, 0x65, 0x88, 0x84,
+        ]
+    }
+
+    #[test]
+    fn cached_p4_stream_is_reused_without_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = tmp.path().join("cache/sha256-a.h264");
+        let output = tmp.path().join("staging/p4/families/sha256-a.h264");
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, p4_test_baseline_stream()).unwrap();
+        let reused = reuse_cached_p4_stream(&cached, &output, || Ok(1000)).unwrap();
+        assert_eq!((reused.frames, reused.duration_ms), (1, 1000));
+        assert_eq!(std::fs::read(&output).unwrap(), p4_test_baseline_stream());
+    }
+
+    #[test]
+    fn unusable_cached_p4_stream_falls_back_to_encoding_and_leaves_no_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("staging/sha256-a.h264");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        let mut truncated = p4_test_baseline_stream();
+        truncated.truncate(12);
+        let cases: [(&str, Option<Vec<u8>>, Result<u64, String>); 4] = [
+            ("missing", None, Ok(1000)),
+            ("not h264", Some(b"not a stream".to_vec()), Ok(1000)),
+            ("truncated", Some(truncated), Ok(1000)),
+            ("probe fails", Some(p4_test_baseline_stream()), Err("ffmpeg gone".into())),
+        ];
+        for (label, bytes, probe) in cases {
+            let cached = tmp.path().join(format!("cache-{}.h264", label.replace(' ', "-")));
+            if let Some(bytes) = bytes {
+                std::fs::write(&cached, bytes).unwrap();
+            }
+            std::fs::write(&output, b"partial").unwrap();
+            assert!(reuse_cached_p4_stream(&cached, &output, || probe).is_none(), "{label}");
+            assert!(!output.exists(), "{label}: a failed reuse must not leave staged output");
+        }
     }
 
     #[test]
