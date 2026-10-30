@@ -1142,6 +1142,19 @@ test("saved ASR changes rearm an eligible connected P4 listener without a restar
   assert.doesNotMatch(callback[0], /audioBridgeDeferred/);
 });
 
+test("device voice never rearms automatically over a WiFi link", () => {
+  const source = readSource("DeviceDashboard.jsx");
+  const effect = source.match(/useEffect\(\(\) => \{\s*\/\/ Device voice is USB-only[\s\S]*?const rearmDeviceVoice = async/);
+  assert.ok(effect, "expected the reconnect rearm guard");
+  assert.match(effect[0], /\|\| usb\.transport === "wifi"/);
+  const callback = source.match(
+    /const resumeDeviceVoiceAfterCredentialAccess = useCallback\(\(\) => \{[\s\S]*?\n  \}\, \[[\s\S]*?\n  \]\);/,
+  );
+  assert.ok(callback, "expected ASR credential-ready callback");
+  assert.match(callback[0], /usb\.transport === "wifi"/);
+  assert.match(callback[0], /usb\.transport,\n/);
+});
+
 test("DeviceDashboard does not expose the unsupported P4 WiFi flow", () => {
   const source = readSource("DeviceDashboard.jsx");
   assert.doesNotMatch(source, /WifiApplyModal/);

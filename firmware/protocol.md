@@ -70,8 +70,9 @@ Credentials and the secret are never logged or echoed.
 
 **Lifecycle.** Without credentials the radio and the ESP-Hosted transport are never touched; the
 host component's boot-time initialization is wrapped to a no-op (`-Wl,--wrap=esp_hosted_init`) and
-runs only after configuration, 12 s after boot (past the OTA validation window). Three consecutive
-crashes during bring-up set `crash_loop` and disable the radio until the next `network/config`.
+runs only after configuration, 12 s after boot. That is after the 8 s OTA validation on purpose:
+a radio fault does not roll back an otherwise healthy update. Instead, three consecutive crashes
+during bring-up set `crash_loop` and disable the radio until the next `network/config`.
 If the network task cannot start at boot (memory allocation or task creation fails), USB keeps
 working: hello reports `capabilities.network = {wifi:false}`, and `network/query|config|clear`
 answer `network/status {ok:false, supported:false, error:"wifi_unavailable"}` without touching NVS.
@@ -92,8 +93,9 @@ encrypted**: use trusted networks.
 parsed as a command. A client that attaches starts with an empty line buffer.
 
 **Allowed topics.** Desktop to board: `ack, bind, system/heartbeat, speech/text, session/current,
-control/screen-page, control/command, stats/update, runtime/stats, state/*, diagnostics/*, network/*`.
-Anything else is answered `protocol/ack {ok:false, code:"wifi_unsupported"}`. Board to desktop
+control/screen-page, stats/update, runtime/stats, state/*, diagnostics/*, network/*`.
+Anything else is answered `protocol/ack {ok:false, code:"wifi_unsupported"}`, including
+`control/command`: its `audio_bridge` variant would arm the microphone on the LAN link. Board to desktop
 broadcasts: `input/*, session/*, protocol/*, diagnostics/*, network/*, button-config-ack`; audio,
 media, asset and firmware traffic never leaves over Wi-Fi even when a button starts it.
 

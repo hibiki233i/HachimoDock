@@ -3758,6 +3758,11 @@ fn audio_bridge_signal_blocking(
     if action != "start" && action != "stop" {
         return Err(format!("invalid action '{action}', expected start|stop"));
     }
+    // Arming the microphone pins the board's audio to the requesting link; PCM never crosses the
+    // unencrypted Wi-Fi link. Stop still runs so the local relay can be released.
+    if action == "start" {
+        usb_manager.require_usb_link("设备语音")?;
+    }
     let voice_button = normalize_voice_button(voiceButton)?;
     let pcm_relay_port = pcPort.unwrap_or(usb_audio::DEFAULT_PCM_RELAY_PORT);
     if pcm_relay_port == 0 {

@@ -132,3 +132,20 @@ fn authenticated_wifi_connect_replaces_the_old_wifi_link_and_delivers_events() {
     manager.disconnect();
     board.join().unwrap();
 }
+
+#[test]
+fn device_voice_command_never_leaves_over_wifi() {
+    // On the P4, `audio_bridge` arms the microphone on the link that sent it; PCM would then
+    // stream over the unencrypted LAN.
+    let arm = serde_json::json!({"type": "audio_bridge", "action": "start"});
+    let manager = UsbSerialManager::new();
+    let (wifi, _) = idle_connection("wifi://192.168.1.9:38517", 1);
+    *manager.connection.lock().unwrap() = Some(wifi);
+    assert!(manager.send("control/command", &arm).is_err());
+    assert!(manager.require_usb_link("设备语音").is_err());
+
+    let (usb, _) = idle_connection("/dev/cu.usbmodem-test", 2);
+    *manager.connection.lock().unwrap() = Some(usb);
+    manager.send("control/command", &arm).unwrap();
+    manager.require_usb_link("设备语音").unwrap();
+}

@@ -10,9 +10,11 @@
 #include <stdio.h>
 #include <string.h>
 
+/* No `control/command`: on the P4 it only carries `audio_bridge` (arms the microphone on the
+ * requesting link) and the legacy `button_config`, both USB-only. */
 static const char *const k_inbound_topics[] = {
   "ack", "bind", "system/heartbeat", "speech/text", "session/current", "control/screen-page",
-  "control/command", "stats/update", "runtime/stats",
+  "stats/update", "runtime/stats",
 };
 static const char *const k_inbound_prefixes[] = {"state/", "diagnostics/", "network/"};
 

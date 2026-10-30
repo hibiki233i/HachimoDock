@@ -33,8 +33,9 @@ static const char *TAG = "pet-net";
 #define PET_P4_NET_NVS_NAMESPACE "p4net"
 #define PET_P4_NET_TASK_STACK_BYTES 8192
 #define PET_P4_NET_TASK_PRIORITY 5
-/* Past the 8 s OTA validation window: a stack that crashes on first use is rolled back by the
- * bootloader instead of becoming a boot loop on the freshly installed image. */
+/* Deliberately after the 8 s OTA validation: a radio problem must not roll back an otherwise
+ * healthy update. A stack that crashes during bring-up is caught by the boot_try counter instead,
+ * which disables the radio after PET_P4_NET_CRASH_LOOP_LIMIT crashes while USB keeps working. */
 #define PET_P4_NET_AUTOSTART_DELAY_MS 12000ULL
 #define PET_P4_NET_TICK_MS 50
 #define PET_P4_NET_SEND_BUDGET_MS 100

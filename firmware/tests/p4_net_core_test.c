@@ -14,9 +14,10 @@
 
 static void test_inbound_allowlist(void) {
   const char *allowed[] = {"ack", "bind", "system/heartbeat", "speech/text", "session/current",
-                           "control/screen-page", "control/command", "stats/update", "runtime/stats",
+                           "control/screen-page", "stats/update", "runtime/stats",
                            "state/active", "diagnostics/query", "network/query"};
-  const char *refused[] = {"asset/chunk", "asset/raw-chunk", "firmware/begin", "audio/conversation",
+  /* control/command: its audio_bridge variant would arm the microphone on the LAN link. */
+  const char *refused[] = {"control/command", "asset/chunk", "asset/raw-chunk", "firmware/begin", "audio/conversation",
                            "media/begin", "widget/data", "widget/chunk", "app/snapshot",
                            "ui/conversation", "input/config", "debug/screenshot", "miniapp/event",
                            "", "statex", "acknowledge"};

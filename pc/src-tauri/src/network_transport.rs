@@ -106,7 +106,8 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 
 /// Phase one syncs status, sessions and key events. Everything else (assets, audio, media,
 /// widgets, firmware, button mapping) keeps its USB transaction; the firmware enforces the
-/// same list and answers other topics with `wifi_unsupported`.
+/// same list and answers other topics with `wifi_unsupported`. `control/command` stays off: on
+/// the P4 its `audio_bridge` variant arms the microphone on whichever link sent it.
 const NETWORK_TOPICS: &[&str] = &[
     "ack",
     "bind",
@@ -114,7 +115,6 @@ const NETWORK_TOPICS: &[&str] = &[
     "speech/text",
     "session/current",
     "control/screen-page",
-    "control/command",
     "stats/update",
     "runtime/stats",
 ];
@@ -849,7 +849,8 @@ mod tests {
         }
         for topic in ["asset/chunk", "asset/raw-chunk", "firmware/begin", "audio/conversation",
                       "media/begin", "widget/data", "widget/chunk", "app/snapshot",
-                      "ui/conversation", "input/config", "debug/screenshot", "miniapp/event"] {
+                      "ui/conversation", "input/config", "debug/screenshot", "miniapp/event",
+                      "control/command"] {
             assert!(!topic_allowed_over_network(topic), "{topic}");
         }
     }
