@@ -52,6 +52,7 @@ const BUILTIN_VIDEO_REVISION_FILE = "video-revisions.json";
 const BUILTIN_VIDEO_OVERRIDE_DIR = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/video-overrides`;
 const BUILTIN_AUDIO_OVERRIDE_FILE = "audio-overrides.json";
 const BUILTIN_AUDIO_OVERRIDE_DIR = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/audio-overrides`;
+const BUILTIN_PREPARE_PENDING_FILE = "prepare-pending";
 const APPEARANCE_LIST_CACHE_TTL_MS = 30_000;
 const appearanceListCache = createAsyncCache({ ttlMs: APPEARANCE_LIST_CACHE_TTL_MS });
 
@@ -116,11 +117,18 @@ async function readBuiltinAudioOverrides() {
   }
 }
 
+/** Marks saved default-appearance overrides as possibly newer than the prepared pack. The native sync
+ * prepares again while this exists, and removes it once a preparation covering this save succeeds. */
+async function markBuiltinPreparePending() {
+  await writeTextFile(`${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/${BUILTIN_PREPARE_PENDING_FILE}`, uuid(), { baseDir: BaseDirectory.AppLocalData });
+}
+
 async function writeBuiltinAudioOverrides(overrides) {
   await ensureRoot();
   const dir = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}`;
   const has = await exists(dir, { baseDir: BaseDirectory.AppLocalData });
   if (!has) await mkdir(dir, { baseDir: BaseDirectory.AppLocalData, recursive: true });
+  await markBuiltinPreparePending();
   await writeTextFile(`${dir}/${BUILTIN_AUDIO_OVERRIDE_FILE}`, JSON.stringify(overrides, null, 2), {
     baseDir: BaseDirectory.AppLocalData,
   });
@@ -141,6 +149,7 @@ async function readBuiltinVideoRevisions() {
 }
 async function writeBuiltinVideoOverrides(overrides) {
   await ensureAppearanceDir(BUILTIN_TERRIER_APPEARANCE_ID);
+  await markBuiltinPreparePending();
   await writeTextFile(`${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/${BUILTIN_VIDEO_OVERRIDE_FILE}`, JSON.stringify(overrides, null, 2), { baseDir: BaseDirectory.AppLocalData });
 }
 export async function restoreBuiltinVideos(family) {

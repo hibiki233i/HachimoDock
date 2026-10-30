@@ -71,3 +71,16 @@ test("async credential persistence cannot admit duplicate single-state generatio
   const wizard=read("./CustomAvatarWizard.jsx");
   assert.ok(wizard.indexOf("if (!mountedRef.current)") < wizard.indexOf("startGenerationTask({"));
 });
+
+test("default-appearance overrides are marked pending before they are written, matching the native marker", () => {
+  const store = read("./lib/appearance-store.js");
+  const native = read("../src-tauri/src/lib.rs");
+  const marker = store.match(/BUILTIN_PREPARE_PENDING_FILE = "([^"]+)"/)[1];
+  assert.match(native, new RegExp(`const BUILTIN_PREPARE_PENDING: &str = "${marker}";`));
+  for (const writer of ["writeBuiltinAudioOverrides", "writeBuiltinVideoOverrides"]) {
+    const start = store.indexOf(`async function ${writer}`);
+    const body = store.slice(start, store.indexOf("\n}\n", start));
+    assert.ok(body.includes("await markBuiltinPreparePending()"), writer);
+    assert.ok(body.indexOf("await markBuiltinPreparePending()") < body.indexOf("await writeTextFile"), writer);
+  }
+});

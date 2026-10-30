@@ -6922,11 +6922,50 @@ fn with_builtin_pending_reset<T>(
     Ok(result)
 }
 
+/// Written by the front end before it changes a default-appearance override, and removed once a
+/// preparation that began after that write succeeds. The content is a per-save token, so a save
+/// that lands while a preparation is running stays pending.
+const BUILTIN_PREPARE_PENDING: &str = "prepare-pending";
+
+fn with_prepare_pending_cleared<T>(
+    dir: &Path,
+    prepare: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let marker = dir.join(BUILTIN_PREPARE_PENDING);
+    let token = fs::read(&marker).ok();
+    let result = prepare()?;
+    // A leftover marker only costs one extra preparation, so a failed removal is not an error.
+    if token.is_some() && fs::read(&marker).ok() == token {
+        let _ = fs::remove_file(&marker);
+    }
+    Ok(result)
+}
+
 fn prepare_builtin_p4(dir: &Path, base: &Path, settings: Option<usb_serial::P4AppearanceSettings>) -> Result<usb_serial::PreparedP4Appearance, String> {
-    with_builtin_pending_reset(dir, settings, |settings, force| {
-        if force { usb_serial::rebuild_p4_appearance(dir, base, settings.expect("forced settings")) }
-        else { usb_serial::prepare_p4_appearance(dir, base) }
+    with_prepare_pending_cleared(dir, || {
+        with_builtin_pending_reset(dir, settings, |settings, force| {
+            if force { usb_serial::rebuild_p4_appearance(dir, base, settings.expect("forced settings")) }
+            else { usb_serial::prepare_p4_appearance(dir, base) }
+        })
     })
+}
+
+/// Syncing reuses the prepared pack unless something changed since it was built, so switching to
+/// the default appearance needs neither ffmpeg nor a fresh probe of every action. A saved override
+/// or factory reset whose preparation has not finished, or a missing or invalid pack, still forces
+/// a preparation and surfaces its error instead of sending stale media.
+fn prepare_builtin_p4_if_stale(
+    dir: &Path,
+    pack_valid: bool,
+    prepare: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    let stale = !pack_valid
+        || dir.join(BUILTIN_PREPARE_PENDING).is_file()
+        || dir.join("factory-settings-reset").is_file();
+    if stale {
+        prepare()?;
+    }
+    Ok(stale)
 }
 
 fn prepare_p4_appearance_by_id(
@@ -7107,8 +7146,14 @@ async fn usb_sync_appearance(
             || local_dir.join("custom-p4-settings").is_file();
         match sync_runtime {
             UsbAppearanceSyncRuntime::EspP4 if has_overrides => {
-                ensure_builtin_terrier_source(&app_local_data_dir, &clips_dir, false)?;
-                prepare_builtin_p4(&local_dir, &app_local_data_dir, None)?;
+                prepare_builtin_p4_if_stale(
+                    &local_dir,
+                    usb_serial::inspect_prepared_p4_appearance(&local_dir).is_ok(),
+                    || {
+                        ensure_builtin_terrier_source(&app_local_data_dir, &clips_dir, false)?;
+                        prepare_builtin_p4(&local_dir, &app_local_data_dir, None).map(|_| ())
+                    },
+                )?;
                 local_dir
             }
             UsbAppearanceSyncRuntime::EspP4 => clips_dir.clone(),
@@ -12440,6 +12485,67 @@ mod tests {
             Ok::<_, String>(())
         });
         assert!(result.is_ok());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn builtin_sync_reuses_valid_pack_without_preparing_or_ffmpeg() {
+        let temp = tempfile::tempdir().unwrap();
+        let prepared = prepare_builtin_p4_if_stale(temp.path(), true, || {
+            panic!("a valid pack with nothing pending must not be prepared, which would need ffmpeg")
+        })
+        .unwrap();
+        assert!(!prepared);
+    }
+
+    #[test]
+    fn builtin_sync_prepares_when_pack_is_invalid_or_a_change_is_pending() {
+        for (pack_valid, marker) in [
+            (false, None),
+            (true, Some(BUILTIN_PREPARE_PENDING)),
+            (true, Some("factory-settings-reset")),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            if let Some(name) = marker {
+                fs::write(temp.path().join(name), b"1").unwrap();
+            }
+            let mut calls = 0;
+            let prepared = prepare_builtin_p4_if_stale(temp.path(), pack_valid, || {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert!(prepared, "pack_valid={pack_valid} marker={marker:?}");
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn builtin_sync_surfaces_preparation_failure_instead_of_sending_a_stale_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(BUILTIN_PREPARE_PENDING), b"1").unwrap();
+        let error = prepare_builtin_p4_if_stale(temp.path(), true, || Err("ffmpeg missing".into()))
+            .unwrap_err();
+        assert_eq!(error, "ffmpeg missing");
+    }
+
+    #[test]
+    fn builtin_prepare_pending_is_cleared_only_by_a_successful_preparation_that_saw_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join(BUILTIN_PREPARE_PENDING);
+        fs::write(&marker, b"save-1").unwrap();
+        // A failed preparation leaves the change pending.
+        assert!(with_prepare_pending_cleared(temp.path(), || Err::<(), String>("encode failed".into())).is_err());
+        assert!(marker.exists());
+        // A save that lands while the preparation runs is not covered by it.
+        with_prepare_pending_cleared(temp.path(), || {
+            fs::write(&marker, b"save-2").unwrap();
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        assert_eq!(fs::read(&marker).unwrap(), b"save-2");
+        // A preparation that saw the latest save clears it.
+        with_prepare_pending_cleared(temp.path(), || Ok::<_, String>(())).unwrap();
         assert!(!marker.exists());
     }
 
