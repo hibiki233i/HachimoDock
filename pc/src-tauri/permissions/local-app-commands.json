@@ -103,6 +103,8 @@
           "usb_update_firmware",
           "usb_update_bundled_firmware",
           "prepare_p4_appearance",
+          "rebuild_p4_appearance",
+          "inspect_p4_appearance",
           "usb_cancel_appearance_sync",
           "usb_sync_appearance",
           "resolve_builtin_clawpkg_path",

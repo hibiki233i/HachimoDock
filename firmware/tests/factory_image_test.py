@@ -85,18 +85,19 @@ def test_factory_config_matches_desktop_export_contract_and_media():
         "height": "P4_APPEARANCE_HEIGHT",
         "fps": "P4_APPEARANCE_FPS",
         "maxFrames": "P4_APPEARANCE_MAX_FRAMES",
-        "h264Crf": "P4_APPEARANCE_H264_CRF",
     }
     for key, constant in expected.items():
         match = re.search(rf"const {constant}: u32 = (\d+);", desktop)
         assert match, constant
         assert appearance[key] == int(match.group(1))
-    version = re.search(r"const P4_READY_PROFILE_VERSION: u32 = (\d+);", desktop)
-    assert version
+    prebuilder = (REPOSITORY / "pc/scripts/prepare-p4-ready-assets.mjs").read_text(encoding="utf-8")
+    assert "String(appearance.h264Crf)" in prebuilder
+    assert "appearance.readyProfile" in prebuilder
     assert appearance["readyProfile"] == (
-        f"v{version.group(1)}-{appearance['width']}x{appearance['height']}-"
+        f"v9-{appearance['width']}x{appearance['height']}-"
         f"{appearance['fps']}fps-{appearance['maxFrames']}f-h264-crf{appearance['h264Crf']}"
     )
+    assert appearance["readyProfile"] in desktop
     assert re.fullmatch(r"[0-9a-f]{64}", appearance["packId"])
 
     clips = (RUNTIME / appearance["clipsDir"]).resolve()

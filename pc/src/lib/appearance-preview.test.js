@@ -9,6 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  mediaFromFamily,
   pickPreviewFamily,
   resolveGeneratedPreviewMedia,
   resolveGalleryPreviewMedia,
@@ -121,4 +122,10 @@ test("resolveGeneratedPreviewMedia keeps generated videos for family previews", 
       label: "RX-93",
     },
   });
+});
+
+test("video preview descriptor retains replacement revision for local blob reload", () => {
+  const preview = mediaFromFamily({ family: "idle", ok: true, videoPath: "idle.mp4", videoRevision: "second" });
+  assert.equal(preview.path, "idle.mp4");
+  assert.equal(preview.revision, "second");
 });

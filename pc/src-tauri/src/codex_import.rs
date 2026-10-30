@@ -3,7 +3,7 @@
 //! Reads a Codex pet's v1 `spritesheet.webp` (8 cols × 9 rows × 192×208) or
 //! v2 sheet (8 cols × 11 rows × 192×208), cuts the shared first nine animation
 //! rows, writes a trimmed transparent gallery preview, and produces
-//! per-family MP4 files by writing one PNG per unique atlas cell and driving
+//! per-family MP4 previews and lossless device-export inputs by writing one PNG per unique atlas cell and driving
 //! hidden FFmpeg concat processes.
 //! The list API also reports each pet's latest source-file modified time so
 //! the community-import UI can detect both newly installed and updated pets;
@@ -845,6 +845,39 @@ fn flatten_to_background(frame: &RgbaImage) -> RgbImage {
         );
     }
     out
+}
+
+/// Build a lossless concat input from the original atlas for one action.
+pub(crate) fn atlas_action_concat(atlas: &Path, family: &str, dir: &Path) -> Result<PathBuf, String> {
+    let mapping = MAPPING.iter().find(|m| m.family == family)
+        .ok_or_else(|| format!("No atlas action mapping for {family}"))?;
+    let img = image::open(atlas).map_err(|e| format!("Cannot read original atlas {}: {e}", atlas.display()))?;
+    let (width, height) = img.dimensions();
+    if width != EXPECTED_W || (height != V1_EXPECTED_H && height != V2_EXPECTED_H) {
+        return Err(format!("Invalid original atlas dimensions: {width}x{height}"));
+    }
+    let rgba = img.to_rgba8();
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let mut concat = String::from("ffconcat version 1.0\n");
+    let mut last = PathBuf::new();
+    for col in 0..mapping.cols {
+        let mut cell = image::imageops::crop_imm(&rgba, col * CELL_W, mapping.row * CELL_H, CELL_W, CELL_H).to_image();
+        clean_frame_edges(&mut cell);
+        let path = dir.join(format!("frame_{col:02}.png"));
+        flatten_to_background(&cell).save(&path).map_err(|e| e.to_string())?;
+        let escaped = path.to_string_lossy().replace('\'', "'\\''");
+        concat.push_str(&format!("file '{escaped}'\nduration {:.6}\n", f64::from(duration_to_frame_count(mapping.durations_ms[col as usize])) / f64::from(OUTPUT_FPS)));
+        last = path;
+    }
+    concat.push_str(&format!("file '{}'\n", last.to_string_lossy().replace('\'', "'\\''")));
+    let path = dir.join("concat.txt");
+    fs::write(&path, concat).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+pub(crate) fn atlas_action_identity(family: &str) -> Result<String, String> {
+    let m = MAPPING.iter().find(|m| m.family == family).ok_or_else(|| format!("No atlas action mapping for {family}"))?;
+    Ok(format!("{}:{}:{:?}", m.row, m.cols, m.durations_ms))
 }
 
 #[derive(Debug, Clone, Serialize)]
