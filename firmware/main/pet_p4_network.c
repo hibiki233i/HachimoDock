@@ -604,14 +604,25 @@ static void pending_authenticate(const char *line) {
   char message[192];
   char expected[PET_P4_NET_PROOF_HEX_LEN + 1];
   char reply[PET_P4_NET_PROOF_HEX_LEN + 1];
-  bool ok = cJSON_IsString(topic) && strcmp(topic->valuestring, "net/auth") == 0
+  /* network/config rewrites the secret on the protocol task. Take a consistent copy under the lock
+   * instead of reading it mid-write, and refuse to authenticate without a valid one: after
+   * network/clear the key is zeroed, and HMAC with an empty key is computable by anyone. */
+  char secret[PET_P4_NET_SECRET_LEN + 1];
+  lock();
+  bool configured = s.configured;
+  memcpy(secret, s.secret, sizeof(secret));
+  unlock();
+  secret[PET_P4_NET_SECRET_LEN] = '\0';
+  bool ok = configured && pet_p4_net_secret_valid(secret)
+    && cJSON_IsString(topic) && strcmp(topic->valuestring, "net/auth") == 0
     && cJSON_IsString(nonce) && pet_p4_net_nonce_valid(nonce->valuestring)
     && cJSON_IsString(proof)
     && pet_p4_net_proof_message("client", s.config.board_device_id, s.pending.device_nonce, nonce->valuestring, message, sizeof(message))
-    && hmac_hex(s.secret, message, expected)
+    && hmac_hex(secret, message, expected)
     && pet_p4_net_ct_equal(expected, proof->valuestring)
     && pet_p4_net_proof_message("server", s.config.board_device_id, s.pending.device_nonce, nonce->valuestring, message, sizeof(message))
-    && hmac_hex(s.secret, message, reply);
+    && hmac_hex(secret, message, reply);
+  memset(secret, 0, sizeof(secret));
   memset(message, 0, sizeof(message));
   cJSON_Delete(root);
   if (!ok) {

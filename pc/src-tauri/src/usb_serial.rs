@@ -1737,8 +1737,11 @@ impl UsbSerialManager {
     }
 
     /// Opens the authenticated Wi-Fi link to a board that was paired over USB. It occupies the
-    /// same single connection slot as USB, so exactly one business channel is ever active, and a
-    /// later USB connect (which has priority) replaces it.
+    /// same single connection slot as USB, so exactly one business channel is ever active.
+    ///
+    /// USB has priority in both directions: a live USB link is never displaced (the call is
+    /// refused), while a later USB connect replaces a Wi-Fi link. The slot is only touched after
+    /// the board proved its identity, so a wrong address or secret cannot drop a working link.
     pub fn connect_network<F>(
         &self,
         board_device_id: &str,
@@ -1753,19 +1756,14 @@ impl UsbSerialManager {
         let port_name = network_transport::network_port_name(&addr);
         {
             let conn = self.connection.lock().map_err(|e| e.to_string())?;
-            if let Some(existing) = conn.as_ref() {
-                if existing.connected && existing.port_name == port_name {
+            if let Some(existing) = conn.as_ref().filter(|existing| existing.connected) {
+                if existing.port_name == port_name {
                     return Ok(());
                 }
+                if !network_transport::is_network_port_name(&existing.port_name) {
+                    return Err(network_transport::USB_PRIORITY_MESSAGE.to_string());
+                }
             }
-        }
-        {
-            let mut conn = self.connection.lock().map_err(|e| e.to_string())?;
-            if let Some(existing) = conn.as_mut() {
-                existing.cancel_reader.store(true, Ordering::SeqCst);
-            }
-            *conn = None;
-            cache_usb_status(&self.status_snapshot, None);
         }
 
         let desktop_id = self
@@ -1821,6 +1819,11 @@ impl UsbSerialManager {
         apply_hello_payload_to_connection(&mut connection, &hello.payload);
         {
             let mut conn = self.connection.lock().map_err(|e| e.to_string())?;
+            // connect_guard serializes every connect, so no USB link can have appeared since the
+            // check above; only now, with the board authenticated, does the old link yield.
+            if let Some(existing) = conn.as_mut() {
+                existing.cancel_reader.store(true, Ordering::SeqCst);
+            }
             *conn = Some(connection);
             cache_usb_status(&self.status_snapshot, conn.as_ref());
         }
@@ -6787,6 +6790,7 @@ fn canonical_binding_for_control(control: &str) -> Option<(&'static str, &'stati
 mod tests {
     include!("usb_serial/silent_acceptance.rs");
     include!("usb_serial/new_components_acceptance.rs");
+    include!("usb_serial/wifi_link_acceptance.rs");
     #[test]
     #[cfg(target_os = "macos")]
     fn paced_macos_serial_writes_do_not_drain_driver() {

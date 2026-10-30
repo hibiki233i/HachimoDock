@@ -65,7 +65,17 @@ const ERROR_TEXT = {
 export function wifiErrorMessage(code) {
   const key = String(code || "");
   if (!key) return "";
-  return ERROR_TEXT[key] || `无线错误：${key}`;
+  if (ERROR_TEXT[key]) return ERROR_TEXT[key];
+  // Backend errors are already sentences; only bare device codes (ap_not_found, ...) get a prefix.
+  return /^[a-z0-9_]+$/.test(key) ? `无线错误：${key}` : key;
+}
+
+/** Same text as network_transport::USB_PRIORITY_MESSAGE; the backend refuses with it too. */
+export const WIFI_USB_PRIORITY_NOTE = "USB 已连接：WiFi 仅在没有 USB 时使用，拔掉 USB 线后会自动切换到 WiFi";
+
+/** Non-empty while a live USB link would be displaced by connecting over WiFi. */
+export function wifiConnectBlockedReason(usb) {
+  return usb?.connected && usb?.transport !== "wifi" ? WIFI_USB_PRIORITY_NOTE : "";
 }
 
 const STATE_TEXT = {

@@ -20,6 +20,7 @@ import {
   isWifiLink,
   linkLabel,
   validateWifiCredentials,
+  wifiConnectBlockedReason,
   wifiAddressFromPortName,
   wifiErrorMessage,
   wifiSupported,
@@ -43,6 +44,9 @@ export default function WifiLinkCard() {
   const onWifi = isWifiLink(usb);
   const provisionable = canProvisionWifi(usb);
   const board = usb?.boardDeviceId || "";
+  // A live USB link keeps priority; the backend refuses to displace it, so don't offer the action.
+  const connectBlocked = wifiConnectBlockedReason(usb);
+  const pairedDevices = devices.filter((device) => device.desktopPaired);
 
   const readStatus = useCallback(async () => {
     if (!connected || !wifiSupported(usb)) {
@@ -152,7 +156,12 @@ export default function WifiLinkCard() {
           <div key={device.boardDeviceId} className="wifi-link-device">
             <span>{device.boardDeviceId}（{device.host}{device.online ? "" : "，离线"}）</span>
             {device.desktopPaired ? (
-              <Button size="small" disabled={Boolean(busy) || (onWifi && board === device.boardDeviceId)} onClick={() => handleConnect(device.boardDeviceId, device.host)}>
+              <Button
+                size="small"
+                title={connectBlocked || undefined}
+                disabled={Boolean(busy) || Boolean(connectBlocked) || (onWifi && board === device.boardDeviceId)}
+                onClick={() => handleConnect(device.boardDeviceId, host.trim() || device.host)}
+              >
                 通过 WiFi 连接
               </Button>
             ) : (
@@ -160,11 +169,11 @@ export default function WifiLinkCard() {
             )}
           </div>
         ))}
-        {board && !onWifi && (
+        {connectBlocked && <p className="message-banner message-banner--muted">{connectBlocked}</p>}
+        {!connectBlocked && pairedDevices.length > 0 && (
           <label className="field">
-            <span className="field__label">手动输入设备 IP（可选）</span>
+            <span className="field__label">地址不对？手动输入设备 IP（可选，对上面的“通过 WiFi 连接”生效）</span>
             <input className="field__input" value={host} placeholder="例如 192.168.1.23" onChange={(e) => setHost(e.target.value)} />
-            <Button size="small" disabled={Boolean(busy) || !host.trim()} onClick={() => handleConnect(board, host.trim())}>用此地址连接</Button>
           </label>
         )}
       </div>

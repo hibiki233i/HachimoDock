@@ -98,7 +98,7 @@ media, asset and firmware traffic never leaves over Wi-Fi even when a button sta
 operations:[state, session, inputEvents, diagnostics]}`, and asset/appearance/widget/audio/voice/
 screenshot/firmware capabilities reported false. Every hello carries `capabilities.network`
 (`wifi`, `protocol`, `port`, `provisioning:"usb"`, `configured`, `state`). Assets, audio, widgets and
-OTA keep their USB transactions. Only one link is the desktop's business channel at a time; USB wins.
+OTA keep their USB transactions. Only one link is the desktop's business channel at a time, and USB wins: a Wi-Fi connect is refused while USB is connected (it never drops the cable link, and a failed attempt never drops an existing Wi-Fi link either), while a USB connect replaces a Wi-Fi link.
 
 ## Handshake
 

@@ -14,8 +14,10 @@ import {
   linkLabel,
   validateWifiCredentials,
   wifiAddressFromPortName,
+  wifiConnectBlockedReason,
   wifiErrorMessage,
   wifiSupported,
+  WIFI_USB_PRIORITY_NOTE,
 } from "./wifi-link.js";
 
 test("credential rules match the firmware and Rust validators", () => {
@@ -76,4 +78,17 @@ test("status text covers every state and surfaces actionable errors", () => {
 test("unknown error codes are shown rather than hidden", () => {
   assert.equal(wifiErrorMessage(""), "");
   assert.match(wifiErrorMessage("brand_new_error"), /brand_new_error/);
+});
+
+test("backend sentences are shown as written, not wrapped as device codes", () => {
+  assert.equal(wifiErrorMessage(WIFI_USB_PRIORITY_NOTE), WIFI_USB_PRIORITY_NOTE);
+  assert.equal(wifiErrorMessage("无法连接 192.168.1.9:38517: timed out"), "无法连接 192.168.1.9:38517: timed out");
+});
+
+test("a live USB link blocks connecting over WiFi; WiFi or no link does not", () => {
+  assert.equal(wifiConnectBlockedReason({ connected: true, transport: "usb" }), WIFI_USB_PRIORITY_NOTE);
+  assert.equal(wifiConnectBlockedReason({ connected: true }), WIFI_USB_PRIORITY_NOTE);
+  assert.equal(wifiConnectBlockedReason({ connected: true, transport: "wifi" }), "");
+  assert.equal(wifiConnectBlockedReason({ connected: false, transport: "usb" }), "");
+  assert.equal(wifiConnectBlockedReason(null), "");
 });

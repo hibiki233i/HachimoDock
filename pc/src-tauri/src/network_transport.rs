@@ -25,6 +25,10 @@ pub const NETWORK_READ_POLL: Duration = Duration::from_millis(100);
 /// Scheme used in `UsbConnection.port_name` to mark a Wi-Fi link.
 pub const NETWORK_PORT_PREFIX: &str = "wifi://";
 
+/// Shown (and returned by `connect_network`) when a Wi-Fi connect would displace a live USB link.
+pub const USB_PRIORITY_MESSAGE: &str =
+    "USB 已连接：WiFi 仅在没有 USB 时使用，拔掉 USB 线后会自动切换到 WiFi";
+
 const SECRET_BYTES: usize = 32;
 const NONCE_BYTES: usize = 16;
 const HANDSHAKE_LINE_MAX: usize = 8192;
