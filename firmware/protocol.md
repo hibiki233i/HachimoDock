@@ -72,6 +72,9 @@ Credentials and the secret are never logged or echoed.
 host component's boot-time initialization is wrapped to a no-op (`-Wl,--wrap=esp_hosted_init`) and
 runs only after configuration, 12 s after boot (past the OTA validation window). Three consecutive
 crashes during bring-up set `crash_loop` and disable the radio until the next `network/config`.
+If the network task cannot start at boot (memory allocation or task creation fails), USB keeps
+working: hello reports `capabilities.network = {wifi:false}`, and `network/query|config|clear`
+answer `network/status {ok:false, supported:false, error:"wifi_unavailable"}` without touching NVS.
 
 **Connection.** TCP `38517`, one authenticated client. UDP `38517` answers
 `{"topic":"net/discover","payload":{"nonce"}}` with `net/announce {boardDeviceId, nonce, port, fw,

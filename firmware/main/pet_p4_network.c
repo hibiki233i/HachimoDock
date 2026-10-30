@@ -323,9 +323,13 @@ static void reply_status(
   if (cJSON_IsString(request_id)) cJSON_AddStringToObject(payload, "requestId", request_id->valuestring);
   cJSON_AddBoolToObject(payload, "ok", ok);
   if (error && error[0]) cJSON_AddStringToObject(payload, "error", error);
-  lock();
-  fill_status(payload);
-  unlock();
+  if (s.lock) {
+    lock();
+    fill_status(payload);
+    unlock();
+  } else {
+    cJSON_AddBoolToObject(payload, "supported", false);
+  }
   cJSON_AddStringToObject(root, "topic", "network/status");
   cJSON_AddItemToObject(root, "payload", payload);
   char *line = cJSON_PrintUnformatted(root);
@@ -337,7 +341,9 @@ static void reply_status(
 void pet_p4_network_describe(cJSON *capabilities) {
   cJSON *network = cJSON_AddObjectToObject(capabilities, "network");
   if (!network) return;
-  cJSON_AddBoolToObject(network, "wifi", true);
+  /* hello is sent on every USB bind: without a running network task it must not take the lock. */
+  cJSON_AddBoolToObject(network, "wifi", s.lock != NULL);
+  if (!s.lock) return;
   cJSON_AddStringToObject(network, "protocol", PET_P4_NET_WIRE_PROTOCOL);
   cJSON_AddNumberToObject(network, "port", PET_P4_NET_TCP_PORT);
   cJSON_AddStringToObject(network, "provisioning", "usb");
@@ -803,6 +809,15 @@ static void network_task(void *arg) {
 
 /* ---- public API -------------------------------------------------------------------------- */
 
+/* Every public entry point treats a null `s.lock` as "no network task": undo a partial init so a
+ * board that could not start Wi-Fi reports it as absent instead of accepting configuration. */
+static esp_err_t init_failed(void) {
+  if (s.lock) vSemaphoreDelete(s.lock);
+  if (s.client_lock) vSemaphoreDelete(s.client_lock);
+  memset(&s, 0, sizeof(s));
+  return ESP_ERR_NO_MEM;
+}
+
 esp_err_t pet_p4_network_init(const pet_p4_network_config_t *config) {
   if (!config || !config->board_device_id || s.lock) return ESP_ERR_INVALID_ARG;
   memset(&s, 0, sizeof(s));
@@ -810,7 +825,7 @@ esp_err_t pet_p4_network_init(const pet_p4_network_config_t *config) {
   s.listen_fd = s.udp_fd = s.client_fd = s.pending.fd = -1;
   s.lock = xSemaphoreCreateMutex();
   s.client_lock = xSemaphoreCreateMutex();
-  if (!s.lock || !s.client_lock) return ESP_ERR_NO_MEM;
+  if (!s.lock || !s.client_lock) return init_failed();
   credentials_load();
   s.state = s.configured ? NET_IDLE : NET_UNCONFIGURED;
   s.not_before_ms = now_ms() + PET_P4_NET_AUTOSTART_DELAY_MS;
@@ -820,8 +835,11 @@ esp_err_t pet_p4_network_init(const pet_p4_network_config_t *config) {
     set_error("crash_loop");
     ESP_LOGW(TAG, "wireless stack disabled after repeated crashes; send network/config over USB to retry");
   }
-  return xTaskCreate(network_task, "pet_p4_net", PET_P4_NET_TASK_STACK_BYTES, NULL,
-                     PET_P4_NET_TASK_PRIORITY, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+  if (xTaskCreate(network_task, "pet_p4_net", PET_P4_NET_TASK_STACK_BYTES, NULL,
+                  PET_P4_NET_TASK_PRIORITY, NULL) != pdPASS) {
+    return init_failed();
+  }
+  return ESP_OK;
 }
 
 bool pet_p4_network_client_ready(void) {
@@ -846,13 +864,18 @@ bool pet_p4_network_handle_topic(
   const char *topic, const cJSON *payload, pet_p4_send_line_fn send_line, void *ctx, bool via_wifi
 ) {
   if (!topic || strncmp(topic, "network/", 8) != 0) return false;
-  if (strcmp(topic, "network/query") == 0) {
+  bool is_query = strcmp(topic, "network/query") == 0;
+  bool is_config = strcmp(topic, "network/config") == 0;
+  bool is_clear = strcmp(topic, "network/clear") == 0;
+  if (!is_query && !is_config && !is_clear) return false;
+  if (!s.lock) {
+    reply_status(send_line, ctx, payload, false, "wifi_unavailable");
+    return true;
+  }
+  if (is_query) {
     reply_status(send_line, ctx, payload, true, NULL);
     return true;
   }
-  bool is_config = strcmp(topic, "network/config") == 0;
-  bool is_clear = strcmp(topic, "network/clear") == 0;
-  if (!is_config && !is_clear) return false;
   if (via_wifi) {
     reply_status(send_line, ctx, payload, false, "usb_required");
     return true;

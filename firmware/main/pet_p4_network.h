@@ -34,12 +34,14 @@ typedef struct {
 } pet_p4_network_config_t;
 
 /* Loads stored credentials and starts the supervisor task. The radio and the ESP-Hosted transport
- * stay untouched until credentials exist, so a USB-only board behaves exactly as before. */
+ * stay untouched until credentials exist, so a USB-only board behaves exactly as before. On
+ * failure (or when never called) every function below stays safe and reports Wi-Fi as absent. */
 esp_err_t pet_p4_network_init(const pet_p4_network_config_t *config);
 
 /* Handles `network/config`, `network/clear` and `network/query`. `via_wifi` marks requests that
  * arrived on the LAN: provisioning and clearing are refused there because they carry or destroy
- * the credentials that make the LAN link reachable. Returns false for other topics. */
+ * the credentials that make the LAN link reachable. Without a running network task all three
+ * answer `wifi_unavailable`. Returns false for other topics. */
 bool pet_p4_network_handle_topic(
   const char *topic,
   const cJSON *payload,
@@ -54,7 +56,8 @@ bool pet_p4_network_client_ready(void);
  * client is attached or the peer cannot keep up, in which case the client is dropped. */
 bool pet_p4_network_send_line(const char *line);
 
-/* Contributes `capabilities.network` to hello (supported, configured, state, port). */
+/* Contributes `capabilities.network` to hello (wifi, configured, state, port); `wifi` is false
+ * and nothing else is reported when the network task is not running. */
 void pet_p4_network_describe(cJSON *capabilities);
 
 #ifdef __cplusplus
