@@ -1,7 +1,8 @@
 /**
  * [Input] An appearanceId persisted by `lib/appearance-store.js` plus centralized API-settings navigation.
  * [Output] Preview-first wide appearance workspace, unified sticky current-state inspector, full-width state rail, contextual details drawer,
- *          configurable per-family WAV and built-in video overrides, device quality/rebuild controls, and direct per-state MP4 replacement,
+ *          configurable per-family WAV and built-in video overrides, refreshed prepared-pack statistics without resetting draft quality inputs,
+ *          device quality/rebuild controls, and direct per-state MP4 replacement,
  *          Ark-background single-state image+prompt regeneration with read-only provider credential readiness, inline progress, cancellable exact-board USB appearance transfer, and full known-state rail.
  * [Pos] component node in pc/src
  * [Sync] If this file changes, update this header and `pc/src/.folder.md`.
@@ -155,13 +156,22 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   const [bitrates, setBitrates] = useState({});
   const [rebuilding, setRebuilding] = useState(false);
   const [packMessage, setPackMessage] = useState("");
+  const refreshPreparedPack = useCallback(async () => {
+    try {
+      const result = await inspectSavedAppearance(appearanceId);
+      setPack(result.packReady === false ? null : result);
+      setPackMessage(result.packReady === false ? "设备素材需要重新生成，已保留画质设置。" : "");
+    } catch (failure) { setPack(null); setPackMessage(`设备素材状态无法读取：${failure}`); }
+  }, [appearanceId]);
   useEffect(() => {
     let cancelled = false;
+    setPack(null); setQuality("standard"); setScaler("smooth"); setBitrates({});
     inspectSavedAppearance(appearanceId).then(result => {
       if (cancelled) return;
-      setPack(result); setQuality(result.settings?.quality || "standard");
+      setPack(result.packReady === false ? null : result); setQuality(result.settings?.quality || "standard");
+      setPackMessage(result.packReady === false ? "设备素材需要重新生成，已保留画质设置。" : "");
       setScaler(result.settings?.scaler || "smooth"); setBitrates(result.settings?.bitratesKbps || {});
-    }).catch(() => { if (!cancelled) setPack(null); });
+    }).catch(failure => { if (!cancelled) { setPack(null); setPackMessage(`设备素材状态无法读取：${failure}`); } });
     return () => { cancelled = true; };
   }, [appearanceId]);
   const [error, setError] = useState("");
@@ -429,6 +439,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
         audioBytes,
       });
       setRecord(nextRecord);
+      await refreshPreparedPack();
       markAudioSyncDirty(`已更新 ${activeFamily} 的提示音，请通过音效通道下发到设备。`);
     } catch (saveFailure) {
       console.error(saveFailure);
@@ -437,7 +448,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       setAudioState("idle");
       endOperation();
     }
-  }, [activeFamily, audioState, markAudioSyncDirty, record, operationBusy]);
+  }, [activeFamily, audioState, markAudioSyncDirty, record, operationBusy, refreshPreparedPack]);
 
   const handleRemoveAudioCue = useCallback(async () => {
     if (!record || !activeFamily || operationBusy) return;
@@ -447,6 +458,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
     try {
       const nextRecord = await removeFamilyAudioCue({ appearanceId: record.id, family: activeFamily });
       setRecord(nextRecord);
+      await refreshPreparedPack();
       markAudioSyncDirty(`已移除 ${activeFamily} 的提示音，请通过音效通道下发到设备。`);
     } catch (removeFailure) {
       console.error(removeFailure);
@@ -455,7 +467,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       setAudioState("idle");
       endOperation();
     }
-  }, [activeFamily, audioState, markAudioSyncDirty, record, operationBusy]);
+  }, [activeFamily, audioState, markAudioSyncDirty, record, operationBusy, refreshPreparedPack]);
 
   const handleStateVideoFileChange = useCallback(async (event) => {
     const file = event.target.files?.[0];
@@ -480,6 +492,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
         prompt: activeRecord?.prompt || `用户上传的 ${activeFamily} 状态视频`,
       });
       setRecord(nextRecord);
+      await refreshPreparedPack();
       const message = `已上传并替换 ${activeFamily} 状态视频。需要在设备生效时，点击“替换到板端”。`;
       setStateVideoState("success");
       setStateVideoMessage(message);
@@ -491,7 +504,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       setStateVideoState("error");
       setStateVideoMessage(replaceFailure?.message || String(replaceFailure));
     } finally { endOperation(); }
-  }, [activeFamily, activeRecord?.prompt, record, stateVideoState, operationBusy]);
+  }, [activeFamily, activeRecord?.prompt, record, stateVideoState, operationBusy, refreshPreparedPack]);
 
   const handleSyncAudioCues = useCallback(async () => {
     if (!record || operationBusy) return;
@@ -688,6 +701,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
         prompt: result.family.prompt,
       });
       setRecord(nextRecord);
+      await refreshPreparedPack();
       setSingleStateStatus("success");
       const successMessage = `已替换 ${activeRecord.family} 状态素材。需要在设备生效时，点击“替换到板端”。`;
       setSingleStateMessage(successMessage);
@@ -710,6 +724,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   }, [
     activeRecord,
     record,
+    refreshPreparedPack,
     singleStateImageFile,
     singleStatePrompt,
     singleStateStatus,
@@ -804,7 +819,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
     setStateVideoState("saving");
     try {
       const next = await restoreBuiltinVideos(family);
-      setRecord(next); setSingleStateStatus("success");
+      setRecord(next); await refreshPreparedPack(); setSingleStateStatus("success");
       setStateVideoMessage("默认视频已恢复，请替换到板端。"); setStateVideoState("success");
     } catch (failure) { setStateVideoState("error"); setStateVideoMessage(String(failure)); }
     finally { endOperation(); }

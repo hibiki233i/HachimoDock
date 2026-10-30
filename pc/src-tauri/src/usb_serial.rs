@@ -7,7 +7,7 @@
  *          persistent prebuilt P4 H.264 Annex-B/WAV ready packs plus
  *          budgeted VideoToolbox/Media Foundation encoding directly from
  *          original community atlas crops or saved video, shared stream/audio/manifest
- *          bitrate allocation and settings-aware cache,
+ *          bitrate allocation, durable quality preferences and settings-aware cache,
  *          native-SPS structural and full-decode validation, plus paced
  *          4 Mbaud JSON control frames plus the hardware-proven 8KiB raw
  *          chunks and 64-byte macOS CH343 drain pacing,
@@ -5215,6 +5215,22 @@ impl Default for P4AppearanceSettings {
     fn default() -> Self { Self { quality: "standard".into(), scaler: "smooth".into(), bitrates_kbps: Default::default() } }
 }
 
+const P4_SETTINGS_FILE: &str = "p4-settings.json";
+
+fn retained_p4_settings(appearance_dir: &Path) -> Result<P4AppearanceSettings, String> {
+    let saved = appearance_dir.join(P4_SETTINGS_FILE);
+    let cached = p4_ready_profile_root(appearance_dir).join("settings.json");
+    let path = if saved.exists() { saved } else { cached };
+    if path.exists() {
+        let bytes = std::fs::read(&path).map_err(|e| format!("read saved appearance settings failed: {e}"))?;
+        return serde_json::from_slice(&bytes).map_err(|e| format!("parse saved appearance settings failed: {e}; save quality settings again"));
+    }
+    if appearance_dir.join("custom-p4-settings").is_file() {
+        return Err("Saved appearance quality settings are missing; choose the settings and rebuild the device assets again".into());
+    }
+    Ok(P4AppearanceSettings::default())
+}
+
 fn p4_ready_profile_id() -> &'static str {
     static PROFILE: OnceLock<String> = OnceLock::new();
     PROFILE
@@ -5482,6 +5498,20 @@ pub fn inspect_prepared_p4_appearance(
         .map(|(_, prepared)| prepared)
 }
 
+pub(crate) fn inspect_p4_appearance_state(appearance_dir: &Path) -> Result<serde_json::Value, String> {
+    match inspect_prepared_p4_appearance(appearance_dir) {
+        Ok(prepared) => {
+            let mut state = serde_json::to_value(prepared).map_err(|e| e.to_string())?;
+            state["packReady"] = serde_json::json!(true);
+            Ok(state)
+        }
+        Err(_) => Ok(serde_json::json!({
+            "packReady": false,
+            "settings": retained_p4_settings(appearance_dir)?,
+        })),
+    }
+}
+
 pub fn prepared_p4_requires_system_cues(appearance_dir: &Path) -> Result<bool, String> {
     let bytes = std::fs::read(p4_ready_profile_root(appearance_dir).join("p4/manifest.json"))
         .map_err(|e| e.to_string())?;
@@ -5519,7 +5549,10 @@ fn prepare_p4_appearance_with_settings(
     let _guard = p4_ready_prepare_lock()
         .lock()
         .map_err(|error| format!("lock P4 ready preparation failed: {error}"))?;
-    let settings = settings.unwrap_or_else(|| inspect_prepared_p4_appearance(appearance_dir).map(|value| value.settings).unwrap_or_default());
+    let settings = match settings {
+        Some(settings) => settings,
+        None => retained_p4_settings(appearance_dir)?,
+    };
     if !["standard", "high"].contains(&settings.quality.as_str()) || !["smooth", "nearest"].contains(&settings.scaler.as_str()) || settings.bitrates_kbps.values().any(|rate| *rate == 0 || *rate > 10_000) {
         return Err("Invalid appearance quality, scaler, or bitrate".into());
     }
@@ -5635,8 +5668,19 @@ fn prepare_p4_appearance_with_settings(
         .map_err(|e| format!("write P4 bitrate metadata failed: {e}"))?;
     let (_, prepared) = load_p4_pack_from_profile_root(staging.path())?;
 
+    // Preferences outlive the disposable pack. Stage their atomic write before activation;
+    // preserve the previous pack until both the pack and preferences have been committed.
+    let mut settings_file = tempfile::NamedTempFile::new_in(appearance_dir)
+        .map_err(|e| format!("stage appearance settings failed: {e}"))?;
+    settings_file.write_all(&serde_json::to_vec(&settings).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("stage appearance settings failed: {e}"))?;
+    settings_file.as_file().sync_all().map_err(|e| format!("flush appearance settings failed: {e}"))?;
+    let persist_settings = || settings_file.persist(appearance_dir.join(P4_SETTINGS_FILE))
+        .map(|_| ()).map_err(|e| format!("save appearance settings failed: {e}"));
+
     if let Ok((_, existing)) = load_p4_pack_from_profile_root(&final_root) {
         if existing.pack_id == prepared.pack_id && serde_json::to_vec(&existing.settings).ok() == serde_json::to_vec(&prepared.settings).ok() && existing.actual_bitrates_kbps == prepared.actual_bitrates_kbps {
+            persist_settings()?;
             return Ok(existing);
         }
     }
@@ -5653,6 +5697,11 @@ fn prepare_p4_appearance_with_settings(
         }
         let _ = std::fs::remove_dir_all(&staging_path);
         return Err(format!("activate prepared P4 ready pack failed: {error}"));
+    }
+    if let Err(error) = persist_settings() {
+        let _ = std::fs::remove_dir_all(&final_root);
+        if backup.exists() { let _ = std::fs::rename(&backup, &final_root); }
+        return Err(error);
     }
     if backup.exists() {
         let _ = std::fs::remove_dir_all(&backup);
@@ -8166,6 +8215,55 @@ mod tests {
         assert!(args.iter().any(|arg| arg.contains("flags=lanczos")));
     }
 
+    fn high_p4_test_settings() -> P4AppearanceSettings {
+        P4AppearanceSettings { quality: "high".into(), scaler: "nearest".into(),
+            bitrates_kbps: [("idle.default".into(), 1700)].into_iter().collect() }
+    }
+
+    #[test]
+    fn retained_p4_settings_survive_missing_pack_and_reject_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = tmp.path().join(P4_SETTINGS_FILE);
+        std::fs::write(&saved, serde_json::to_vec(&high_p4_test_settings()).unwrap()).unwrap();
+        let settings = retained_p4_settings(tmp.path()).unwrap();
+        assert_eq!(settings.quality, "high");
+        assert_eq!(settings.scaler, "nearest");
+        assert_eq!(settings.bitrates_kbps["idle.default"], 1700);
+        std::fs::write(saved, b"{").unwrap();
+        assert!(retained_p4_settings(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn retained_p4_settings_read_legacy_metadata_even_when_pack_is_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = p4_ready_profile_root(tmp.path());
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("settings.json"), serde_json::to_vec(&high_p4_test_settings()).unwrap()).unwrap();
+        let settings = retained_p4_settings(tmp.path()).unwrap();
+        assert_eq!(settings.quality, "high");
+        assert_eq!(settings.scaler, "nearest");
+    }
+
+    #[test]
+    fn inspection_retains_saved_preferences_without_reporting_an_invalid_pack_as_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(P4_SETTINGS_FILE), serde_json::to_vec(&high_p4_test_settings()).unwrap()).unwrap();
+        let state = inspect_p4_appearance_state(tmp.path()).unwrap();
+        assert_eq!(state["packReady"], false);
+        assert_eq!(state["settings"]["quality"], "high");
+        assert_eq!(state["settings"]["scaler"], "nearest");
+        assert_eq!(state["settings"]["bitratesKbps"]["idle.default"], 1700);
+        assert!(state.get("byteCount").is_none());
+    }
+
+    #[test]
+    fn retained_p4_settings_do_not_silently_reset_a_customized_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(retained_p4_settings(tmp.path()).unwrap().quality, "standard");
+        std::fs::write(tmp.path().join("custom-p4-settings"), b"1").unwrap();
+        assert!(retained_p4_settings(tmp.path()).is_err());
+    }
+
     #[test]
     fn invalid_rebuild_settings_leave_existing_pack_untouched() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8257,13 +8355,43 @@ mod tests {
         image::RgbaImage::from_pixel(1536, 1872, image::Rgba([20, 80, 160, 255])).save(&atlas).unwrap();
         std::fs::write(tmp.path().join("manifest.json"), serde_json::to_vec(&serde_json::json!({"type":"codex-import", "families":[{"ok":true,"family":"idle.default","taskId":"codex-row-0","videoPath":"missing-preview.mp4"}]})).unwrap()).unwrap();
         let first = rebuild_p4_appearance(tmp.path(), tmp.path(), P4AppearanceSettings::default()).unwrap();
-        let high = P4AppearanceSettings { quality: "high".into(), scaler: "nearest".into(), ..Default::default() };
+        let high = high_p4_test_settings();
         let second = rebuild_p4_appearance(tmp.path(), tmp.path(), high).unwrap();
         assert!(second.actual_bitrates_kbps["idle.default"] > first.actual_bitrates_kbps["idle.default"]);
         assert_ne!(first.pack_id, second.pack_id);
+        let saved = tmp.path().join(P4_SETTINGS_FILE);
+        assert!(saved.is_file(), "quality preferences must be outside the disposable pack");
+        // Migrate an already prepared pre-fix pack without re-encoding.
+        std::fs::remove_file(&saved).unwrap();
+        assert_eq!(prepare_p4_appearance(tmp.path(), tmp.path()).unwrap().pack_id, second.pack_id);
+        assert!(saved.is_file());
+        std::fs::remove_dir_all(tmp.path().join(P4_READY_DIR_NAME)).unwrap();
+        let rebuilt = prepare_p4_appearance(tmp.path(), tmp.path()).unwrap();
+        assert_eq!(rebuilt.settings.quality, "high");
+        assert_eq!(rebuilt.settings.scaler, "nearest");
+        assert_eq!(rebuilt.settings.bitrates_kbps["idle.default"], 1700);
+        assert_eq!(rebuilt.actual_bitrates_kbps, second.actual_bitrates_kbps);
+        let retained = std::fs::read(&saved).unwrap();
         std::fs::remove_file(&atlas).unwrap();
         assert!(rebuild_p4_appearance(tmp.path(), tmp.path(), P4AppearanceSettings::default()).unwrap_err().contains("Original atlas"));
-        assert_eq!(inspect_prepared_p4_appearance(tmp.path()).unwrap().pack_id, second.pack_id);
+        assert_eq!(inspect_prepared_p4_appearance(tmp.path()).unwrap().pack_id, rebuilt.pack_id);
+        assert_eq!(std::fs::read(saved).unwrap(), retained, "failed rebuild must preserve saved preferences");
+    }
+
+    #[test]
+    #[ignore = "requires audited platform FFmpeg and hardware encoder"]
+    fn p4_settings_commit_failure_preserves_previous_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let atlas = tmp.path().join("source.webp");
+        image::RgbaImage::from_pixel(1536, 1872, image::Rgba([20, 80, 160, 255])).save(&atlas).unwrap();
+        std::fs::write(tmp.path().join("manifest.json"), serde_json::to_vec(&serde_json::json!({"type":"codex-import", "families":[{"ok":true,"family":"idle.default","taskId":"codex-row-0","videoPath":"missing-preview.mp4"}]})).unwrap()).unwrap();
+        let first = rebuild_p4_appearance(tmp.path(), tmp.path(), P4AppearanceSettings::default()).unwrap();
+        let saved = tmp.path().join(P4_SETTINGS_FILE);
+        std::fs::remove_file(&saved).unwrap();
+        std::fs::create_dir(&saved).unwrap(); // Atomic preference activation must fail.
+        let error = rebuild_p4_appearance(tmp.path(), tmp.path(), high_p4_test_settings()).unwrap_err();
+        assert!(error.contains("save appearance settings failed"));
+        assert_eq!(inspect_prepared_p4_appearance(tmp.path()).unwrap().pack_id, first.pack_id);
     }
 
     #[test]
@@ -8283,7 +8411,7 @@ mod tests {
         });
         receiver.recv().unwrap();
         let settings = P4AppearanceSettings { quality: "high".into(), scaler: "nearest".into(), ..Default::default() };
-        std::fs::write(p4_ready_profile_root(tmp.path()).join("settings.json"), serde_json::to_vec(&settings).unwrap()).unwrap();
+        std::fs::write(tmp.path().join(P4_SETTINGS_FILE), serde_json::to_vec(&settings).unwrap()).unwrap();
         drop(guard);
         let result = queued.join().unwrap();
         assert_eq!(result.settings.quality, "high");

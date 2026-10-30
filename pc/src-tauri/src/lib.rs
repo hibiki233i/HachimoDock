@@ -10,7 +10,8 @@
  *          current-followed-Agent daily Token telemetry, SSH state fallback, and
  *          active speech sync plus immediate reconnect replay, a P4 host
  *          heartbeat, and verified USB binding refresh, built-in
- *          appearance default/override WAV cue sync, P4 quality inspection and
+ *          appearance default/override WAV cue sync, independent saved-quality inspection
+ *          even when a P4 pack needs rebuilding, and
  *          forced rebuild plus cached-slot reuse,
  *          persistent USB transfer diagnostics, and serialized, exact-board
  *          native-only appearance attempts,
@@ -6790,6 +6791,12 @@ fn read_builtin_video_overrides(local_dir: &Path, base: &Path) -> Result<HashMap
     Ok(overrides)
 }
 
+fn builtin_terrier_has_customization(local_dir: &Path, base: &Path) -> Result<bool, String> {
+    Ok(builtin_terrier_has_audio_overrides(local_dir)?
+        || !read_builtin_video_overrides(local_dir, base)?.is_empty()
+        || local_dir.join("custom-p4-settings").is_file())
+}
+
 fn ensure_builtin_terrier_source(
     app_local_data_dir: &Path,
     clips_dir: &Path,
@@ -7024,12 +7031,15 @@ async fn rebuild_p4_appearance(
 #[tauri::command]
 async fn inspect_p4_appearance(
     app_handle: tauri::AppHandle, appearance_id: String,
-) -> Result<usb_serial::PreparedP4Appearance, String> {
+) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let id = validate_appearance_id(&appearance_id)?;
         let base = app_handle.path().app_local_data_dir().map_err(|e| e.to_string())?;
-        let dir = base.join("custom-appearances").join(id);
-        usb_serial::inspect_prepared_p4_appearance(&dir)
+        let local_dir = base.join("custom-appearances").join(id);
+        let dir = if id == "builtin-terrier" && !builtin_terrier_has_customization(&local_dir, &base)? {
+            app_handle.path().resource_dir().map_err(|e| e.to_string())?.join("terrier-clips")
+        } else { local_dir };
+        usb_serial::inspect_p4_appearance_state(&dir)
     }).await.map_err(|error| error.to_string())?
 }
 
@@ -7141,9 +7151,7 @@ async fn usb_sync_appearance(
         let local_dir = app_local_data_dir
             .join("custom-appearances")
             .join("builtin-terrier");
-        let has_overrides = builtin_terrier_has_audio_overrides(&local_dir)?
-            || !read_builtin_video_overrides(&local_dir, &app_local_data_dir)?.is_empty()
-            || local_dir.join("custom-p4-settings").is_file();
+        let has_overrides = builtin_terrier_has_customization(&local_dir, &app_local_data_dir)?;
         match sync_runtime {
             UsbAppearanceSyncRuntime::EspP4 if has_overrides => {
                 prepare_builtin_p4_if_stale(
@@ -12465,6 +12473,27 @@ mod tests {
         assert!(!builtin_terrier_has_audio_overrides(tmp.path()).unwrap());
         fs::write(&path, "broken").unwrap();
         assert!(builtin_terrier_has_audio_overrides(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn builtin_inspection_and_sync_use_the_factory_pack_after_customization_is_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("custom-appearances/builtin-terrier");
+        fs::create_dir_all(&local).unwrap();
+        assert!(!builtin_terrier_has_customization(&local, tmp.path()).unwrap());
+        fs::write(local.join("custom-p4-settings"), b"1").unwrap();
+        assert!(builtin_terrier_has_customization(&local, tmp.path()).unwrap());
+        fs::remove_file(local.join("custom-p4-settings")).unwrap();
+        fs::write(local.join("audio-overrides.json"), r#"{"done":"audio-overrides/done.wav"}"#).unwrap();
+        assert!(builtin_terrier_has_customization(&local, tmp.path()).unwrap());
+        fs::write(local.join("audio-overrides.json"), b"{}").unwrap();
+        fs::create_dir_all(local.join("video-overrides")).unwrap();
+        fs::write(local.join("video-overrides/welcome.mp4"), b"video").unwrap();
+        fs::write(local.join("video-overrides.json"), r#"{"welcome":"custom-appearances/builtin-terrier/video-overrides/welcome.mp4"}"#).unwrap();
+        assert!(builtin_terrier_has_customization(&local, tmp.path()).unwrap());
+        fs::write(local.join("video-overrides.json"), b"{}").unwrap();
+        fs::write(local.join("factory-settings-reset"), b"1").unwrap();
+        assert!(!builtin_terrier_has_customization(&local, tmp.path()).unwrap());
     }
 
     #[test]

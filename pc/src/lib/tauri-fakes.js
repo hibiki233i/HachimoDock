@@ -10,7 +10,7 @@ export const BaseDirectory = { AppLocalData: 1 };
 /** Path -> string (text files) or Uint8Array (binary files). */
 export const files = new Map();
 /** Set failPrepare to make `prepare_p4_appearance` reject; calls records every invoked command. */
-export const state = { failPrepare: false, calls: [] };
+export const state = { failPrepare: false, failWritePath: "", calls: [] };
 
 const norm = (p) => String(p).replace(/\/+/g, "/").replace(/\/$/, "");
 const isDir = (p) => [...files.keys()].some((k) => k.startsWith(`${norm(p)}/`));
@@ -33,8 +33,14 @@ export async function readTextFile(p) {
   return typeof f === "string" ? f : new TextDecoder().decode(f);
 }
 export async function remove(p) { files.delete(norm(p)); }
-export async function writeFile(p, bytes) { files.set(norm(p), new Uint8Array(bytes)); }
-export async function writeTextFile(p, text) { files.set(norm(p), String(text)); }
+function checkWrite(p) {
+  if (state.failWritePath === norm(p)) {
+    state.failWritePath = "";
+    throw new Error("write failed");
+  }
+}
+export async function writeFile(p, bytes) { checkWrite(p); files.set(norm(p), new Uint8Array(bytes)); }
+export async function writeTextFile(p, text) { checkWrite(p); files.set(norm(p), String(text)); }
 
 export async function appLocalDataDir() { return "/app"; }
 export async function join(...parts) { return parts.join("/").replace(/\/+/g, "/"); }

@@ -4,7 +4,7 @@ import { register } from "node:module";
 
 // Run the real store against in-memory Tauri stand-ins so rollback and recovery are executed, not just read.
 register("./tauri-fakes-hooks.mjs", import.meta.url);
-const { replaceFamilyVideo, getAppearance, listAppearances, invalidateAppearanceCache, restoreBuiltinFactoryAppearance } = await import("./appearance-store.js");
+const { replaceFamilyVideo, getAppearance, listAppearances, invalidateAppearanceCache, restoreBuiltinFactoryAppearance, restoreBuiltinVideos, replaceFamilyAudioCue, removeFamilyAudioCue } = await import("./appearance-store.js");
 const { files, state } = await import("./tauri-fakes.js");
 
 const BASE = "custom-appearances/builtin-terrier";
@@ -18,6 +18,7 @@ function seed({ pending = null, overridesText, revisionsText } = {}) {
   files.clear();
   invalidateAppearanceCache();
   state.failPrepare = false;
+  state.failWritePath = "";
   state.calls.length = 0;
   files.set(IDLE, new Uint8Array([1, 2, 3]));
   files.set(OVERRIDES, overridesText ?? JSON.stringify({ idle: IDLE }, null, 2));
@@ -25,7 +26,7 @@ function seed({ pending = null, overridesText, revisionsText } = {}) {
   if (pending !== null) files.set(PENDING, pending);
 }
 const bytes = (p) => (files.has(p) ? Array.from(files.get(p)) : null);
-const text = (p) => (files.has(p) ? files.get(p) : null);
+const text = (p) => !files.has(p) ? null : typeof files.get(p) === "string" ? files.get(p) : new TextDecoder().decode(files.get(p));
 const replace = (family) => replaceFamilyVideo({
   appearanceId: "builtin-terrier", family, videoBytes: new Uint8Array([9, 9, 9]), taskId: "t", videoUrl: "u", prompt: "p",
 });
@@ -93,4 +94,45 @@ test("factory restore recovers a default appearance with damaged video settings"
   assert.deepEqual(JSON.parse(text(OVERRIDES)), {});
   assert.equal(files.has(`${BASE}/factory-settings-reset`), true);
   assert.deepEqual(bytes(IDLE), [1, 2, 3], "factory restore preserves saved source media");
+});
+
+for (const family of ["idle", undefined]) {
+  test(`failed restoration of ${family || "all videos"} preserves overrides and pending state`, async () => {
+    seed({ pending: "previous-token" });
+    files.set(`${BASE}/custom-p4-settings`, "1");
+    const before = { overrides: text(OVERRIDES), pending: text(PENDING) };
+    state.failPrepare = true;
+    await assert.rejects(restoreBuiltinVideos(family), /encode failed/);
+    assert.deepEqual({ overrides: text(OVERRIDES), pending: text(PENDING) }, before);
+    const record = await getAppearance("builtin-terrier");
+    assert.equal(record.families.find(item => item.family === "idle").videoPath, IDLE);
+  });
+}
+
+for (const operation of ["replace", "remove"]) {
+  test(`failed builtin audio ${operation} preserves the previous audio and pending state`, async () => {
+    seed();
+    const audioPath = `${BASE}/audio-overrides/done.wav`;
+    const audioOverrides = `${BASE}/audio-overrides.json`;
+    files.set(audioPath, new Uint8Array([4, 5, 6]));
+    files.set(audioOverrides, JSON.stringify({ done: audioPath }));
+    const before = { audio: bytes(audioPath), overrides: text(audioOverrides), pending: text(PENDING) };
+    state.failPrepare = true;
+    const call = operation === "replace"
+      ? replaceFamilyAudioCue({ appearanceId: "builtin-terrier", family: "done", audioBytes: new Uint8Array([9]) })
+      : removeFamilyAudioCue({ appearanceId: "builtin-terrier", family: "done" });
+    await assert.rejects(call, /encode failed/);
+    assert.deepEqual({ audio: bytes(audioPath), overrides: text(audioOverrides), pending: text(PENDING) }, before);
+  });
+}
+
+test("a failed factory reset restores every selection marker even after metadata was written", async () => {
+  seed({ pending: "old-pending" });
+  files.set(`${BASE}/custom-p4-settings`, "1");
+  const before = { overrides: text(OVERRIDES), revisions: text(REVISIONS), pending: text(PENDING) };
+  state.failWritePath = `${BASE}/factory-settings-reset`;
+  await assert.rejects(restoreBuiltinFactoryAppearance(), /write failed/);
+  assert.deepEqual({ overrides: text(OVERRIDES), revisions: text(REVISIONS), pending: text(PENDING) }, before);
+  assert.equal(text(`${BASE}/custom-p4-settings`), "1");
+  assert.equal(files.has(`${BASE}/factory-settings-reset`), false);
 });
