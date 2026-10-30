@@ -82,6 +82,30 @@ bool pet_p4_net_auth_locked(const pet_p4_net_auth_guard_t *guard, uint64_t now_m
 void pet_p4_net_auth_failure(pet_p4_net_auth_guard_t *guard, uint64_t now_ms);
 void pet_p4_net_auth_success(pet_p4_net_auth_guard_t *guard);
 
+/* Splits a byte stream into lines inside a caller-owned buffer. A line longer than capacity - 1 is
+ * never delivered, not even its tail: the splitter reports PET_P4_NET_LINE_OVERFLOW once, then
+ * discards bytes through the next newline, so a truncated fragment cannot pass for a command. */
+typedef struct {
+  char *buffer;
+  size_t capacity;
+  size_t used;
+  bool discarding;
+} pet_p4_net_line_t;
+
+typedef enum {
+  PET_P4_NET_LINE_NONE = 0,
+  /* A complete, non-empty line is in `buffer`, NUL-terminated. It stays valid until the next feed. */
+  PET_P4_NET_LINE_READY,
+  /* The current line outgrew the buffer; reported on the first byte that did not fit. */
+  PET_P4_NET_LINE_OVERFLOW,
+} pet_p4_net_line_event_t;
+
+void pet_p4_net_line_init(pet_p4_net_line_t *line, char *buffer, size_t capacity);
+/* Drops any partial line, including an overflow still being discarded (new session). */
+void pet_p4_net_line_reset(pet_p4_net_line_t *line);
+/* `\r` and empty lines are ignored. */
+pet_p4_net_line_event_t pet_p4_net_line_feed(pet_p4_net_line_t *line, char ch);
+
 /* 1 s, 2 s, 4 s ... capped at 30 s; attempt is the number of consecutive failures so far. */
 uint32_t pet_p4_net_backoff_ms(uint32_t attempt);
 

@@ -9,6 +9,7 @@
 #include "pet_p4_net_core.h"
 
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 
 static void test_inbound_allowlist(void) {
@@ -137,6 +138,82 @@ static void test_auth_guard_locks_after_repeated_failures_and_recovers(void) {
   assert(guard.failures == 0 && !pet_p4_net_auth_locked(&guard, now));
 }
 
+typedef struct {
+  unsigned ready;
+  unsigned overflow;
+  char last[32];
+} feed_result_t;
+
+static feed_result_t feed(pet_p4_net_line_t *line, const char *text) {
+  feed_result_t result = {0};
+  for (const char *p = text; *p; ++p) {
+    pet_p4_net_line_event_t event = pet_p4_net_line_feed(line, *p);
+    if (event == PET_P4_NET_LINE_READY) {
+      result.ready += 1;
+      snprintf(result.last, sizeof(result.last), "%s", line->buffer);
+    } else if (event == PET_P4_NET_LINE_OVERFLOW) {
+      result.overflow += 1;
+    }
+  }
+  return result;
+}
+
+static void test_line_splitter_delivers_whole_lines(void) {
+  char storage[8]; /* longest deliverable line: 7 bytes + NUL */
+  pet_p4_net_line_t line;
+  pet_p4_net_line_init(&line, storage, sizeof(storage));
+  feed_result_t r = feed(&line, "ab\n");
+  assert(r.ready == 1 && r.overflow == 0 && strcmp(r.last, "ab") == 0);
+  r = feed(&line, "cd\r\n");
+  assert(r.ready == 1 && strcmp(r.last, "cd") == 0);
+  r = feed(&line, "\n\r\n\n");
+  assert(r.ready == 0 && r.overflow == 0);
+  r = feed(&line, "1234567\n");
+  assert(r.ready == 1 && r.overflow == 0 && strcmp(r.last, "1234567") == 0);
+  r = feed(&line, "x\ny\nz\n");
+  assert(r.ready == 3 && strcmp(r.last, "z") == 0);
+  r = feed(&line, "no newline yet");
+  assert(r.ready == 0);
+}
+
+static void test_line_splitter_never_delivers_the_tail_of_an_oversized_line(void) {
+  char storage[8];
+  pet_p4_net_line_t line;
+  pet_p4_net_line_init(&line, storage, sizeof(storage));
+  /* 8 bytes do not fit; the remainder looks like a perfectly valid command. */
+  feed_result_t r = feed(&line, "12345678{\"topic\":\"ack\",\"payload\":{}}\n");
+  assert(r.overflow == 1 && "reported once, on the first byte that did not fit");
+  assert(r.ready == 0 && "the tail must not become a line");
+  r = feed(&line, "ok\n");
+  assert(r.ready == 1 && r.overflow == 0 && strcmp(r.last, "ok") == 0);
+
+  /* Overflow ended by an immediate newline, and a very long line, each report exactly once. */
+  r = feed(&line, "12345678\nnext\n");
+  assert(r.overflow == 1 && r.ready == 1 && strcmp(r.last, "next") == 0);
+  char huge[2049];
+  memset(huge, 'A', sizeof(huge) - 1);
+  huge[sizeof(huge) - 1] = '\0';
+  r = feed(&line, huge);
+  assert(r.overflow == 1 && r.ready == 0);
+  r = feed(&line, "\nfine\n");
+  assert(r.overflow == 0 && r.ready == 1 && strcmp(r.last, "fine") == 0);
+}
+
+static void test_line_splitter_reset_starts_a_clean_session(void) {
+  char storage[8];
+  pet_p4_net_line_t line;
+  pet_p4_net_line_init(&line, storage, sizeof(storage));
+  feed_result_t r = feed(&line, "12345678tail");
+  assert(r.overflow == 1 && line.discarding);
+  pet_p4_net_line_reset(&line); /* a new client attaches mid-discard */
+  r = feed(&line, "ok\n");
+  assert(r.ready == 1 && strcmp(r.last, "ok") == 0);
+  feed(&line, "par");
+  pet_p4_net_line_reset(&line); /* a dead session's partial line is not spliced into the next */
+  r = feed(&line, "tial\n");
+  assert(r.ready == 1 && strcmp(r.last, "tial") == 0);
+}
+
 static void test_backoff_is_exponential_and_capped(void) {
   assert(pet_p4_net_backoff_ms(0) == 1000);
   assert(pet_p4_net_backoff_ms(1) == 2000);
@@ -166,6 +243,9 @@ int main(void) {
   test_proof_message_matches_the_desktop_contract();
   test_hex_and_constant_time_compare();
   test_auth_guard_locks_after_repeated_failures_and_recovers();
+  test_line_splitter_delivers_whole_lines();
+  test_line_splitter_never_delivers_the_tail_of_an_oversized_line();
+  test_line_splitter_reset_starts_a_clean_session();
   test_backoff_is_exponential_and_capped();
   test_disconnect_reasons_map_to_stable_codes();
   return 0;

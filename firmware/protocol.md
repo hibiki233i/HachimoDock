@@ -84,6 +84,10 @@ sends `net/keepalive` every 3 s and drops a client silent for 15 s; the desktop 
 for 12 s and reconnects with a fresh `bind`/snapshot. The stream is **authenticated but not
 encrypted**: use trusted networks.
 
+**Line limit.** A Wi-Fi line may hold at most 16,383 bytes. A longer line is answered once with
+`protocol/error {ok:false, error:"line_too_long"}` and discarded through its newline: its tail is never
+parsed as a command. A client that attaches starts with an empty line buffer.
+
 **Allowed topics.** Desktop to board: `ack, bind, system/heartbeat, speech/text, session/current,
 control/screen-page, control/command, stats/update, runtime/stats, state/*, diagnostics/*, network/*`.
 Anything else is answered `protocol/ack {ok:false, code:"wifi_unsupported"}`. Board to desktop

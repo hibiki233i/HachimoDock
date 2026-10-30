@@ -149,6 +149,41 @@ void pet_p4_net_auth_success(pet_p4_net_auth_guard_t *guard) {
   guard->locked_until_ms = 0;
 }
 
+void pet_p4_net_line_init(pet_p4_net_line_t *line, char *buffer, size_t capacity) {
+  line->buffer = buffer;
+  line->capacity = capacity;
+  line->used = 0;
+  line->discarding = false;
+}
+
+void pet_p4_net_line_reset(pet_p4_net_line_t *line) {
+  line->used = 0;
+  line->discarding = false;
+}
+
+pet_p4_net_line_event_t pet_p4_net_line_feed(pet_p4_net_line_t *line, char ch) {
+  if (!line->buffer || line->capacity < 2 || ch == '\r') return PET_P4_NET_LINE_NONE;
+  if (ch == '\n') {
+    if (line->discarding) {
+      line->discarding = false;
+      line->used = 0;
+      return PET_P4_NET_LINE_NONE;
+    }
+    if (line->used == 0) return PET_P4_NET_LINE_NONE;
+    line->buffer[line->used] = '\0';
+    line->used = 0;
+    return PET_P4_NET_LINE_READY;
+  }
+  if (line->discarding) return PET_P4_NET_LINE_NONE;
+  if (line->used + 1 >= line->capacity) {
+    line->discarding = true;
+    line->used = 0;
+    return PET_P4_NET_LINE_OVERFLOW;
+  }
+  line->buffer[line->used++] = ch;
+  return PET_P4_NET_LINE_NONE;
+}
+
 uint32_t pet_p4_net_backoff_ms(uint32_t attempt) {
   uint32_t exponent = attempt > 5 ? 5 : attempt;
   return 1000U << exponent > 30000U ? 30000U : 1000U << exponent;

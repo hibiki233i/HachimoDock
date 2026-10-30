@@ -104,7 +104,7 @@ static const pet_p4_transport_route_t g_network_route = PET_P4_TRANSPORT_NETWORK
 #define PET_P4_NET_LINE_BUFFER_BYTES 16384
 // Owned by the network task only (bytes of the authenticated Wi-Fi client).
 static char *g_net_line_buffer;
-static size_t g_net_line_used;
+static pet_p4_net_line_t g_net_line;
 
 static void mark_usb_protocol_seen(void);
 static bool usb_protocol_seen(void);
@@ -622,25 +622,28 @@ static void network_rx(const uint8_t *data, size_t len, void *ctx) {
   (void) ctx;
   if (!g_net_line_buffer) return;
   for (size_t i = 0; i < len; ++i) {
-    char ch = (char) data[i];
-    if (ch == '\r') continue;
-    if (ch == '\n') {
-      g_net_line_buffer[g_net_line_used] = '\0';
-      if (g_net_line_used > 0) {
+    switch (pet_p4_net_line_feed(&g_net_line, (char) data[i])) {
+      case PET_P4_NET_LINE_READY:
         (void) enqueue_protocol_line(g_net_line_buffer, transport_send_line, (void *) &g_network_route, NULL);
-      }
-      g_net_line_used = 0;
-    } else if (g_net_line_used + 1 < PET_P4_NET_LINE_BUFFER_BYTES) {
-      g_net_line_buffer[g_net_line_used++] = ch;
-    } else {
-      g_net_line_used = 0;
+        break;
+      case PET_P4_NET_LINE_OVERFLOW:
+        // The rest of the oversized line is discarded through its newline; it never becomes a command.
+        transport_send_line(
+          "{\"topic\":\"protocol/error\",\"payload\":{\"ok\":false,\"error\":\"line_too_long\"}}",
+          (void *) &g_network_route
+        );
+        break;
+      case PET_P4_NET_LINE_NONE:
+      default:
+        break;
     }
   }
 }
 
 static void network_client(bool attached, void *ctx) {
   (void) ctx;
-  if (attached) g_net_line_used = 0; // never splice a dead session's partial line into a new one
+  // Never splice a dead session's partial line (or an overflow being discarded) into a new one.
+  if (attached) pet_p4_net_line_reset(&g_net_line);
 }
 
 static void uart_rx_task(void *arg) {
@@ -784,6 +787,7 @@ void app_main(void) {
     ESP_LOGW(TAG, "A/B firmware OTA unavailable: %s", esp_err_to_name(ota_err));
   }
   g_net_line_buffer = heap_caps_calloc(1, PET_P4_NET_LINE_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (g_net_line_buffer) pet_p4_net_line_init(&g_net_line, g_net_line_buffer, PET_P4_NET_LINE_BUFFER_BYTES);
   const esp_app_desc_t *app_desc = esp_app_get_description();
   const pet_p4_network_config_t network_config = {
     .board_device_id = g_state.board_device_id,
