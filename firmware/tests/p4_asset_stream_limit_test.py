@@ -36,9 +36,29 @@ int main(int argc, char **argv) {
 """
 
 
+def h264_manifest(stream_bytes):
+    return {
+        "format": "p4-h264-v1",
+        "families": [
+            {"family": name, "path": f"p4/{name}.h264", "frames": 1, "streamBytes": size}
+            for name, size in stream_bytes.items()
+        ],
+    }
+
+
+def mjpeg_manifest(frame_sizes):
+    return {
+        "format": "p4-mjpeg-v1",
+        "families": [
+            {"family": name, "path": f"p4/{name}", "frames": len(sizes), "frameSizes": sizes}
+            for name, sizes in frame_sizes.items()
+        ],
+    }
+
+
 @pytest.fixture(scope="module")
 def parse_catalog(tmp_path_factory):
-    """Build the real parser once; return parse({family: streamBytes}) -> (accepted, family_count)."""
+    """Build the real parser once; return parse(manifest) -> (accepted, family_count)."""
     tmp = tmp_path_factory.mktemp("p4_catalog")
     (tmp / "esp_heap_caps.h").write_text(HEAP_CAPS_STUB)
     (tmp / "harness.c").write_text(HARNESS)
@@ -48,14 +68,7 @@ def parse_catalog(tmp_path_factory):
         check=True,
     )
 
-    def parse(stream_bytes):
-        manifest = {
-            "format": "p4-h264-v1",
-            "families": [
-                {"family": name, "path": f"p4/{name}.h264", "frames": 1, "streamBytes": size}
-                for name, size in stream_bytes.items()
-            ],
-        }
+    def parse(manifest):
         path = tmp / "manifest.json"
         path.write_text(json.dumps(manifest))
         out = subprocess.run([str(tmp / "harness"), str(path)], check=True, capture_output=True, text=True)
@@ -66,15 +79,23 @@ def parse_catalog(tmp_path_factory):
 
 
 def test_stream_limit_boundary(parse_catalog):
-    assert parse_catalog({"idle": LIMIT}) == (True, 1)
-    assert parse_catalog({"idle": LIMIT + 1}) == (False, 0)
+    assert parse_catalog(h264_manifest({"idle": LIMIT})) == (True, 1)
+    assert parse_catalog(h264_manifest({"idle": LIMIT + 1})) == (False, 0)
 
 
 def test_catalog_with_every_stream_within_the_limit_parses(parse_catalog):
-    assert parse_catalog({"idle": 700_000, "working": LIMIT, "done": 1}) == (True, 3)
+    assert parse_catalog(h264_manifest({"idle": 700_000, "working": LIMIT, "done": 1})) == (True, 3)
 
 
 def test_one_oversized_stream_rejects_the_whole_catalog(parse_catalog):
-    # Intentional: the catalog is validated as a unit, so an appearance holding an action the
-    # renderer cannot play is refused up front rather than failing partway through playback.
-    assert parse_catalog({"idle": 700_000, "working": LIMIT + 1, "done": 700_000}) == (False, 0)
+    # The catalog is validated as a unit, so an appearance holding an action the renderer
+    # cannot play is refused up front rather than failing partway through playback.
+    assert parse_catalog(h264_manifest({"idle": 700_000, "working": LIMIT + 1, "done": 700_000})) == (False, 0)
+
+
+def test_legacy_mjpeg_total_is_not_held_to_the_h264_stream_limit(parse_catalog):
+    # The 2 MiB limit is for H.264 streams. A legacy MJPEG action is many small JPEG frames whose
+    # total routinely exceeds it, and those packs must keep loading.
+    frame_sizes = {"idle": [30_000] * 100}
+    assert sum(frame_sizes["idle"]) > LIMIT
+    assert parse_catalog(mjpeg_manifest(frame_sizes)) == (True, 1)
