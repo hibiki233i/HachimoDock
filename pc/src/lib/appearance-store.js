@@ -136,9 +136,17 @@ async function writeBuiltinAudioOverrides(overrides) {
   });
 }
 
+function parseBuiltinVideoMap(text) {
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.values(parsed).some(value => typeof value !== "string")) {
+    throw new Error("视频设置须为字符串映射。");
+  }
+  return parsed;
+}
+
 async function readBuiltinVideoOverrides() {
   const path = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/${BUILTIN_VIDEO_OVERRIDE_FILE}`;
-  try { return JSON.parse(await readTextFile(path, { baseDir: BaseDirectory.AppLocalData })); }
+  try { return parseBuiltinVideoMap(await readTextFile(path, { baseDir: BaseDirectory.AppLocalData })); }
   catch (error) {
     if (await exists(path, { baseDir: BaseDirectory.AppLocalData })) throw new Error(`内置视频设置无法读取：${error}`);
     return {};
@@ -148,7 +156,7 @@ async function readBuiltinVideoRevisions() {
   const path = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/${BUILTIN_VIDEO_REVISION_FILE}`;
   if (!await exists(path, { baseDir: BaseDirectory.AppLocalData })) return {};
   // Revisions only bust the preview cache, so an unreadable file is the same as none.
-  try { return JSON.parse(await readTextFile(path, { baseDir: BaseDirectory.AppLocalData })); }
+  try { return parseBuiltinVideoMap(await readTextFile(path, { baseDir: BaseDirectory.AppLocalData })); }
   catch { return {}; }
 }
 async function readOptionalText(path) {

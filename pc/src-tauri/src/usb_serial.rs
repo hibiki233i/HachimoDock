@@ -6,7 +6,8 @@
  *          lifecycle-updated status snapshots during bulk writes;
  *          persistent prebuilt P4 H.264 Annex-B/WAV ready packs plus
  *          budgeted VideoToolbox/Media Foundation encoding directly from
- *          original community atlas crops or saved video, settings-aware cache,
+ *          original community atlas crops or saved video, shared stream/audio/manifest
+ *          bitrate allocation and settings-aware cache,
  *          native-SPS structural and full-decode validation, plus paced
  *          4 Mbaud JSON control frames plus the hardware-proven 8KiB raw
  *          chunks and 64-byte macOS CH343 drain pacing,
@@ -5575,7 +5576,6 @@ fn prepare_p4_appearance_with_settings(
         } else { 900 };
         settings.bitrates_kbps.get(name).copied().unwrap_or(default_target)
     };
-    let mut groups: HashMap<(String, u32), u64> = HashMap::new();
     let mut inputs = Vec::new();
     let mut audio_bytes = 0u64;
     let mut budget_specs = Vec::new();
@@ -5589,7 +5589,6 @@ fn prepare_p4_appearance_with_settings(
         } else { p4_file_sha256_hex(&input)? };
         let target = target_for(name);
         let duration = probe_video_duration_ms(&ffmpeg, &input)?;
-        groups.insert((source.clone(), target), duration);
         let audio_path = if let Some(audio) = p4_custom_audio_path(family, name, &input, appearance_dir, app_data_dir).filter(|p| p.is_file()) {
             let output = atlas_frames.path().join("audio").join(format!("{}.wav", p4_safe_family_file_stem(name)));
             stage_p4_audio_cue(&audio, &output)?;
@@ -5601,18 +5600,12 @@ fn prepare_p4_appearance_with_settings(
     }
     let budget_manifest = build_p4_h264_manifest(&budget_specs, P4_APPEARANCE_WIDTH, P4_APPEARANCE_HEIGHT, P4_APPEARANCE_FPS, &"0".repeat(64));
     let manifest_bytes = serde_json::to_vec_pretty(&budget_manifest).map_err(|e| e.to_string())?.len() as u64;
-    let video_budget = P4_APPEARANCE_SLOT_MAX_BYTES.saturating_sub(audio_bytes + manifest_bytes);
-    let expected: f64 = groups.iter().map(|((_, rate), duration)| *duration as f64 * *rate as f64 / 8.0).sum();
-    if video_budget == 0 || expected == 0.0 { return Err("Appearance exceeds storage budget; use shorter or simpler content".into()); }
-    let scale = (video_budget as f64 * 0.8 / expected).min(1.0);
+    let actual_rates = allocate_p4_bitrates(&inputs, audio_bytes, manifest_bytes)?;
     let mut identities = HashMap::new();
     let mut rates = HashMap::new();
-    let mut actual_rates = std::collections::BTreeMap::new();
-    for (name, source_hash, target, duration) in inputs {
-        let rate = p4_rate_with_budget(target, duration, scale);
-        if rate == 0 { return Err("Appearance exceeds storage budget; use shorter or simpler content".into()); }
+    for (name, source_hash, _, _) in inputs {
+        let rate = actual_rates[&name];
         let key = p4_export_identity(&source_hash, rate, &settings.scaler, &encoder_identity, encoder.codec_name());
-        actual_rates.insert(name.clone(), rate);
         identities.insert(name, key.clone());
         rates.insert(key[..24].to_string(), rate);
     }
@@ -5896,6 +5889,34 @@ fn p4_export_identity(source: &str, rate: u32, scaler: &str, encoder_identity: &
     digest.update(encoder_identity);
     digest.update(codec.as_bytes());
     format!("{:x}", digest.finalize())
+}
+
+/// Allocate target upper bounds across unique streams after reserving normalized audio and
+/// manifest bytes. Hardware output may vary; the staged pack still undergoes byte-limit validation.
+fn allocate_p4_bitrates(
+    inputs: &[(String, String, u32, u64)],
+    audio_bytes: u64,
+    manifest_bytes: u64,
+) -> Result<std::collections::BTreeMap<String, u32>, String> {
+    let video_budget = P4_APPEARANCE_SLOT_MAX_BYTES.saturating_sub(audio_bytes + manifest_bytes);
+    let mut groups = HashMap::new();
+    for (_, source, target, duration) in inputs {
+        groups.insert((source, *target), *duration);
+    }
+    let expected: f64 = groups.iter()
+        .map(|((_, rate), duration)| *duration as f64 * *rate as f64 / 8.0)
+        .sum();
+    if video_budget == 0 || expected == 0.0 {
+        return Err("Appearance exceeds storage budget; use shorter or simpler content".into());
+    }
+    let scale = (video_budget as f64 * 0.8 / expected).min(1.0);
+    inputs.iter().map(|(name, _, target, duration)| {
+        let rate = p4_rate_with_budget(*target, *duration, scale);
+        if rate == 0 {
+            return Err("Appearance exceeds storage budget; use shorter or simpler content".into());
+        }
+        Ok((name.clone(), rate))
+    }).collect()
 }
 
 fn p4_rate_with_budget(target: u32, duration_ms: u64, scale: f64) -> u32 {
@@ -8165,6 +8186,47 @@ mod tests {
         assert_ne!(first, p4_export_identity("source-a", 900, "nearest", b"ffmpeg-a", "codec-a"));
         assert_ne!(first, p4_export_identity("source-a", 900, "smooth", b"ffmpeg-b", "codec-a"));
         assert_ne!(first, p4_export_identity("source-a", 900, "smooth", b"ffmpeg-a", "codec-b"));
+    }
+
+    #[test]
+    fn bitrate_allocation_counts_shared_source_once_but_distinct_rates_separately() {
+        // 1,000,000 bytes remain: 800,000 bytes may be assigned to video.
+        let same = vec![
+            ("idle".into(), "shared".into(), 1000, 4000),
+            ("working".into(), "shared".into(), 1000, 4000),
+        ];
+        let allocated = allocate_p4_bitrates(&same, 9_400_000, 81_664).unwrap();
+        assert_eq!(allocated["idle"], 1000);
+        assert_eq!(allocated["working"], 1000);
+        let different = vec![
+            ("idle".into(), "shared".into(), 1000, 4000),
+            ("working".into(), "shared".into(), 2000, 4000),
+        ];
+        let allocated = allocate_p4_bitrates(&different, 9_400_000, 81_664).unwrap();
+        assert_eq!(allocated["idle"], 533);
+        assert_eq!(allocated["working"], 1066);
+    }
+
+    #[test]
+    fn bitrate_allocation_reserves_audio_and_manifest_then_scales_all_targets() {
+        // Requested sizes: 2,000,000 + 1,000,000 bytes. The 20% reserve leaves
+        // 1,200,000 bytes for video, so both targets are reduced to 40%.
+        let inputs = vec![
+            ("working".into(), "a".into(), 10_000, 1600),
+            ("done".into(), "b".into(), 5000, 1600),
+        ];
+        let allocated = allocate_p4_bitrates(&inputs, 8_900_000, 81_664).unwrap();
+        assert_eq!(allocated["working"], 4000);
+        assert_eq!(allocated["done"], 2000);
+    }
+
+    #[test]
+    fn bitrate_allocation_caps_long_actions_and_rejects_unusable_budgets() {
+        let input = vec![("idle".into(), "source".into(), 1800, 20_000)];
+        assert_eq!(allocate_p4_bitrates(&input, 0, 1000).unwrap()["idle"], 671);
+        assert!(allocate_p4_bitrates(&input, 10_481_664, 1).is_err());
+        assert!(allocate_p4_bitrates(&input, 10_481_662, 1).is_err());
+        assert!(allocate_p4_bitrates(&[], 0, 1000).is_err());
     }
 
     #[test]

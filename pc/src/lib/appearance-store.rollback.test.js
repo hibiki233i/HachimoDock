@@ -4,7 +4,7 @@ import { register } from "node:module";
 
 // Run the real store against in-memory Tauri stand-ins so rollback and recovery are executed, not just read.
 register("./tauri-fakes-hooks.mjs", import.meta.url);
-const { replaceFamilyVideo, getAppearance } = await import("./appearance-store.js");
+const { replaceFamilyVideo, getAppearance, listAppearances, invalidateAppearanceCache, restoreBuiltinFactoryAppearance } = await import("./appearance-store.js");
 const { files, state } = await import("./tauri-fakes.js");
 
 const BASE = "custom-appearances/builtin-terrier";
@@ -16,6 +16,8 @@ const PENDING = `${BASE}/prepare-pending`;
 
 function seed({ pending = null, overridesText, revisionsText } = {}) {
   files.clear();
+  invalidateAppearanceCache();
+  state.failPrepare = false;
   state.calls.length = 0;
   files.set(IDLE, new Uint8Array([1, 2, 3]));
   files.set(OVERRIDES, overridesText ?? JSON.stringify({ idle: IDLE }, null, 2));
@@ -64,9 +66,31 @@ test("a successful replacement keeps the new video and leaves the marker for the
   assert.ok(state.calls.includes("prepare_p4_appearance"));
 });
 
-test("unreadable override and revision files still load the default appearance with a notice", async () => {
-  seed({ overridesText: '{"idle":', revisionsText: '{"id' });
-  const record = await getAppearance("builtin-terrier");
-  assert.ok(Array.isArray(record.families) && record.families.length > 0);
-  assert.ok(typeof record.overrideError === "string" && record.overrideError.length > 0);
+for (const [label, overridesText, revisionsText, hasOverrideError] of [
+  ["truncated overrides", '{"idle":', undefined, true],
+  ["truncated revisions", undefined, '{"idle":', false],
+  ["null overrides", 'null', undefined, true],
+  ["array overrides", '[]', undefined, true],
+  ["invalid override path", '{"idle":42}', undefined, true],
+  ["null revisions", undefined, 'null', false],
+]) {
+  test(`${label} keep the default appearance and gallery loadable`, async () => {
+    seed({ overridesText, revisionsText });
+    const record = await getAppearance("builtin-terrier");
+    assert.ok(record.families.length > 0);
+    assert.equal(Boolean(record.overrideError), hasOverrideError);
+    assert.equal(Boolean(record.families.find(item => item.family === "idle")?.videoOverride), !hasOverrideError);
+    const gallery = await listAppearances({ force: true });
+    assert.equal(gallery[0].id, "builtin-terrier");
+  });
+}
+
+test("factory restore recovers a default appearance with damaged video settings", async () => {
+  seed({ overridesText: '{"idle":', revisionsText: '{"idle":' });
+  const restored = await restoreBuiltinFactoryAppearance();
+  assert.equal(restored.overrideError, undefined);
+  assert.ok(restored.families.every(item => !item.videoOverride));
+  assert.deepEqual(JSON.parse(text(OVERRIDES)), {});
+  assert.equal(files.has(`${BASE}/factory-settings-reset`), true);
+  assert.deepEqual(bytes(IDLE), [1, 2, 3], "factory restore preserves saved source media");
 });
