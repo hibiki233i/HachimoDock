@@ -1,7 +1,8 @@
 /**
  * [Input] An appearanceId persisted by `lib/appearance-store.js` plus centralized API-settings navigation.
  * [Output] Preview-first wide appearance workspace, unified sticky current-state inspector, full-width state rail, contextual details drawer,
- *          configurable per-family WAV cue overrides, persisted video generation parameters and direct per-state MP4 replacement,
+ *          configurable per-family WAV and built-in video overrides, refreshed prepared-pack statistics without resetting draft quality inputs,
+ *          device quality/rebuild controls, and direct per-state MP4 replacement,
  *          Ark-background single-state image+prompt regeneration with read-only provider credential readiness, inline progress, cancellable exact-board USB appearance transfer, and full known-state rail.
  * [Pos] component node in pc/src
  * [Sync] If this file changes, update this header and `pc/src/.folder.md`.
@@ -29,7 +30,9 @@ import {
   replaceFamilyAudioCue,
   replaceFamilyVideo,
   readAppearanceSourceImage,
+  inspectSavedAppearance, rebuildSavedAppearance, restoreBuiltinVideos, restoreBuiltinFactoryAppearance,
 } from "./lib/appearance-store.js";
+import { parseBitrateSettings, createAppearanceOperationGate } from "./lib/appearance-overrides.js";
 import AppearancePreview from "./AppearancePreview.jsx";
 import { compressWavFileForBoard } from "./lib/audio-cue.js";
 import { mediaFromFamily, mediaFromSourceImage, mediaFromSourcePreview } from "./lib/appearance-preview.js";
@@ -147,6 +150,30 @@ function singleStateProgressFromPipeline(progress, fallbackFamily) {
 
 export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onBack, onOpenApiSettings }) {
   const [record, setRecord] = useState(null);
+  const [pack, setPack] = useState(null);
+  const [quality, setQuality] = useState("standard");
+  const [scaler, setScaler] = useState("smooth");
+  const [bitrates, setBitrates] = useState({});
+  const [rebuilding, setRebuilding] = useState(false);
+  const [packMessage, setPackMessage] = useState("");
+  const refreshPreparedPack = useCallback(async () => {
+    try {
+      const result = await inspectSavedAppearance(appearanceId);
+      setPack(result.packReady === false ? null : result);
+      setPackMessage(result.packReady === false ? "设备素材需要重新生成，已保留画质设置。" : "");
+    } catch (failure) { setPack(null); setPackMessage(`设备素材状态无法读取：${failure}`); }
+  }, [appearanceId]);
+  useEffect(() => {
+    let cancelled = false;
+    setPack(null); setQuality("standard"); setScaler("smooth"); setBitrates({});
+    inspectSavedAppearance(appearanceId).then(result => {
+      if (cancelled) return;
+      setPack(result.packReady === false ? null : result); setQuality(result.settings?.quality || "standard");
+      setPackMessage(result.packReady === false ? "设备素材需要重新生成，已保留画质设置。" : "");
+      setScaler(result.settings?.scaler || "smooth"); setBitrates(result.settings?.bitratesKbps || {});
+    }).catch(failure => { if (!cancelled) { setPack(null); setPackMessage(`设备素材状态无法读取：${failure}`); } });
+    return () => { cancelled = true; };
+  }, [appearanceId]);
   const [error, setError] = useState("");
   const [activeFamily, setActiveFamily] = useState("");
   const [audioUrl, setAudioUrl] = useState("");
@@ -165,7 +192,11 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   const [singleStatePrompt, setSingleStatePrompt] = useState("");
   const [singleStateStatus, setSingleStateStatus] = useState("idle"); // idle | generating | success | error | syncing | synced | cancelled
   const singleSubmitting = useRef(false);
-  useExitProtection(singleStateStatus === "generating" ? "形象动作仍在生成" : audioSyncState === "syncing" || singleStateStatus === "syncing" ? "形象资源仍在同步" : stateVideoState === "saving" ? "形象视频仍在保存" : "");
+  const operationGate = useRef(createAppearanceOperationGate());
+  const operationBusy = deleteState === "deleting" || rebuilding || singleStateStatus === "generating" || singleStateStatus === "syncing" || stateVideoState === "saving" || audioState === "saving" || audioSyncState === "syncing";
+  const beginOperation = () => !operationBusy && operationGate.current.begin();
+  const endOperation = () => operationGate.current.end();
+  useExitProtection(rebuilding ? "设备素材仍在生成" : singleStateStatus === "generating" ? "形象动作仍在生成" : audioSyncState === "syncing" || singleStateStatus === "syncing" ? "形象资源仍在同步" : stateVideoState === "saving" ? "形象视频仍在保存" : "");
   const [singleStateMessage, setSingleStateMessage] = useState("");
   const [singleStateProgress, setSingleStateProgress] = useState(null);
   const [singleStateDialogOpen, setSingleStateDialogOpen] = useState(false);
@@ -369,11 +400,12 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   }, [record, activeFamily]);
 
   const handleDelete = useCallback(async () => {
-    if (!record || deleteState === "deleting") return;
+    if (!record || operationBusy) return;
     if (deleteState !== "confirm") {
       setDeleteState("confirm");
       return;
     }
+    if (!beginOperation()) return;
     setDeleteState("deleting");
     setDeleteError("");
     try {
@@ -383,17 +415,20 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       console.error(deleteFailure);
       setDeleteError(deleteFailure?.message || String(deleteFailure));
       setDeleteState("idle");
+    } finally {
+      endOperation();
     }
-  }, [deleteState, record, onBack]);
+  }, [deleteState, record, onBack, operationBusy]);
 
   const handleAudioFileChange = useCallback(async (event) => {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file || !record || !activeFamily || audioState === "saving") return;
+    if (!file || !record || !activeFamily || operationBusy) return;
     if (!file.name.toLowerCase().endsWith(".wav") && !/audio\/(x-)?wav/i.test(file.type || "")) {
       setAudioErr("请上传 WAV 格式文件");
       return;
     }
+    if (!beginOperation()) return;
     setAudioState("saving");
     setAudioErr("");
     try {
@@ -404,45 +439,46 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
         audioBytes,
       });
       setRecord(nextRecord);
+      await refreshPreparedPack();
       markAudioSyncDirty(`已更新 ${activeFamily} 的提示音，请通过音效通道下发到设备。`);
     } catch (saveFailure) {
       console.error(saveFailure);
       setAudioErr(saveFailure?.message || String(saveFailure));
     } finally {
       setAudioState("idle");
+      endOperation();
     }
-  }, [activeFamily, audioState, markAudioSyncDirty, record]);
+  }, [activeFamily, audioState, markAudioSyncDirty, record, operationBusy, refreshPreparedPack]);
 
   const handleRemoveAudioCue = useCallback(async () => {
-    if (!record || !activeFamily || audioState === "saving") return;
+    if (!record || !activeFamily || operationBusy) return;
+    if (!beginOperation()) return;
     setAudioState("saving");
     setAudioErr("");
     try {
       const nextRecord = await removeFamilyAudioCue({ appearanceId: record.id, family: activeFamily });
       setRecord(nextRecord);
+      await refreshPreparedPack();
       markAudioSyncDirty(`已移除 ${activeFamily} 的提示音，请通过音效通道下发到设备。`);
     } catch (removeFailure) {
       console.error(removeFailure);
       setAudioErr(removeFailure?.message || String(removeFailure));
     } finally {
       setAudioState("idle");
+      endOperation();
     }
-  }, [activeFamily, audioState, markAudioSyncDirty, record]);
+  }, [activeFamily, audioState, markAudioSyncDirty, record, operationBusy, refreshPreparedPack]);
 
   const handleStateVideoFileChange = useCallback(async (event) => {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file || !record || !activeFamily || stateVideoState === "saving") return;
-    if (record.type === "builtin") {
-      setStateVideoState("error");
-      setStateVideoMessage("内置形象不能直接替换状态视频，请先创建自定义形象后再编辑。");
-      return;
-    }
+    if (!file || !record || !activeFamily || operationBusy) return;
     if (!isMp4VideoFile(file)) {
       setStateVideoState("error");
       setStateVideoMessage("请上传 MP4 格式的状态视频。");
       return;
     }
+    if (!beginOperation()) return;
     setStateVideoState("saving");
     setStateVideoMessage("正在写入客户端状态视频...");
     try {
@@ -456,6 +492,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
         prompt: activeRecord?.prompt || `用户上传的 ${activeFamily} 状态视频`,
       });
       setRecord(nextRecord);
+      await refreshPreparedPack();
       const message = `已上传并替换 ${activeFamily} 状态视频。需要在设备生效时，点击“替换到板端”。`;
       setStateVideoState("success");
       setStateVideoMessage(message);
@@ -466,17 +503,18 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       console.error(replaceFailure);
       setStateVideoState("error");
       setStateVideoMessage(replaceFailure?.message || String(replaceFailure));
-    }
-  }, [activeFamily, activeRecord?.prompt, record, stateVideoState]);
+    } finally { endOperation(); }
+  }, [activeFamily, activeRecord?.prompt, record, stateVideoState, operationBusy, refreshPreparedPack]);
 
   const handleSyncAudioCues = useCallback(async () => {
-    if (!record || audioSyncState === "syncing") return;
+    if (!record || operationBusy) return;
     if (!hasTauriRuntime()) {
       setAudioSyncState("error");
       setAudioSyncMessage("当前不是桌面客户端运行环境，无法通过板端音效 OTA 通道下发。");
       return;
     }
 
+    if (!beginOperation()) return;
     setAudioSyncState("syncing");
     setAudioSyncMessage("正在通过板端音效 OTA 通道下发 WAV...");
     try {
@@ -501,8 +539,9 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       setAudioSyncMessage(cancelled ? "形象素材传输已中断，设备继续保留原素材。" : message);
     } finally {
       setAppearanceCancelPending(false);
+      endOperation();
     }
-  }, [audioSyncState, boardDeviceId, record]);
+  }, [audioSyncState, boardDeviceId, record, operationBusy]);
 
   const singleStateGenerationReadyIssue = useMemo(() => {
     if (providerId === "kling") {
@@ -574,12 +613,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   }, []);
 
   const handleSingleStateGenerate = useCallback(async () => {
-    if (!record || !activeRecord?.ok || singleSubmitting.current || singleStateStatus === "generating") return;
-    if (record.type === "builtin") {
-      setSingleStateStatus("error");
-      setSingleStateMessage("内置形象不能直接替换单个状态，请先创建自定义形象后再编辑。");
-      return;
-    }
+    if (!record || !activeRecord || singleSubmitting.current || operationBusy) return;
     if (!singleStateImageFile) {
       setSingleStateStatus("error");
       setSingleStateMessage("请先上传当前状态的参考图片。");
@@ -597,12 +631,14 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       return;
     }
 
+    if (!beginOperation()) return;
     singleSubmitting.current = true;
     setSingleStateStatus("generating");
     const exitId = `single-generation:${record.id}:${activeRecord.family}`;
     setExitReason(exitId,"形象动作仍在生成");
     try { await persistSingleStateProviderConfig(); } catch (error) {
       singleSubmitting.current = false;
+      endOperation();
       setExitReason(exitId,"");
       setSingleStateStatus("error");
       setSingleStateMessage(error.message || "配置未保存，请重试。");
@@ -665,6 +701,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
         prompt: result.family.prompt,
       });
       setRecord(nextRecord);
+      await refreshPreparedPack();
       setSingleStateStatus("success");
       const successMessage = `已替换 ${activeRecord.family} 状态素材。需要在设备生效时，点击“替换到板端”。`;
       setSingleStateMessage(successMessage);
@@ -681,14 +718,17 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       setSingleStateProgress(null);
     } finally {
       singleSubmitting.current = false;
+      endOperation();
       setExitReason(exitId,"");
     }
   }, [
     activeRecord,
     record,
+    refreshPreparedPack,
     singleStateImageFile,
     singleStatePrompt,
     singleStateStatus,
+    operationBusy,
     singleStateGenerationReadyIssue,
     persistSingleStateProviderConfig,
     providerId,
@@ -707,13 +747,14 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   ]);
 
   const handleSyncSingleStateToDevice = useCallback(async () => {
-    if (!record || singleStateStatus === "syncing") return;
+    if (!record || operationBusy) return;
     if (!hasTauriRuntime()) {
       setSingleStateStatus("error");
       setSingleStateMessage("当前不是桌面客户端运行环境，无法替换到板端。");
       return;
     }
 
+    if (!beginOperation()) return;
     setSingleStateStatus("syncing");
     setSingleStateMessage("正在通过素材 OTA 通道替换到板端…");
     setStateVideoState("saving");
@@ -746,8 +787,9 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       );
     } finally {
       setAppearanceCancelPending(false);
+      endOperation();
     }
-  }, [boardDeviceId, record, singleStateStatus]);
+  }, [boardDeviceId, record, singleStateStatus, operationBusy]);
 
   const handleCancelAppearanceSync = useCallback(async () => {
     if (appearanceCancelPending) return;
@@ -769,6 +811,44 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       }
     }
   }, [appearanceCancelPending, audioSyncState, singleStateStatus]);
+
+  const handleRestoreVideos = async (family) => {
+    if (operationBusy) return;
+    if (!window.confirm(family ? `恢复 ${family} 的默认视频？` : "恢复所有默认视频？")) return;
+    if (!beginOperation()) return;
+    setStateVideoState("saving");
+    try {
+      const next = await restoreBuiltinVideos(family);
+      setRecord(next); await refreshPreparedPack(); setSingleStateStatus("success");
+      setStateVideoMessage("默认视频已恢复，请替换到板端。"); setStateVideoState("success");
+    } catch (failure) { setStateVideoState("error"); setStateVideoMessage(String(failure)); }
+    finally { endOperation(); }
+  };
+  const handleRestoreFactory = async () => {
+    if (operationBusy) return;
+    if (!window.confirm("恢复工厂形象？这会清除默认形象的视频、音效和画质自定义，保留人设与声音。恢复后请替换到板端。")) return;
+    if (!beginOperation()) return;
+    setStateVideoState("saving");
+    try {
+      setRecord(await restoreBuiltinFactoryAppearance());
+      setPack(null); setQuality("standard"); setScaler("smooth"); setBitrates({});
+      writeAudioSyncDirty(appearanceId, false); setAudioSyncDirty(false);
+      setSingleStateStatus("success"); setStateVideoState("success");
+      setStateVideoMessage("客户端已恢复工厂形象，请替换到板端。");
+    } catch (failure) { setStateVideoState("error"); setStateVideoMessage(String(failure)); }
+    finally { endOperation(); }
+  };
+  const handleRebuildPack = async () => {
+    if (!beginOperation()) return;
+    setRebuilding(true); setPackMessage("正在客户端生成设备素材…");
+    try {
+      const settings = { quality, scaler, bitratesKbps: parseBitrateSettings(bitrates) };
+      const result = await rebuildSavedAppearance(appearanceId, settings);
+      setPack(result); setSingleStateStatus("success");
+      setPackMessage("客户端素材已生成，可替换到板端。");
+    } catch (failure) { setPackMessage(`生成失败：${failure?.message || failure}`); }
+    finally { setRebuilding(false); endOperation(); }
+  };
 
   if (error) {
     return (
@@ -808,15 +888,13 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   const canEditAudio = activeRecord?.ok;
   const audioInputId = `audio-cue-${record.id}-${activeFamily || "none"}`;
   const stateVideoInputId = `state-video-${record.id}-${activeFamily || "none"}`;
-  const singleStateBusy = singleStateStatus === "generating" || singleStateStatus === "syncing";
+  const singleStateBusy = singleStateStatus === "generating" || singleStateStatus === "syncing" || rebuilding;
   const usbAppearanceSyncing =
     audioSyncState === "syncing" || singleStateStatus === "syncing";
   const stateVideoBusy = stateVideoState === "saving";
-  const canUploadStateVideo = Boolean(activeRecord) && !isBuiltin && !singleStateBusy && !stateVideoBusy;
-  const canRegenerateState = activeRecord?.ok && !isBuiltin && !singleStateBusy;
-  const canSyncSingleState =
-    !isBuiltin &&
-    ["success", "synced", "cancelled"].includes(singleStateStatus);
+  const canUploadStateVideo = Boolean(activeRecord) && !operationBusy;
+  const canRegenerateState = Boolean(activeRecord) && !operationBusy;
+  const canSyncSingleState = Boolean(record);
   const singleStateStartIssue = !singleStateImageFile
     ? "请先上传当前状态的参考图片。"
     : !singleStatePrompt.trim()
@@ -857,6 +935,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
               className="detail-audio-sync-btn"
               variant="primary"
               onClick={handleSyncAudioCues}
+              disabled={operationBusy}
               title="通过板端音效 OTA 通道下发当前 WAV"
             >
               <UploadCloud size={14} />
@@ -867,7 +946,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
             <button
               className="btn-ghost danger"
               onClick={handleDelete}
-              disabled={deleteState === "deleting"}
+              disabled={operationBusy}
             >
               {deleteState === "deleting" ? (
                 <>
@@ -889,6 +968,22 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
           )}
         </div>
       </header>
+      <details className="detail-side-section">
+        <summary>设备素材质量设置</summary>
+        <p className="muted small">自动分配各动作的空间；可为单个动作指定码率上限，整体空间不足时会按比例降低，实际结果见“各动作分配结果”。生成在客户端进行，之后需传输到设备。</p>
+        <fieldset disabled={operationBusy}>
+          <label>画质 <select value={quality} onChange={event => setQuality(event.target.value)}><option value="standard">标准</option><option value="high">高画质</option></select></label>{" "}
+          <label>缩放 <select value={scaler} onChange={event => setScaler(event.target.value)}><option value="smooth">平滑</option><option value="nearest">像素画</option></select></label>
+          <details><summary>各动作码率上限（留空为自动）</summary>
+            {stateFamilyRecords.map(item => <label key={item.family} style={{display:"block"}}>{item.family} <input type="number" min="1" max="10000" step="1" value={bitrates[item.family] ?? ""} onChange={event => setBitrates({...bitrates, [item.family]: event.target.value})} aria-label={`${item.family} 码率（kbps）`} /> kbps</label>)}
+          </details>
+          <button type="button" className="btn-primary" onClick={handleRebuildPack}>重新生成设备素材</button>
+        </fieldset>
+        {pack && <p className="muted small">设备素材 {(pack.byteCount / 1048576).toFixed(2)} MiB / {(pack.slotLimitBytes / 1048576).toFixed(2)} MiB</p>}
+        {pack && Object.keys(pack.actualBitratesKbps || {}).length > 0 && <details><summary>各动作分配结果</summary>{Object.entries(pack.actualBitratesKbps).map(([family, rate]) => <div key={family}>{family}: {rate} kbps</div>)}</details>}
+        {packMessage && <p role="status">{packMessage}</p>}
+        {canSyncSingleState && <button type="button" className="btn-ghost" disabled={operationBusy} onClick={handleSyncSingleStateToDevice}>替换到板端</button>}
+      </details>
 
       {deleteError && (
         <div className="message-banner message-banner--error">
@@ -953,6 +1048,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                       key={familyRecord.family}
                       type="button"
                       className={`state-card${isActive ? " active" : ""}`}
+                      disabled={operationBusy}
                       onClick={() => setActiveFamily(familyRecord.family)}
                     >
                       <span className="state-card__thumb">
@@ -1031,18 +1127,19 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                       className="btn-primary"
                       type="button"
                       onClick={handleSyncSingleStateToDevice}
-                      disabled={singleStateBusy}
+                      disabled={operationBusy}
                     >
                       {singleStateStatus === "syncing" ? <Loader size={14} className="spin" /> : <UploadCloud size={14} />}
                       替换到板端
                     </button>
                   )}
                 </div>
-                {isBuiltin && (
-                  <div className="muted small">
-                    内置形象不能直接替换状态视频，请先创建自定义形象后再编辑。
-                  </div>
-                )}
+                {isBuiltin && <div className="detail-state-video-upload__actions">
+                  <button type="button" className="btn-ghost" disabled={!activeRecord?.videoOverride || operationBusy} onClick={() => handleRestoreVideos(activeFamily)}>恢复当前默认动作</button>
+                  <button type="button" className="btn-ghost" disabled={operationBusy} onClick={() => handleRestoreVideos()}>恢复全部默认视频</button>
+                  <button type="button" className="btn-ghost" disabled={operationBusy} onClick={handleRestoreFactory}>恢复工厂形象</button>
+                </div>}
+                {isBuiltin && record?.overrideError && <p role="alert" className="muted small">默认形象的视频设置文件无法读取（{record.overrideError}），此处显示的是工厂视频。请点“恢复工厂形象”后重新设置。</p>}
               </div>
             </section>
           )}
@@ -1092,7 +1189,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                     type="file"
                     accept="audio/wav,audio/x-wav,.wav"
                     onChange={handleAudioFileChange}
-                    disabled={!canEditAudio || audioState === "saving"}
+                    disabled={!canEditAudio || operationBusy}
                   />
                   <label
                     className={`btn-ghost${canEditAudio ? "" : " is-disabled"}`}
@@ -1106,7 +1203,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                       className="btn-ghost danger"
                       type="button"
                       onClick={handleRemoveAudioCue}
-                      disabled={audioState === "saving"}
+                      disabled={operationBusy}
                     >
                       <Trash2 size={14} />
                       移除提示音
@@ -1126,7 +1223,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
               </div>
             </section>
           )}
-          {activeRecord?.ok && (
+          {activeRecord && (
             <section className="detail-side-section detail-side-section--regenerate">
               <div className="detail-state-regenerate-entry">
                 <div className="detail-state-regenerate-entry__header">
@@ -1154,14 +1251,14 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                       className="btn-primary"
                       type="button"
                       onClick={handleSyncSingleStateToDevice}
-                      disabled={singleStateBusy}
+                      disabled={operationBusy}
                     >
                       {singleStateStatus === "syncing" ? <Loader size={14} className="spin" /> : <UploadCloud size={14} />}
                       替换到板端
                     </button>
                   )}
                 </div>
-                {(singleStateMessage || isBuiltin) && (
+                {singleStateMessage && (
                   <div
                     className={`message-banner detail-state-regenerate-entry__message ${
                       singleStateStatus === "error"
@@ -1176,7 +1273,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                     ) : (
                       <AlertCircle size={14} />
                     )}
-                    {singleStateMessage || "内置形象不能直接替换单个状态，请先创建自定义形象后再编辑。"}
+                    {singleStateMessage}
                   </div>
                 )}
               </div>
@@ -1208,7 +1305,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
         </section>
       </details>
 
-      {singleStateDialogOpen && activeRecord?.ok && (
+      {singleStateDialogOpen && activeRecord && (
         <div className="modal-backdrop" onClick={handleCloseSingleStateDialog}>
           <div
             className="modal-card modal-card--wide single-state-regenerate-modal"
@@ -1261,7 +1358,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                     inputRef={singleStateInputRef}
                     onFileChange={handleSingleStateFile}
                     onCancel={handleCloseSingleStateDialog}
-                    canAdvance={Boolean(singleStateImageFile) && !isBuiltin}
+                    canAdvance={Boolean(singleStateImageFile)}
                     onNext={() => setSingleStateStep(1)}
                     title={`第 1 步 · 上传 ${activeRecord.family} 参考图`}
                     identityFields={false}
@@ -1269,7 +1366,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                     nextLabel="下一步：生成配置"
                   >
                     <div className="field single-state-regenerate-modal__prompt">
-                      <button type="button" className="btn-secondary btn-sm" disabled={singleStateBusy} onClick={async () => {
+                      <button type="button" className="btn-secondary btn-sm" disabled={operationBusy} onClick={async () => {
                         try {
                           const source = await readAppearanceSourceImage(record.id);
                           setSingleStateImageFile(new File([source.bytes], "saved-reference.png", { type: source.mime }));
@@ -1282,7 +1379,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                         className="field-input"
                         value={singleStatePrompt}
                         onChange={(event) => setSingleStatePrompt(event.target.value)}
-                        disabled={singleStateBusy}
+                        disabled={operationBusy}
                         placeholder="描述这个状态要生成的动作，例如：小八猫趴在纸箱里认真写字，保持黑色背景，循环动画。"
                       />
                     </div>
@@ -1370,7 +1467,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                 <Button
                   variant="primary"
                   onClick={handleSyncSingleStateToDevice}
-                  disabled={!canSyncSingleState || singleStateBusy}
+                  disabled={!canSyncSingleState || operationBusy}
                 >
                   <UploadCloud size={14} />
                   替换到板端

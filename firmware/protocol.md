@@ -372,12 +372,17 @@ volume is preserved and reported as a mount failure; only an explicit factory
 recovery/erase operation may format or replace it.
 
 Appearance slot `0` is the protected factory Westie pack. All non-built-in
-appearance transfers target replaceable slot `1` and atomically switch the
+appearance transfers, including customized Westie videos, audio, or quality, target replaceable slot `1` and atomically switch the
 active marker only after commit. Before `asset/begin` is acknowledged,
 firmware clears slot `1` using a fresh SPIFFS directory scan after every
 deletion; cleanup failure rejects the transfer instead of leaving skipped stale
 files to consume the next pack's capacity. This path never erases protected
-slot `0`.
+slot `0`. Each H.264 stream is limited to 2 MiB in both manifest validation and rendering
+(earlier firmware accepted up to 4 MiB in manifest validation). The manifest is validated
+as a unit: one H.264 stream above the limit fails the whole manifest, and firmware clears a
+manifest it cannot use. The desktop rejects such streams while preparing a pack, so only a
+pack prepared by an older desktop can hit this; preparing and syncing the appearance again
+replaces it. Legacy `p4-mjpeg-v1` totals are not subject to this limit.
 When the active slot contains a valid pre-ready-marker manifest with a
 deterministic `packId`, startup promotes that same slot by writing its ready
 marker. It does not clear either slot during migration.

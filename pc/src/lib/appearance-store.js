@@ -1,7 +1,9 @@
 /**
  * [Input] pipeline output or direct uploaded video bytes plus per-family manifest metadata.
  * [Output] cached local filesystem persistence, synchronous cached list reads, direct uploaded-video appearances,
- *          built-in appearance fallback/override merging, immediate P4-ready preparation after media mutations,
+ *          built-in video/audio override merging and restoration, P4 quality inspection/rebuild, immediate preparation after media mutations,
+ *          rollback of built-in video/audio edits or restoration whose preparation fails, and a built-in record that still loads (with `overrideError`)
+ *          when its override file is unreadable so factory restore stays reachable,
  *          source-preview/audio cue asset URLs, blob URL readers, and the per-appearance 人设与声音 document
  *          (`persona-voice.json`, normalized onto every record as `personaVoice`; new appearances are
  *          marked "persona setup pending" until saved). Successful saves refresh device-context
@@ -25,6 +27,7 @@ import {
 export { readFile as readAppearanceFile };
 import { appLocalDataDir, join } from "@tauri-apps/api/path";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { mergeVideoOverrides, removeVideoOverrides, runWithRollback } from "./appearance-overrides.js";
 import { createAsyncCache } from "./client-cache.js";
 import { extensionFromMime } from "./avatar-pipeline/image.js";
 import { FAMILIES } from "./avatar-pipeline/families.js";
@@ -46,8 +49,12 @@ import {
 const ROOT_DIR = "custom-appearances";
 const MANIFEST_FILE = "manifest.json";
 const VIDEO_DIR = "videos";
+const BUILTIN_VIDEO_OVERRIDE_FILE = "video-overrides.json";
+const BUILTIN_VIDEO_REVISION_FILE = "video-revisions.json";
+const BUILTIN_VIDEO_OVERRIDE_DIR = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/video-overrides`;
 const BUILTIN_AUDIO_OVERRIDE_FILE = "audio-overrides.json";
 const BUILTIN_AUDIO_OVERRIDE_DIR = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/audio-overrides`;
+const BUILTIN_PREPARE_PENDING_FILE = "prepare-pending";
 const APPEARANCE_LIST_CACHE_TTL_MS = 30_000;
 const appearanceListCache = createAsyncCache({ ttlMs: APPEARANCE_LIST_CACHE_TTL_MS });
 
@@ -112,14 +119,106 @@ async function readBuiltinAudioOverrides() {
   }
 }
 
+/** Marks saved default-appearance overrides as possibly newer than the prepared pack. The native sync
+ * prepares again while this exists, and removes it once a preparation covering this save succeeds. */
+async function markBuiltinPreparePending() {
+  await writeTextFile(`${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/${BUILTIN_PREPARE_PENDING_FILE}`, uuid(), { baseDir: BaseDirectory.AppLocalData });
+}
+
 async function writeBuiltinAudioOverrides(overrides) {
   await ensureRoot();
   const dir = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}`;
   const has = await exists(dir, { baseDir: BaseDirectory.AppLocalData });
   if (!has) await mkdir(dir, { baseDir: BaseDirectory.AppLocalData, recursive: true });
+  await markBuiltinPreparePending();
   await writeTextFile(`${dir}/${BUILTIN_AUDIO_OVERRIDE_FILE}`, JSON.stringify(overrides, null, 2), {
     baseDir: BaseDirectory.AppLocalData,
   });
+}
+
+function parseBuiltinVideoMap(text) {
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.values(parsed).some(value => typeof value !== "string")) {
+    throw new Error("视频设置须为字符串映射。");
+  }
+  return parsed;
+}
+
+async function readBuiltinVideoOverrides() {
+  const path = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/${BUILTIN_VIDEO_OVERRIDE_FILE}`;
+  try { return parseBuiltinVideoMap(await readTextFile(path, { baseDir: BaseDirectory.AppLocalData })); }
+  catch (error) {
+    if (await exists(path, { baseDir: BaseDirectory.AppLocalData })) throw new Error(`内置视频设置无法读取：${error}`);
+    return {};
+  }
+}
+async function readBuiltinVideoRevisions() {
+  const path = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/${BUILTIN_VIDEO_REVISION_FILE}`;
+  if (!await exists(path, { baseDir: BaseDirectory.AppLocalData })) return {};
+  // Revisions only bust the preview cache, so an unreadable file is the same as none.
+  try { return parseBuiltinVideoMap(await readTextFile(path, { baseDir: BaseDirectory.AppLocalData })); }
+  catch { return {}; }
+}
+/** Restore selection metadata and any changed source media when a built-in mutation fails. */
+async function withBuiltinMutationRollback(mediaPaths, mutate) {
+  await ensureAppearanceDir(BUILTIN_TERRIER_APPEARANCE_ID);
+  const base = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}`;
+  const paths = [...mediaPaths, ...[
+    BUILTIN_VIDEO_OVERRIDE_FILE, BUILTIN_AUDIO_OVERRIDE_FILE, BUILTIN_VIDEO_REVISION_FILE,
+    BUILTIN_PREPARE_PENDING_FILE, "factory-settings-reset", "custom-p4-settings",
+  ].map(name => `${base}/${name}`)];
+  const previous = await Promise.all(paths.map(async path => ({
+    path, bytes: await exists(path, { baseDir: BaseDirectory.AppLocalData })
+      ? await readFile(path, { baseDir: BaseDirectory.AppLocalData }) : null,
+  })));
+  return runWithRollback(async () => {
+    const result = await mutate();
+    invalidateAppearanceCache();
+    return result;
+  }, async () => {
+    for (const { path, bytes } of previous) {
+      if (bytes !== null) await writeFile(path, bytes, { baseDir: BaseDirectory.AppLocalData });
+      else if (await exists(path, { baseDir: BaseDirectory.AppLocalData })) await remove(path, { baseDir: BaseDirectory.AppLocalData });
+    }
+    invalidateAppearanceCache();
+  });
+}
+async function writeBuiltinVideoOverrides(overrides) {
+  await ensureAppearanceDir(BUILTIN_TERRIER_APPEARANCE_ID);
+  await markBuiltinPreparePending();
+  await writeTextFile(`${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/${BUILTIN_VIDEO_OVERRIDE_FILE}`, JSON.stringify(overrides, null, 2), { baseDir: BaseDirectory.AppLocalData });
+}
+export async function restoreBuiltinVideos(family) {
+  const overrides = await readBuiltinVideoOverrides();
+  const next = removeVideoOverrides(overrides, family);
+  await withBuiltinMutationRollback([], async () => {
+    await writeBuiltinVideoOverrides(next);
+    if (Object.keys(next).length || Object.keys(await readBuiltinAudioOverrides()).length || await exists(`${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}/custom-p4-settings`, { baseDir: BaseDirectory.AppLocalData })) await prepareP4Appearance(BUILTIN_TERRIER_APPEARANCE_ID);
+  });
+  return getBuiltinTerrierAppearance();
+}
+/** Reset only selection metadata; saved media, persona and the last prepared pack remain available. */
+export async function restoreBuiltinFactoryAppearance() {
+  await withBuiltinMutationRollback([], async () => {
+    await writeBuiltinVideoOverrides({});
+    await writeBuiltinAudioOverrides({});
+    const base = `${ROOT_DIR}/${BUILTIN_TERRIER_APPEARANCE_ID}`;
+    await writeTextFile(`${base}/factory-settings-reset`, "1", { baseDir: BaseDirectory.AppLocalData });
+    if (await exists(`${base}/custom-p4-settings`, { baseDir: BaseDirectory.AppLocalData })) await remove(`${base}/custom-p4-settings`, { baseDir: BaseDirectory.AppLocalData });
+  });
+  return getBuiltinTerrierAppearance();
+}
+export async function inspectSavedAppearance(appearanceId) {
+  const result = await invoke("inspect_p4_appearance", { appearanceId });
+  if (appearanceId === BUILTIN_TERRIER_APPEARANCE_ID && await exists(`${ROOT_DIR}/${appearanceId}/factory-settings-reset`, { baseDir: BaseDirectory.AppLocalData })) {
+    return { ...result, settings: { quality: "standard", scaler: "smooth", bitratesKbps: {} } };
+  }
+  return result;
+}
+export async function rebuildSavedAppearance(appearanceId, settings) {
+  const result = await invoke("rebuild_p4_appearance", { appearanceId, settings });
+  invalidateAppearanceCache();
+  return result;
 }
 
 async function readPersonaVoiceDocument(appearanceId) {
@@ -204,6 +303,14 @@ async function getBuiltinTerrierAppearance() {
   } catch {
     root = "";
   }
+  let videoOverrides = {};
+  try {
+    videoOverrides = await readBuiltinVideoOverrides();
+  } catch (error) {
+    // Keep the page and list loadable so "restore factory appearance" stays reachable.
+    record.overrideError = error?.message || String(error);
+  }
+  record.families = mergeVideoOverrides(record.families, videoOverrides, path => appLocalAudioSrc(path, root), await readBuiltinVideoRevisions());
   record.families = record.families.map((familyRecord) => {
     const overridePath = overrides[familyRecord.family];
     if (!overridePath) return familyRecord;
@@ -489,6 +596,24 @@ export async function readAppearanceSourceImage(appearanceId) {
  * Replace a single family's video (e.g. after a retry).
  */
 export async function replaceFamilyVideo({ appearanceId, family, videoBytes, taskId, videoUrl, prompt, deferPreparation = false }) {
+  if (appearanceId === BUILTIN_TERRIER_APPEARANCE_ID) {
+    await ensureAppearanceDir(appearanceId);
+    await mkdir(BUILTIN_VIDEO_OVERRIDE_DIR, { baseDir: BaseDirectory.AppLocalData, recursive: true });
+    const videoRel = `${BUILTIN_VIDEO_OVERRIDE_DIR}/${family}.mp4`;
+    const revisionsRel = `${ROOT_DIR}/${appearanceId}/${BUILTIN_VIDEO_REVISION_FILE}`;
+    await withBuiltinMutationRollback([videoRel], async () => {
+      await writeFile(videoRel, videoBytes, { baseDir: BaseDirectory.AppLocalData });
+      const overrides = await readBuiltinVideoOverrides();
+      overrides[family] = videoRel;
+      await writeBuiltinVideoOverrides(overrides);
+      const revisions = await readBuiltinVideoRevisions();
+      revisions[family] = uuid();
+      await writeTextFile(revisionsRel, JSON.stringify(revisions), { baseDir: BaseDirectory.AppLocalData });
+      invalidateAppearanceCache();
+      if (!deferPreparation) await prepareP4Appearance(appearanceId);
+    });
+    return getBuiltinTerrierAppearance();
+  }
   const dir = `${ROOT_DIR}/${appearanceId}`;
   const videoRel = `${dir}/${VIDEO_DIR}/${family}.mp4`;
   await writeFile(videoRel, videoBytes, { baseDir: BaseDirectory.AppLocalData });
@@ -520,12 +645,13 @@ export async function replaceFamilyAudioCue({ appearanceId, family, audioBytes }
   if (appearanceId === BUILTIN_TERRIER_APPEARANCE_ID) {
     const dir = await ensureBuiltinOverrideDir();
     const audioRel = `${dir}/${family}.wav`;
-    await writeFile(audioRel, audioBytes, { baseDir: BaseDirectory.AppLocalData });
-    const overrides = await readBuiltinAudioOverrides();
-    overrides[family] = audioRel;
-    await writeBuiltinAudioOverrides(overrides);
-    await prepareP4Appearance(appearanceId);
-    invalidateAppearanceCache();
+    await withBuiltinMutationRollback([audioRel], async () => {
+      await writeFile(audioRel, audioBytes, { baseDir: BaseDirectory.AppLocalData });
+      const overrides = await readBuiltinAudioOverrides();
+      overrides[family] = audioRel;
+      await writeBuiltinAudioOverrides(overrides);
+      await prepareP4Appearance(appearanceId);
+    });
     return getBuiltinTerrierAppearance();
   }
 
@@ -550,13 +676,14 @@ export async function replaceFamilyAudioCue({ appearanceId, family, audioBytes }
 export async function removeFamilyAudioCue({ appearanceId, family }) {
   if (appearanceId === BUILTIN_TERRIER_APPEARANCE_ID) {
     const overrides = await readBuiltinAudioOverrides();
-    if (overrides[family]) {
-      await remove(overrides[family], { baseDir: BaseDirectory.AppLocalData }).catch(() => {});
-      delete overrides[family];
-      await writeBuiltinAudioOverrides(overrides);
-    }
-    await prepareP4Appearance(appearanceId);
-    invalidateAppearanceCache();
+    await withBuiltinMutationRollback(overrides[family] ? [overrides[family]] : [], async () => {
+      if (overrides[family]) {
+        await remove(overrides[family], { baseDir: BaseDirectory.AppLocalData }).catch(() => {});
+        delete overrides[family];
+        await writeBuiltinAudioOverrides(overrides);
+      }
+      await prepareP4Appearance(appearanceId);
+    });
     return getBuiltinTerrierAppearance();
   }
 
