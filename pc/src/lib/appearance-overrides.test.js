@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeVideoOverrides, removeVideoOverrides, parseBitrateSettings } from './appearance-overrides.js';
+import { mergeVideoOverrides, removeVideoOverrides, parseBitrateSettings, runWithRollback } from './appearance-overrides.js';
 
 test('video overrides replace only requested family and add missing action', () => {
   const families = [{ family: 'idle', videoSrc: 'factory' }, { family: 'done', videoSrc: 'done' }];
@@ -44,4 +44,26 @@ test('an in-flight media save excludes rebuild, restore and both sync paths unti
   await assert.rejects(upload, /save failed/);
   assert.equal(gate.begin(), true);
   gate.end();
+});
+
+test('a failed action is rolled back and its original error is rethrown', async () => {
+  const calls = [];
+  await assert.rejects(
+    runWithRollback(async () => { calls.push('action'); throw new Error('encode failed'); }, async () => { calls.push('rollback'); }),
+    /encode failed/,
+  );
+  assert.deepEqual(calls, ['action', 'rollback']);
+});
+
+test('a successful action returns its result without rolling back', async () => {
+  let rolledBack = false;
+  assert.equal(await runWithRollback(async () => 'prepared', async () => { rolledBack = true; }), 'prepared');
+  assert.equal(rolledBack, false);
+});
+
+test('a failing rollback never masks the original error', async () => {
+  const original = new Error('encode failed');
+  const rejected = await runWithRollback(async () => { throw original; }, async () => { throw new Error('restore failed'); }).catch(error => error);
+  assert.equal(rejected, original);
+  assert.match(rejected.rollbackError.message, /restore failed/);
 });

@@ -84,3 +84,32 @@ test("default-appearance overrides are marked pending before they are written, m
     assert.ok(body.indexOf("await markBuiltinPreparePending()") < body.indexOf("await writeTextFile"), writer);
   }
 });
+
+test("a failed built-in video replacement restores the previous video, overrides, revisions and pending state", () => {
+  const store = read("./lib/appearance-store.js");
+  const start = store.indexOf("export async function replaceFamilyVideo");
+  const builtin = store.slice(start, store.indexOf("const dir = `${ROOT_DIR}/${appearanceId}`;", start));
+  assert.ok(builtin.indexOf("const previous = {") > 0 && builtin.indexOf("const previous = {") < builtin.indexOf("await writeFile(videoRel, videoBytes"), "snapshot before overwriting the video");
+  const rollbackStart = builtin.indexOf("}, async () => {");
+  assert.ok(builtin.indexOf("await prepareP4Appearance(appearanceId)") < rollbackStart, "a failed preparation must reach the rollback");
+  for (const restored of ["previous.video", "previous.overrides", "previous.revisions", "previous.pending"]) {
+    assert.ok(builtin.slice(rollbackStart).includes(restored), restored);
+  }
+});
+
+test("unreadable built-in override files keep the appearance loadable with a recovery notice", () => {
+  const store = read("./lib/appearance-store.js");
+  const loader = store.slice(store.indexOf("async function getBuiltinTerrierAppearance"), store.indexOf("function withDefaultAudioCues"));
+  assert.match(loader, /try \{\s*videoOverrides = await readBuiltinVideoOverrides\(\);\s*\} catch \(error\) \{[\s\S]*?record\.overrideError = /);
+  const revisions = store.slice(store.indexOf("async function readBuiltinVideoRevisions"), store.indexOf("async function readOptionalText"));
+  assert.match(revisions, /try \{ return JSON\.parse[\s\S]*catch \{ return \{\}; \}/);
+  const detail = read("./AppearanceDetail.jsx");
+  assert.match(detail, /isBuiltin && record\?\.overrideError/);
+  assert.ok(detail.indexOf("record?.overrideError") > detail.indexOf("onClick={handleRestoreFactory}"));
+});
+
+test("explicit per-action bitrates are described as upper limits", () => {
+  const detail = read("./AppearanceDetail.jsx");
+  assert.match(detail, /各动作码率上限（留空为自动）/);
+  assert.match(detail, /整体空间不足时会按比例降低/);
+});

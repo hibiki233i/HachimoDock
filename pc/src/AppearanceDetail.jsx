@@ -955,11 +955,11 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       </header>
       <details className="detail-side-section">
         <summary>设备素材质量设置</summary>
-        <p className="muted small">自动分配各动作的空间；可为单个动作指定码率。生成在客户端进行，之后需传输到设备。</p>
+        <p className="muted small">自动分配各动作的空间；可为单个动作指定码率上限，整体空间不足时会按比例降低，实际结果见“各动作分配结果”。生成在客户端进行，之后需传输到设备。</p>
         <fieldset disabled={operationBusy}>
           <label>画质 <select value={quality} onChange={event => setQuality(event.target.value)}><option value="standard">标准</option><option value="high">高画质</option></select></label>{" "}
           <label>缩放 <select value={scaler} onChange={event => setScaler(event.target.value)}><option value="smooth">平滑</option><option value="nearest">像素画</option></select></label>
-          <details><summary>各动作码率（留空为自动）</summary>
+          <details><summary>各动作码率上限（留空为自动）</summary>
             {stateFamilyRecords.map(item => <label key={item.family} style={{display:"block"}}>{item.family} <input type="number" min="1" max="10000" step="1" value={bitrates[item.family] ?? ""} onChange={event => setBitrates({...bitrates, [item.family]: event.target.value})} aria-label={`${item.family} 码率（kbps）`} /> kbps</label>)}
           </details>
           <button type="button" className="btn-primary" onClick={handleRebuildPack}>重新生成设备素材</button>
@@ -1124,6 +1124,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
                   <button type="button" className="btn-ghost" disabled={operationBusy} onClick={() => handleRestoreVideos()}>恢复全部默认视频</button>
                   <button type="button" className="btn-ghost" disabled={operationBusy} onClick={handleRestoreFactory}>恢复工厂形象</button>
                 </div>}
+                {isBuiltin && record?.overrideError && <p role="alert" className="muted small">默认形象的视频设置文件无法读取（{record.overrideError}），此处显示的是工厂视频。请点“恢复工厂形象”后重新设置。</p>}
               </div>
             </section>
           )}

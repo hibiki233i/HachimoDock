@@ -28,6 +28,20 @@ export function parseBitrateSettings(values) {
   return result;
 }
 
+/** Run `action`; if it throws, undo it and rethrow the original error. A failing undo never masks it. */
+export async function runWithRollback(action, rollback) {
+  try {
+    return await action();
+  } catch (error) {
+    try {
+      await rollback();
+    } catch (rollbackError) {
+      if (error && typeof error === "object") error.rollbackError = rollbackError;
+    }
+    throw error;
+  }
+}
+
 export function createAppearanceOperationGate() {
   let active = false;
   return { begin() { if (active) return false; active = true; return true; }, end() { active = false; } };
