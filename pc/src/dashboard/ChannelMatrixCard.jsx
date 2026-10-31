@@ -216,6 +216,10 @@ export default function ChannelMatrixCard() {
     try {
       if (checked) {
         const outcome = await focus.preloadAppearance({ appearanceId: appearance.id, boardDeviceId: usb.boardDeviceId });
+        if (outcome.ignored) {
+          push({ tone: "info", title: "桌宠槽已满，已保留现有 Agent", message: "新形象未加入同时跟随。" });
+          return;
+        }
         if (!outcome.ok) {
           push({ tone: "error", title: "无法把桌宠存入设备", message: outcome.error });
           return;

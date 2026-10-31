@@ -7,7 +7,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { activateResidentAppearance, preloadResidentAppearance, residentActivationMessage } from "./resident-appearance.js";
+import { activateResidentAppearance, preloadResidentAppearance, residentActivationMessage, createPetFollowController } from "./resident-appearance.js";
 
 test("the command is called with the appearance and board, and each outcome is reported", async () => {
   const calls = [];
@@ -36,87 +36,62 @@ test("only a non-resident pack and a failure produce a message", () => {
   assert.match(residentActivationMessage({ state: "error", error: "x" }), /切换桌宠失败：x/);
 });
 
-function scriptedInvoke({ resident = [], syncResult = { ok: true } } = {}) {
+test("preloading uses the no-replacement operation and reports cached or transferred packs", async () => {
   const calls = [];
   const invoke = async (command, args) => {
-    calls.push([command, args.appearanceId]);
-    if (command === "usb_sync_appearance") {
-      if (syncResult instanceof Error) throw syncResult;
-      return syncResult;
-    }
-    const known = resident.includes(args.appearanceId);
-    return { ok: known, state: known ? "activated" : "notResident" };
+    calls.push([command, args]);
+    return args.appearanceId === "cached"
+      ? { ok: true, reusedSlot: true, fileCount: 0, byteCount: 0 }
+      : { ok: true, reusedSlot: false, fileCount: 5, byteCount: 100 };
   };
-  return { invoke, calls };
-}
-
-test("an appearance already in a slot is only activated, then the shown pet is restored", async () => {
-  const { invoke, calls } = scriptedInvoke({ resident: ["pet-a", "pet-b"] });
-  const outcome = await preloadResidentAppearance({ invoke, appearanceId: "pet-b", boardDeviceId: "p4-1", restoreAppearanceId: "pet-a" });
-  assert.deepEqual(outcome, { ok: true, transferred: false, restored: true });
-  assert.deepEqual(calls, [["usb_activate_resident_appearance", "pet-b"], ["usb_activate_resident_appearance", "pet-a"]]);
-});
-
-test("a missing appearance is synced over USB and the previous pet is put back", async () => {
-  const { invoke, calls } = scriptedInvoke({ resident: ["pet-a"] });
-  const outcome = await preloadResidentAppearance({ invoke, appearanceId: "pet-c", restoreAppearanceId: "pet-a" });
-  assert.deepEqual(outcome, { ok: true, transferred: true, restored: true });
-  assert.deepEqual(calls.map(([command]) => command), [
-    "usb_activate_resident_appearance", "usb_sync_appearance", "usb_activate_resident_appearance",
+  assert.deepEqual(await preloadResidentAppearance({ invoke, appearanceId: "cached", boardDeviceId: "p4-1" }), { ok: true, transferred: false, restored: true });
+  assert.deepEqual(await preloadResidentAppearance({ invoke, appearanceId: "new", boardDeviceId: "p4-1" }), { ok: true, transferred: true, restored: true });
+  assert.deepEqual(calls, [
+    ["usb_sync_appearance", { appearanceId: "cached", boardDeviceId: "p4-1", preloadOnly: true }],
+    ["usb_sync_appearance", { appearanceId: "new", boardDeviceId: "p4-1", preloadOnly: true }],
   ]);
 });
 
-test("a failed sync reports the reason and never claims the pet is stored", async () => {
-  const rejected = scriptedInvoke({ syncResult: { ok: false, error: "P4 appearance videos require 9 bytes" } });
-  assert.deepEqual(
-    await preloadResidentAppearance({ invoke: rejected.invoke, appearanceId: "pet-c", restoreAppearanceId: "pet-a" }),
-    { ok: false, transferred: false, error: "P4 appearance videos require 9 bytes" },
-  );
-  assert.equal(rejected.calls.length, 2, "no restore after a failure");
-  const thrown = scriptedInvoke({ syncResult: new Error("USB 未连接") });
-  assert.equal((await preloadResidentAppearance({ invoke: thrown.invoke, appearanceId: "pet-c" })).error, "USB 未连接");
+test("full slots ignore the new appearance without an activation or replacement request", async () => {
+  const calls = [];
+  const outcome = await preloadResidentAppearance({ appearanceId: "pet-d", boardDeviceId: "p4-1",
+    invoke: async (command, args) => { calls.push([command, args]); return { ok: false, slotsFull: true }; },
+  });
+  assert.deepEqual(outcome, { ok: false, ignored: true, state: "slotsFull", transferred: false });
+  assert.deepEqual(calls, [["usb_sync_appearance", { appearanceId: "pet-d", boardDeviceId: "p4-1", preloadOnly: true }]]);
 });
 
-test("the same pet needs no restore, and a failed restore does not undo the preload", async () => {
-  const same = scriptedInvoke({ resident: ["pet-a"] });
-  await preloadResidentAppearance({ invoke: same.invoke, appearanceId: "pet-a", restoreAppearanceId: "pet-a" });
-  assert.equal(same.calls.length, 1);
-  const gone = scriptedInvoke({ resident: ["pet-b"] });
-  const outcome = await preloadResidentAppearance({ invoke: gone.invoke, appearanceId: "pet-b", restoreAppearanceId: "pet-x" });
-  assert.deepEqual(outcome, { ok: true, transferred: false, restored: false });
+test("a failed preload or restore reports its failure instead of claiming the Agent was admitted", async () => {
+  for (const result of [{ ok: false, error: "restore failed" }, new Error("USB 未连接")]) {
+    const outcome = await preloadResidentAppearance({ appearanceId: "pet-c", invoke: async () => {
+      if (result instanceof Error) throw result;
+      return result;
+    } });
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.error, result.message || result.error);
+  }
 });
-
-
-// The device adapter is the only fake: these tests observe the actual displayed pet and
-// command ordering while the real coordinator handles target changes and preloading.
-import * as resident from "./resident-appearance.js";
-
-function followController(invoke, onNotice = () => {}) {
-  assert.equal(typeof resident.createPetFollowController, "function", "resident switching needs a shared coordinator");
-  return resident.createPetFollowController({ invoke, onNotice });
-}
 
 function deferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
   return { promise, resolve };
 }
-
 const target = (appearanceId) => ({ enabled: true, boardDeviceId: "p4-1", appearanceId });
 
 test("returning to A while B is activating restores A after the uncancellable request", async () => {
   const started = deferred(), release = deferred();
   let displayed = "pet-a";
   const calls = [];
-  const controller = followController(async (command, args) => {
+  const controller = createPetFollowController({ invoke: async (command, args) => {
     assert.equal(command, "usb_activate_resident_appearance");
     calls.push(args.appearanceId);
     if (args.appearanceId === "pet-b") { started.resolve(); await release.promise; }
     displayed = args.appearanceId;
     return { ok: true, state: "activated" };
-  });
-  controller.setShownAppearance(target("pet-a"));
+  } });
   await controller.setTarget(target("pet-a"));
+  calls.length = 0;
   const toB = controller.setTarget(target("pet-b"));
   await started.promise;
   const backToA = controller.setTarget(target("pet-a"));
@@ -128,52 +103,55 @@ test("returning to A while B is activating restores A after the uncancellable re
 
 test("removing the focused extra Agent restores the sole remaining primary pet", async () => {
   let displayed = "pet-b";
-  const controller = followController(async (_command, args) => {
+  const controller = createPetFollowController({ invoke: async (_command, args) => {
     displayed = args.appearanceId;
     return { ok: true, state: "activated" };
-  });
-  controller.setShownAppearance(target("pet-b"));
+  } });
   await controller.setTarget(target("pet-b"));
   await controller.setTarget(target("pet-a"));
   assert.equal(displayed, "pet-a");
 });
 
-test("preloading C restores the focused B instead of the desktop channel A", async () => {
+test("preloading C reconciles the focused B instead of the desktop channel A", async () => {
   let displayed = "pet-b";
   const calls = [];
-  const controller = followController(async (command, args) => {
+  const controller = createPetFollowController({ invoke: async (command, args) => {
     calls.push([command, args.appearanceId]);
+    if (command === "usb_sync_appearance") return { ok: true, byteCount: 0, reusedSlot: true };
     displayed = args.appearanceId;
     return { ok: true, state: "activated" };
-  });
-  controller.setShownAppearance(target("pet-b"));
+  } });
   await controller.setTarget(target("pet-b"));
+  calls.length = 0;
   const outcome = await controller.preload({ appearanceId: "pet-c", boardDeviceId: "p4-1" });
   assert.equal(outcome.ok, true);
   assert.equal(outcome.restored, true);
   assert.equal(displayed, "pet-b");
-  assert.deepEqual(calls, [["usb_activate_resident_appearance", "pet-c"], ["usb_activate_resident_appearance", "pet-b"]]);
+  assert.deepEqual(calls, [["usb_sync_appearance", "pet-c"], ["usb_activate_resident_appearance", "pet-b"]]);
 });
 
 test("focus changes during a USB preload are applied afterwards without overlapping commands", async () => {
   const started = deferred(), release = deferred();
   let displayed = "pet-b", active = 0, maxActive = 0;
   const calls = [];
-  const controller = followController(async (command, args) => {
+  const controller = createPetFollowController({ invoke: async (command, args) => {
     active += 1;
     maxActive = Math.max(maxActive, active);
     calls.push([command, args.appearanceId]);
     try {
-      if (command === "usb_activate_resident_appearance" && args.appearanceId === "pet-c") {
-        return { ok: false, state: "notResident" };
+      if (command === "usb_sync_appearance") {
+        const previous = displayed;
+        displayed = args.appearanceId;
+        started.resolve(); await release.promise;
+        displayed = previous;
+        return { ok: true, byteCount: 100 };
       }
-      if (command === "usb_sync_appearance") { started.resolve(); await release.promise; }
       displayed = args.appearanceId;
       return { ok: true, state: "activated" };
     } finally { active -= 1; }
-  });
-  controller.setShownAppearance(target("pet-b"));
+  } });
   await controller.setTarget(target("pet-b"));
+  calls.length = 0;
   const preload = controller.preload({ appearanceId: "pet-c", boardDeviceId: "p4-1" });
   await started.promise;
   const focusChange = controller.setTarget(target("pet-d"));
@@ -182,17 +160,35 @@ test("focus changes during a USB preload are applied afterwards without overlapp
   await Promise.all([preload, focusChange]);
   assert.equal(displayed, "pet-d");
   assert.equal(maxActive, 1);
-  assert.deepEqual(calls, [["usb_activate_resident_appearance", "pet-c"], ["usb_sync_appearance", "pet-c"], ["usb_activate_resident_appearance", "pet-d"]]);
+  assert.deepEqual(calls, [["usb_sync_appearance", "pet-c"], ["usb_activate_resident_appearance", "pet-d"]]);
 });
 
-test("resident mode preserves the pet that was showing before a preload", async () => {
+test("resident mode preserves the device display without inventing a frontend appearance", async () => {
   let displayed = "pet-b";
-  const controller = followController(async (_command, args) => {
+  const calls = [];
+  const controller = createPetFollowController({ invoke: async (command, args) => {
+    calls.push([command, args.appearanceId]);
+    if (command === "usb_sync_appearance") return { ok: true, byteCount: 100 };
     displayed = args.appearanceId;
     return { ok: true, state: "activated" };
-  });
-  controller.setShownAppearance(target("pet-b"));
+  } });
   await controller.setTarget(target(""));
   await controller.preload({ appearanceId: "pet-c", boardDeviceId: "p4-1" });
   assert.equal(displayed, "pet-b");
+  assert.deepEqual(calls, [["usb_sync_appearance", "pet-c"]]);
+});
+
+test("reconnecting the same board confirms its display again", async () => {
+  let displayed = "pet-b", activations = 0;
+  const controller = createPetFollowController({ invoke: async (_command, args) => {
+    activations += 1;
+    displayed = args.appearanceId;
+    return { ok: true, state: "activated" };
+  } });
+  await controller.setTarget(target("pet-a"));
+  displayed = "pet-b";
+  controller.invalidateShownAppearance();
+  await controller.setTarget(target("pet-a"));
+  assert.equal(displayed, "pet-a");
+  assert.equal(activations, 2);
 });

@@ -218,6 +218,8 @@ pub(super) fn parse_p4_slot_capacities(capabilities: &Value) -> Option<Vec<u64>>
     Some(list.iter().map(|value| value.as_u64().unwrap_or(0)).collect())
 }
 
+pub(crate) const P4_APPEARANCE_SLOTS_FULL_ERROR: &str = "P4_APPEARANCE_SLOTS_FULL";
+
 /// Pick the slot a new pack is written to.
 ///
 /// 1. Only slots that exist and can hold `raw_bytes` of video qualify.
@@ -226,14 +228,19 @@ pub(super) fn parse_p4_slot_capacities(capabilities: &Value) -> Option<Vec<u64>>
 /// 3. Otherwise the lowest empty slot.
 /// 4. Otherwise the slot synced longest ago, never the one currently shown unless it is the only
 ///    choice. Slots with no record (factory defaults) count as oldest.
+/// Preloads disable replacement: an occupied preferred slot never bypasses the empty-slot rule.
 pub(super) fn choose_p4_target_slot(
     state: &P4AppearanceSlotState,
     capacities: Option<&[u64]>,
     raw_bytes: u64,
     preferred: Option<u32>,
     synced_at: &HashMap<u32, u64>,
+    allow_replacement: bool,
 ) -> Result<u32, String> {
     let Some(capacities) = capacities else {
+        if !allow_replacement && state.slots.iter().any(|slot| slot.slot == P4_RAW_APPEARANCE_SLOT) {
+            return Err(P4_APPEARANCE_SLOTS_FULL_ERROR.into());
+        }
         return Ok(P4_RAW_APPEARANCE_SLOT);
     };
     let candidates: Vec<u32> = (0..capacities.len() as u32)
@@ -248,13 +255,14 @@ pub(super) fn choose_p4_target_slot(
             "P4 appearance videos require {raw_bytes} bytes but the largest slot only has {largest} bytes"
         ));
     }
-    if let Some(slot) = preferred.filter(|slot| candidates.contains(slot)) {
+    let occupied = |slot: u32| state.slots.iter().any(|entry| entry.slot == slot);
+    if let Some(slot) = preferred.filter(|slot| candidates.contains(slot) && (allow_replacement || !occupied(*slot))) {
         return Ok(slot);
     }
-    let occupied = |slot: u32| state.slots.iter().any(|entry| entry.slot == slot);
     if let Some(slot) = candidates.iter().copied().find(|slot| !occupied(*slot)) {
         return Ok(slot);
     }
+    if !allow_replacement { return Err(P4_APPEARANCE_SLOTS_FULL_ERROR.into()); }
     Ok(candidates
         .iter()
         .copied()

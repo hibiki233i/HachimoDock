@@ -2,7 +2,7 @@
  * [Input] JSON-line control/state envelopes from USB-UART and native USB.
  * [Output] validated runtime updates, ACK/NACK responses, persisted input
  *          configuration snapshots, transfer routing, deterministic appearance
- *          pack discovery/reactivation across both flash slots, compatible
+ *          pack discovery/reactivation across available flash slots, compatible
  *          v3/v4 component capabilities with bounded sprite limits, restart-safe
  *          slot cleanup, idle-transfer recovery and legacy-pack migration, 60-second per-session
  *          terminal conversation visibility across active-queue refreshes,
@@ -480,7 +480,7 @@ static void read_active_slot_marker(void) {
   if (!file) return;
   ch = fgetc(file);
   fclose(file);
-  if (ch == '0' || ch == '1') {
+  if (ch >= '0' && ch <= '9' && slot_is_valid(ch - '0')) {
     g_asset_active_slot = ch - '0';
   }
 }

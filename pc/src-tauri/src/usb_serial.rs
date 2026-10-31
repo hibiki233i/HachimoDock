@@ -79,6 +79,8 @@ mod transaction_waiters;
 mod transfer_log;
 mod widget_transaction;
 
+pub(crate) use appearance_transaction::P4_APPEARANCE_SLOTS_FULL_ERROR;
+
 use appearance_transaction::{
     asset_checksum_hex, build_asset_file_commit_payload, compute_p4_pack_id,
     choose_p4_target_slot, digest_appearance_assets, p4_pack_id_from_assets, p4_transfer_fallback_slot,
@@ -3914,9 +3916,10 @@ impl UsbSerialManager {
         capacities: Option<&[u64]>,
         preferred: Option<u32>,
         synced_at: &HashMap<u32, u64>,
+        allow_replacement: bool,
     ) -> Result<u32, String> {
         let state = self.query_p4_appearance_slots(transfer_id)?;
-        let target = choose_p4_target_slot(&state, capacities, raw_bytes, preferred, synced_at)?;
+        let target = choose_p4_target_slot(&state, capacities, raw_bytes, preferred, synced_at, allow_replacement)?;
         if let Some(fallback) = p4_transfer_fallback_slot(&state, target) {
             self.activate_p4_appearance_slot(transfer_id, fallback.slot, &fallback.pack_id)?;
         }
@@ -4823,6 +4826,62 @@ impl UsbSerialManager {
         F: Fn(u32, u32, u64, u64),
         S: Fn(&'static str),
     {
+        self.sync_appearance_p4_with_policy(appearance_dir, app_data_dir, expected_board_device_id,
+            use_device_builtin, false, on_progress, on_stage)
+    }
+
+    /// Preloading fills only an empty slot and restores the device's actual previous display.
+    pub fn sync_appearance_p4_with_policy<F, S>(
+        &self,
+        appearance_dir: &std::path::Path,
+        app_data_dir: &std::path::Path,
+        expected_board_device_id: &str,
+        use_device_builtin: bool,
+        preload_only: bool,
+        on_progress: F,
+        on_stage: S,
+    ) -> Result<(u32, u64, bool), String>
+    where
+        F: Fn(u32, u32, u64, u64),
+        S: Fn(&'static str),
+    {
+        self.require_usb_link("形象同步")?;
+        let _asset_transfer_guard = self.asset_transfer_guard.lock().map_err(|error| error.to_string())?;
+        self.connected_board_status(expected_board_device_id)?;
+        let restore_id = format!("p4-preload-{}", uuid::Uuid::new_v4());
+        let previous = if preload_only {
+            let state = self.query_p4_appearance_slots(&restore_id)?;
+            state.active_slot.and_then(|active| state.slots.iter().find(|slot| slot.slot == active).cloned())
+        } else { None };
+        let result = self.sync_appearance_p4_with_stages_inner(appearance_dir, app_data_dir,
+            expected_board_device_id, use_device_builtin, !preload_only, on_progress, on_stage);
+        if let Some(previous) = previous {
+            let restored = (|| -> Result<(), String> {
+                let state = self.query_p4_appearance_slots(&restore_id)?;
+                if state.active_slot != Some(previous.slot) {
+                    self.activate_p4_appearance_slot(&restore_id, previous.slot, &previous.pack_id)?;
+                }
+                Ok(())
+            })();
+            if result.is_ok() { restored?; }
+        }
+        result
+    }
+
+    fn sync_appearance_p4_with_stages_inner<F, S>(
+        &self,
+        appearance_dir: &std::path::Path,
+        app_data_dir: &std::path::Path,
+        expected_board_device_id: &str,
+        use_device_builtin: bool,
+        allow_replacement: bool,
+        on_progress: F,
+        on_stage: S,
+    ) -> Result<(u32, u64, bool), String>
+    where
+        F: Fn(u32, u32, u64, u64),
+        S: Fn(&'static str),
+    {
         self.require_usb_link("形象同步")?;
         let sync_started = Instant::now();
         let stage = |name: &'static str| {
@@ -4836,13 +4895,9 @@ impl UsbSerialManager {
             );
             on_stage(name);
         };
-        let _asset_transfer_guard = self
-            .asset_transfer_guard
-            .lock()
-            .map_err(|error| error.to_string())?;
         self.connected_board_status(expected_board_device_id)?;
         self.ensure_appearance_sync_not_cancelled(None)?;
-        if p4_native_usb_available() {
+        if allow_replacement && p4_native_usb_available() {
             match sync_appearance_p4_native(
                 appearance_dir,
                 app_data_dir,
@@ -4956,6 +5011,9 @@ impl UsbSerialManager {
 
         let use_raw_chunks = self.supports_p4_raw_asset_chunks();
         let use_raw_slot = use_raw_chunks && self.supports_p4_raw_appearance_slot();
+        if !allow_replacement && !use_raw_slot {
+            return Err("设备固件不支持安全预载，请先升级固件。".into());
+        }
         // Firmware with several slots reports each slot's capacity and accepts a target slot.
         let slot_capacities = if use_raw_slot {
             parse_p4_slot_capacities(&self.status().capabilities)
@@ -5010,6 +5068,7 @@ impl UsbSerialManager {
                     slot_capacities.as_deref(),
                     preferred_slot,
                     &synced_at,
+                    allow_replacement,
                 )?);
                 eprintln!("[usb-p4-ota] target appearance slot={}", target_slot.get());
             }
@@ -7357,6 +7416,7 @@ mod tests {
                         "activeSlot": self.active_slot,
                         "slots": [{"slot": 0, "packId": "old-factory-pack"}, {"slot": 1, "packId": "custom-pack"}],
                     });
+                    if phase == "activate" { self.active_slot = command["payload"]["slot"].as_u64().unwrap() as u32; }
                     self.commands.lock().unwrap().push(command);
                     resolve_asset_ack(&self.waiters, "asset/ack", &ack);
                 }
@@ -7405,6 +7465,20 @@ mod tests {
         let (manager, commands) = resident_builtin_test_manager(1);
         assert_eq!(manager.activate_resident_p4_appearance(&tmp.path().join("custom-appearance"), tmp.path(), "p4-test", false).unwrap(), P4ResidentActivation::NotResident);
         assert!(commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preload_restores_the_devices_actual_active_slot_without_a_frontend_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manager, commands) = resident_builtin_test_manager(1);
+        manager.sync_appearance_p4_with_policy(
+            &tmp.path().join("terrier-clips"), tmp.path(), "p4-test", true, true,
+            |_, _, _, _| {}, |_| {},
+        ).unwrap();
+        let commands = commands.lock().unwrap();
+        let activations: Vec<_> = commands.iter().filter(|command| command["topic"] == "asset/activate").collect();
+        assert_eq!(activations.last().unwrap()["payload"]["slot"], 1);
+        assert_eq!(activations.last().unwrap()["payload"]["packId"], "custom-pack");
     }
 
     #[test]
@@ -9287,7 +9361,7 @@ mod tests {
         let caps = [5_000_000u64; 3];
         let none = HashMap::new();
         let pick = |state: &P4AppearanceSlotState, preferred, synced: &HashMap<u32, u64>| {
-            choose_p4_target_slot(state, Some(&caps), 2_000_000, preferred, synced)
+            choose_p4_target_slot(state, Some(&caps), 2_000_000, preferred, synced, true)
         };
         // An appearance returns to the slot it used, even when other slots are free.
         let partly = slot_state(Some(0), &[(0, "f0"), (1, "f1")]);
@@ -9301,8 +9375,20 @@ mod tests {
         assert_eq!(pick(&full, None, &HashMap::from([(0, 500)])), Ok(2), "slot 2 has no record");
         assert_eq!(pick(&full, None, &HashMap::from([(0, 100), (1, 1), (2, 500)])), Ok(0), "the shown slot is spared");
         // The shown slot is only chosen when nothing else can hold the pack.
-        let only = choose_p4_target_slot(&slot_state(Some(1), &[(1, "b")]), Some(&[0, 5_000_000, 0]), 2_000_000, None, &none);
+        let only = choose_p4_target_slot(&slot_state(Some(1), &[(1, "b")]), Some(&[0, 5_000_000, 0]), 2_000_000, None, &none, true);
         assert_eq!(only, Ok(1));
+    }
+
+    #[test]
+    fn p4_preload_never_replaces_an_occupied_slot_even_with_an_old_assignment() {
+        let caps = [5_000_000; 3];
+        let none = HashMap::new();
+        let full = slot_state(Some(1), &[(0, "a"), (1, "b"), (2, "c")]);
+        assert!(choose_p4_target_slot(&full, Some(&caps), 100, Some(0), &none, false).is_err());
+        let partly = slot_state(Some(1), &[(0, "a"), (1, "b")]);
+        assert_eq!(choose_p4_target_slot(&partly, Some(&caps), 100, Some(0), &none, false), Ok(2));
+        let legacy = slot_state(Some(1), &[(1, "a")]);
+        assert!(choose_p4_target_slot(&legacy, None, 100, None, &none, false).is_err());
     }
 
     #[test]
@@ -9310,14 +9396,14 @@ mod tests {
         let none = HashMap::new();
         let state = slot_state(None, &[]);
         // Slot 0 is too small for the videos, so a preference for it is ignored.
-        let mixed = choose_p4_target_slot(&state, Some(&[1_000_000, 5_000_000, 5_000_000]), 2_000_000, Some(0), &none);
+        let mixed = choose_p4_target_slot(&state, Some(&[1_000_000, 5_000_000, 5_000_000]), 2_000_000, Some(0), &none, true);
         assert_eq!(mixed, Ok(1));
         // A slot without a partition (capacity 0) never qualifies.
-        assert_eq!(choose_p4_target_slot(&state, Some(&[0, 0, 5_000_000]), 1, None, &none), Ok(2));
-        let too_big = choose_p4_target_slot(&state, Some(&[5_000_000; 3]), 6_000_000, None, &none).unwrap_err();
+        assert_eq!(choose_p4_target_slot(&state, Some(&[0, 0, 5_000_000]), 1, None, &none, true), Ok(2));
+        let too_big = choose_p4_target_slot(&state, Some(&[5_000_000; 3]), 6_000_000, None, &none, true).unwrap_err();
         assert!(too_big.contains("largest slot only has 5000000"), "{too_big}");
         // Firmware without per-slot capacities only has the legacy custom slot.
-        assert_eq!(choose_p4_target_slot(&state, None, 9_999_999, Some(2), &none), Ok(P4_RAW_APPEARANCE_SLOT));
+        assert_eq!(choose_p4_target_slot(&state, None, 9_999_999, Some(2), &none, true), Ok(P4_RAW_APPEARANCE_SLOT));
     }
 
     #[test]

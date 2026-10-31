@@ -1,6 +1,6 @@
 /**
- * [Input] The focus Agent, the pet follow mode, the Agent→appearance map, the appearance the board shows, and a notice sink.
- * [Output] Serializes focus-driven resident activation and preloading, restores the latest focus afterwards, and warns once for an unavailable appearance.
+ * [Input] The focus Agent, the pet follow mode, the Agent→appearance map, the desktop assignment revision, and a notice sink.
+ * [Output] Serializes focus-driven resident activation and preloading, confirms the latest focus after initialization, reconnection and preloading, and warns once for an unavailable appearance.
  * [Pos] Focus-driven pet switching in the device dashboard; never transfers assets.
  * [Sync] If this file changes, update `pc/src/dashboard/.folder.md` and `pc/src/.folder.md`.
  */
@@ -28,15 +28,15 @@ export function usePetFollowSwitch({
   }), [invoke]);
 
   useEffect(() => {
-    controller.setShownAppearance({ boardDeviceId, appearanceId: shownAppearanceId });
-  }, [controller, boardDeviceId, shownAppearanceId]);
+    controller.invalidateShownAppearance();
+  }, [controller, enabled, boardDeviceId, shownAppearanceId]);
 
   useEffect(() => {
     const plan = planPetSwitch({
       state: { focusAgentId }, petFollowMode, residentAgentId, agentAppearanceMap,
     });
     controller.setTarget({ enabled, boardDeviceId, appearanceId: plan.switchNeeded ? plan.appearanceId : "" });
-  }, [controller, enabled, boardDeviceId, focusAgentId, petFollowMode, residentAgentId, agentAppearanceMap]);
+  }, [controller, enabled, boardDeviceId, focusAgentId, petFollowMode, residentAgentId, agentAppearanceMap, shownAppearanceId]);
 
   useEffect(() => () => { controller.setTarget({ enabled: false }); }, [controller]);
 

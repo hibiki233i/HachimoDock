@@ -7020,6 +7020,8 @@ struct UsbSyncAppearanceResult {
     file_count: u32,
     byte_count: u64,
     reused_slot: bool,
+    #[serde(default)]
+    slots_full: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -7435,6 +7437,7 @@ async fn usb_sync_appearance(
     usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
     appearance_id: String,
     board_device_id: Option<String>,
+    preload_only: Option<bool>,
 ) -> Result<UsbSyncAppearanceResult, String> {
     let status = usb_manager.status();
     let native_usb_available = usb_serial::p4_native_usb_available();
@@ -7460,6 +7463,10 @@ async fn usb_sync_appearance(
         UsbAppearanceSyncRuntime::EspP4
     };
 
+    let preload_only = preload_only.unwrap_or(false);
+    if preload_only && (!serial_connected || !matches!(sync_runtime, UsbAppearanceSyncRuntime::EspP4)) {
+        return Err("加入同时跟随需要通过 USB 串口连接 P4 设备。".into());
+    }
     let appearance_id = validate_appearance_id(&appearance_id)?.to_string();
     let resource_dir = app_handle
         .path()
@@ -7533,11 +7540,12 @@ async fn usb_sync_appearance(
             UsbAppearanceSyncRuntime::EspP4 => {
                 if serial_connected {
                     let stage_emitter = emitter.clone();
-                    worker_mgr.sync_appearance_p4_with_stages(
+                    worker_mgr.sync_appearance_p4_with_policy(
                         &dir,
                         &data_dir,
                         &expected_board_device_id,
                         use_device_builtin,
+                        preload_only,
                         |current, total, bytes_sent, bytes_total| {
                             let _ = emitter.emit(
                                 "usb-sync-progress",
@@ -7601,6 +7609,7 @@ async fn usb_sync_appearance(
                 file_count,
                 byte_count,
                 reused_slot,
+                slots_full: false,
                 error: None,
             }),
             Err(e) => Ok(UsbSyncAppearanceResult {
@@ -7608,6 +7617,7 @@ async fn usb_sync_appearance(
                 file_count: 0,
                 byte_count: 0,
                 reused_slot: false,
+                slots_full: e == usb_serial::P4_APPEARANCE_SLOTS_FULL_ERROR,
                 error: Some(e),
             }),
         }
