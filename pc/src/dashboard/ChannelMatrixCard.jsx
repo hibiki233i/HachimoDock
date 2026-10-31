@@ -1,6 +1,6 @@
 /**
  * [Input] useDeviceContext for appearances/agentAppearanceMap/agentOptions/currentDisplay/verified USB status/cancellable appearanceSync/refreshAppearances/applyDesktopPet/saveAgentAppearance; useToast for notices.
- * [Output] Dashboard "Agent与形象" matrix: all supported local Agent channels with unavailable client/CLI rows kept visible, detected channels offering independent appearance selection and USB-only follow switching, non-blocking inline USB appearance-sync progress with a real abort action, and preloading coordinated with the latest device focus.
+ * [Output] Dashboard "Agent与形象" matrix: all supported local Agent channels with unavailable client/CLI rows kept visible, detected channels offering independent appearance selection and USB-only follow switching, non-blocking inline USB appearance-sync progress with a real abort action, and preloading followed Agents' new pets before saving their assignments while preserving the latest device focus.
  * [Pos] component node in pc/src/dashboard
  * [Sync] If this file changes, update `pc/src/dashboard/.folder.md`.
  */
@@ -96,7 +96,7 @@ export default function ChannelMatrixCard() {
   const [followBusyId, setFollowBusyId] = useState("");
   const [pickerState, setPickerState] = useState(null); // { agentId }
   const [pendingFollow, setPendingFollow] = useState(null); // { agentId, appearance }
-  const syncing = appearanceSync?.pending === true;
+  const syncing = appearanceSync?.pending === true || followBusyId !== "";
   const syncProgress = appearanceSync?.progress
     ? normalizeSyncProgress(appearanceSync.progress)
     : null;
@@ -124,18 +124,32 @@ export default function ChannelMatrixCard() {
   const handleConfirmAppearance = useCallback(async (agentId, appearance) => {
     if (!agentId || !appearance?.id) return;
     const isFollowed = agentId === activeAgentId;
+    const alsoFollowed = !isFollowed && (deviceFollowAgents || []).includes(agentId);
     closePicker();
 
-    if (!isFollowed) {
-      saveAgentAppearance(agentId, appearance.id);
-      push({
-        tone: "success",
-        title: `已为 ${channelLabelForId(agentOptions, agentId)} 保存「${appearance.name}」`,
-      });
-      return;
-    }
-
     try {
+      if (!isFollowed) {
+        if (alsoFollowed) {
+          if (!usb?.connected || usb.transport === "wifi") {
+            push({ tone: "warning", title: "更换同时跟随的桌宠需要 USB 连接", message: "请先连接 USB，再更换该 Agent 的形象。" });
+            return;
+          }
+          setFollowBusyId(agentId);
+          const outcome = await focus.preloadAppearance({ appearanceId: appearance.id, boardDeviceId: usb.boardDeviceId });
+          if (outcome.ignored) {
+            push({ tone: "info", title: "桌宠槽已满，已保留原形象", message: "新形象未存入设备，也未更改该 Agent 的形象选择。" });
+            return;
+          }
+          if (!outcome.ok) throw new Error(outcome.error || "无法把桌宠存入设备");
+        }
+        saveAgentAppearance(agentId, appearance.id);
+        push({
+          tone: "success",
+          title: `已为 ${channelLabelForId(agentOptions, agentId)} ${alsoFollowed ? "同步" : "保存"}「${appearance.name}」`,
+        });
+        return;
+      }
+
       const { notice } = await applyDesktopPet(agentId, appearance, {
         initialProgress: {
           text: `准备下发「${appearance.name}」到设备端...`,
@@ -154,8 +168,10 @@ export default function ChannelMatrixCard() {
         title: cancelled ? "形象传输已中断" : "更换形象失败",
         message: cancelled ? "设备继续保留原形象。" : msg,
       });
+    } finally {
+      if (alsoFollowed) setFollowBusyId("");
     }
-  }, [activeAgentId, agentOptions, applyDesktopPet, closePicker, push, saveAgentAppearance]);
+  }, [activeAgentId, agentOptions, applyDesktopPet, closePicker, deviceFollowAgents, focus.preloadAppearance, push, saveAgentAppearance, usb]);
 
   const requestFollow = useCallback((agentId) => {
     const appearance = appearanceForAgent(agentId);
@@ -432,7 +448,7 @@ export default function ChannelMatrixCard() {
           appearances={appearances}
           agentLabel={channelLabelForId(agentOptions, pickerState.agentId)}
           selectedAppearanceId={(agentAppearanceMap[pickerState.agentId] || BUILTIN_TERRIER_APPEARANCE_ID)}
-          isFollowed={pickerState.agentId === activeAgentId}
+          isFollowed={pickerState.agentId === activeAgentId || (deviceFollowAgents || []).includes(pickerState.agentId)}
           syncing={syncing}
           onClose={closePicker}
           onConfirm={(appearance) => handleConfirmAppearance(pickerState.agentId, appearance)}
