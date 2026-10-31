@@ -1,12 +1,11 @@
 /**
  * [Input] useDeviceContext for appearances/agentAppearanceMap/agentOptions/currentDisplay/verified USB status/cancellable appearanceSync/refreshAppearances/applyDesktopPet/saveAgentAppearance; useToast for notices.
- * [Output] Dashboard "Agent与形象" matrix: all supported local Agent channels with unavailable client/CLI rows kept visible, detected channels offering independent appearance selection and USB-only follow switching, and non-blocking inline USB appearance-sync progress with a real abort action.
+ * [Output] Dashboard "Agent与形象" matrix: all supported local Agent channels with unavailable client/CLI rows kept visible, detected channels offering independent appearance selection and USB-only follow switching, non-blocking inline USB appearance-sync progress with a real abort action, and preloading coordinated with the latest device focus.
  * [Pos] component node in pc/src/dashboard
  * [Sync] If this file changes, update `pc/src/dashboard/.folder.md`.
  */
 
 import React, { useCallback, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import {
   CheckCircle,
   ChevronDown,
@@ -32,7 +31,6 @@ import {
 } from "../lib/desktop-pet-assignment.js";
 import AppearancePreview from "../AppearancePreview.jsx";
 import { resolveDashboardPreviewMedia } from "../lib/appearance-preview.js";
-import { preloadResidentAppearance } from "../lib/resident-appearance.js";
 import { useAgentFocusContext } from "./AgentFocusContext.js";
 import { useDeviceContext } from "../shell/DeviceContext.jsx";
 import Button from "../shell/Button.jsx";
@@ -204,11 +202,7 @@ export default function ChannelMatrixCard() {
   // Opting an Agent in stores its pet on the board first, so the focus can switch to it later without a
   // transfer. That needs USB; opting out only changes the follow set.
   const handleToggleDeviceFollow = useCallback(async (agent, checked) => {
-    if (!checked) {
-      setDeviceFollowAgent(agent.id, false);
-      return;
-    }
-    if (!usb?.connected || usb.transport === "wifi") {
+    if (checked && (!usb?.connected || usb.transport === "wifi")) {
       push({
         tone: "warning",
         title: "加入同时跟随需要 USB 连接",
@@ -216,30 +210,29 @@ export default function ChannelMatrixCard() {
       });
       return;
     }
-    const appearance = appearanceForAgent(agent.id);
-    if (!appearance) return;
+    const appearance = checked ? appearanceForAgent(agent.id) : null;
+    if (checked && !appearance) return;
     setFollowBusyId(agent.id);
     try {
-      const outcome = await preloadResidentAppearance({
-        invoke,
-        appearanceId: appearance.id,
-        boardDeviceId: usb.boardDeviceId,
-        restoreAppearanceId: currentDisplay.appearance?.id || "",
-      });
-      if (!outcome.ok) {
-        push({ tone: "error", title: "无法把桌宠存入设备", message: outcome.error });
-        return;
+      if (checked) {
+        const outcome = await focus.preloadAppearance({ appearanceId: appearance.id, boardDeviceId: usb.boardDeviceId });
+        if (!outcome.ok) {
+          push({ tone: "error", title: "无法把桌宠存入设备", message: outcome.error });
+          return;
+        }
       }
-      setDeviceFollowAgent(agent.id, true);
-      push({
+      await setDeviceFollowAgent(agent.id, checked);
+      if (checked) push({
         tone: "success",
         title: `已把「${appearance.name}」存入设备`,
         message: `${agent.label} 比其他 Agent 更早活跃时，设备会自动切换到它的桌宠。`,
       });
+    } catch (error) {
+      push({ tone: "error", title: "更新同时跟随失败", message: error?.message || String(error) });
     } finally {
       setFollowBusyId("");
     }
-  }, [appearanceForAgent, currentDisplay.appearance?.id, push, setDeviceFollowAgent, usb]);
+  }, [appearanceForAgent, focus.preloadAppearance, push, setDeviceFollowAgent, usb]);
 
   const handleCancelAppearanceSync = useCallback(async () => {
     try {

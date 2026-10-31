@@ -7642,16 +7642,24 @@ async fn usb_activate_resident_appearance(
         .path()
         .app_local_data_dir()
         .map_err(|e| format!("无法解析 AppLocalData 目录: {}", e))?;
-    // The default appearance is prepared in the same directory a sync would use for it.
-    let appearance_dir = app_local_data_dir
+    let local_dir = app_local_data_dir
         .join("custom-appearances")
         .join(&appearance_id);
+    let use_device_builtin = appearance_id == "builtin-terrier"
+        && status.capabilities["appearance"]["builtinProtected"] == true
+        && !builtin_terrier_has_customization(&local_dir, &app_local_data_dir)?;
+    let appearance_dir = if use_device_builtin {
+        app_handle.path().resource_dir().map_err(|error| error.to_string())?.join("terrier-clips")
+    } else {
+        local_dir
+    };
     let manager = usb_manager.inner().clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         manager.activate_resident_p4_appearance(
             &appearance_dir,
             &app_local_data_dir,
             &expected_board_device_id,
+            use_device_builtin,
         )
     })
     .await

@@ -40,9 +40,9 @@ test("each fixed Agent gets exactly one feed call in a stable order, and unwante
   assert.equal((feeds.match(/useAgentSessionFeed\(\{/g) || []).length, 1);
 });
 
-test("pet switching only runs with a connected P4 and more than one followed Agent, and never transfers", () => {
-  assert.match(dashboard, /usePetFollowSwitch\(\{\s*enabled: isP4Runtime && Boolean\(usb\.connected\) && followAgentIds\.length > 1/);
-  assert.match(petSwitch, /activateResidentAppearance\(/);
+test("pet switching stays enabled when only the primary Agent remains", () => {
+  assert.match(dashboard, /usePetFollowSwitch\(\{\s*enabled: isP4Runtime && Boolean\(usb\.connected\),/);
+  assert.match(petSwitch, /createPetFollowController\(/);
   assert.doesNotMatch(petSwitch, /usb_sync_appearance/);
   assert.match(petSwitch, /planPetSwitch\(/);
 });
@@ -57,8 +57,9 @@ test("the matrix card receives the focus through context and keeps its literal m
 
 test("joining the follow set stores the pet on the board first and needs a USB link", () => {
   assert.match(matrix, /!usb\?\.connected \|\| usb\.transport === "wifi"/);
-  assert.match(matrix, /preloadResidentAppearance\(\{[\s\S]*restoreAppearanceId: currentDisplay\.appearance\?\.id/);
-  assert.match(matrix, /setDeviceFollowAgent\(agent\.id, true\)/);
+  assert.match(matrix, /focus\.preloadAppearance\(\{/);
+  assert.match(dashboard, /preloadAppearance: preloadFollowAppearance/);
+  assert.match(matrix, /setDeviceFollowAgent\(agent\.id, checked\)/);
   assert.match(matrix, /if \(!outcome\.ok\) \{[\s\S]*return;[\s\S]*setDeviceFollowAgent/);
 });
 

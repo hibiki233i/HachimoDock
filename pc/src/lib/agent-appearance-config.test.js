@@ -202,3 +202,41 @@ test("the pet follow mode defaults to follow and only accepts known values", () 
   savePetFollowMode("bogus");
   assert.equal(loadPetFollowMode(), "follow");
 });
+
+
+import * as followConfig from "./agent-appearance-config.js";
+
+test("device follow changes restart the monitors without changing the selected desktop channel", async () => {
+  assert.equal(typeof followConfig.createDeviceFollowSynchronizer, "function");
+  let profile = { desktopDeviceId: "desk-1", mqttUrl: "mqtt://localhost", enabledAgents: ["claude-code"], selectedAgentId: "claude-code" };
+  let restarts = 0;
+  const synchronize = followConfig.createDeviceFollowSynchronizer({ invoke: async (command, args) => {
+    if (command === "load_bridge_profile") return profile;
+    if (command === "save_bridge_profile") { profile = args.input; return profile; }
+    if (command === "ensure_bridge_runtime") { assert.equal(args.input.forceRestart, true); restarts += 1; return { running: true }; }
+    throw new Error(command);
+  } });
+  await synchronize(["codex"]);
+  assert.deepEqual(profile.enabledAgents, ["codex", "claude-code"]);
+  assert.equal(profile.selectedAgentId, "claude-code");
+  await synchronize([]);
+  assert.deepEqual(profile.enabledAgents, ["claude-code"]);
+  assert.equal(profile.selectedAgentId, "claude-code");
+  await synchronize([]);
+  assert.equal(restarts, 2, "an unchanged monitor set must not restart Bridge");
+});
+
+test("a failed Bridge restart is reported and retried even after the profile was saved", async () => {
+  assert.equal(typeof followConfig.createDeviceFollowSynchronizer, "function");
+  let profile = { desktopDeviceId: "desk-1", mqttUrl: "mqtt://localhost", enabledAgents: ["claude-code"], selectedAgentId: "claude-code" };
+  let restarts = 0;
+  const synchronize = followConfig.createDeviceFollowSynchronizer({ invoke: async (command, args) => {
+    if (command === "load_bridge_profile") return profile;
+    if (command === "save_bridge_profile") { profile = args.input; return profile; }
+    if (command === "ensure_bridge_runtime") return { running: ++restarts > 1, message: "not ready" };
+    throw new Error(command);
+  } });
+  await assert.rejects(synchronize(["codex"]), /not ready/);
+  await synchronize(["codex"]);
+  assert.equal(restarts, 2);
+});

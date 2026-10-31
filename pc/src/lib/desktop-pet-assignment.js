@@ -1,6 +1,6 @@
 /**
  * [Input] Current desktop-pet channel map, active appearance, selected appearance, Tauri invoke/listen adapters, verified USB status, and agent labels.
- * [Output] Shared "set as desktop pet" workflow that syncs appearance assets to the exact bound board only when the selected appearance changes, reports instant P4 A/B-slot cache reuse, explains USB sync failures before cancelling real appearance changes, skips asset re-pushes for pure follow-channel switches, clears the previous followed source, requires USB for every follow change, idempotently re-dispatches the requested binding over USB after any successful asset step, and keeps one active channel.
+ * [Output] Shared "set as desktop pet" workflow that syncs appearance assets to the exact bound board only when the selected appearance changes, reports instant P4 A/B-slot cache reuse, explains USB sync failures before cancelling real appearance changes, skips asset re-pushes for pure follow-channel switches, clears the previous followed source, requires USB for every follow change, idempotently re-dispatches the requested binding over USB after any successful asset step, keeps one selected desktop channel, and retains monitors for extra device-followed Agents.
  * [Pos] lib node in pc/src/lib
  * [Sync] If this file changes, update `pc/src/.folder.md` and UI callers that set desktop pets.
  */
@@ -11,6 +11,7 @@ import {
   channelLabelForId,
   saveAgentAppearanceMap,
   saveEnabledAgents,
+  sanitizeDeviceFollowAgents,
 } from "./agent-appearance-config.js";
 
 export const ACTIVE_APPEARANCE_KEY = "pet-manager:active-appearance-id";
@@ -42,6 +43,7 @@ export async function applyDesktopPetAssignment({
   agentOptions,
   boardDeviceId,
   currentAppearanceId = "",
+  deviceFollowAgents = [],
   onProgress,
 }) {
   if (!appearance?.id || !agentId) {
@@ -50,6 +52,7 @@ export async function applyDesktopPetAssignment({
 
   const nextMap = assignAppearanceToAgent(agentAppearanceMap, agentId, appearance.id);
   const enabledAgents = assignedAgentIds(nextMap, agentId);
+  const monitoredAgents = sanitizeDeviceFollowAgents([agentId, ...deviceFollowAgents]);
   const channelLabel = channelLabelForId(agentOptions, agentId);
   const storedAppearanceId = readActiveAppearanceId();
   const activeAppearanceId = currentAppearanceId || storedAppearanceId;
@@ -82,12 +85,11 @@ export async function applyDesktopPetAssignment({
     ? profile.enabledAgents.filter(Boolean)
     : [];
   const selectedAgentId = profile.selectedAgentId || profileEnabledAgents[0] || "";
-  const previousSource = profileEnabledAgents.find((id) => id && id !== agentId)
-    || (selectedAgentId && selectedAgentId !== agentId ? selectedAgentId : "");
+  const previousSource = selectedAgentId && selectedAgentId !== agentId ? selectedAgentId : "";
   const followChanged =
     selectedAgentId !== agentId ||
-    !profileEnabledAgents.includes(agentId) ||
-    profileEnabledAgents.some((id) => id && id !== agentId);
+    profileEnabledAgents.length !== monitoredAgents.length ||
+    profileEnabledAgents.some((id) => !monitoredAgents.includes(id));
   let notice = appearanceChanged
     ? `已将「${appearance.name}」设为 ${channelLabel} 渠道桌宠。`
     : `已切换设备跟随主体为 ${channelLabel}，沿用「${appearance.name}」，无需重新传输素材。`;
@@ -155,7 +157,7 @@ export async function applyDesktopPetAssignment({
         serialPort: profile.serialPort,
         serialBaud: profile.serialBaud,
         petChannelId: profile.petChannelId,
-        enabledAgents,
+        enabledAgents: monitoredAgents,
         selectedAgentId: agentId,
       },
     });

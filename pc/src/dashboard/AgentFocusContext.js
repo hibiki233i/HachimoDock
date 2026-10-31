@@ -15,6 +15,7 @@ export const AgentFocusContext = createContext({
   mode: "auto",
   step: noop,
   release: noop,
+  preloadAppearance: null,
 });
 
 export function useAgentFocusContext() {

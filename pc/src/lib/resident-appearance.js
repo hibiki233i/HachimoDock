@@ -1,6 +1,6 @@
 /**
  * [Input] A Tauri `invoke` adapter, an appearance id and the bound board id.
- * [Output] Switch the board to an appearance already resident in one of its slots, and user-facing text for each outcome.
+ * [Output] Resident activation and USB preloading with serialized device writes, latest-focus reconciliation and user-facing outcome text.
  * [Pos] lib node in pc/src/lib; used by focus-driven pet switching over USB or Wi-Fi.
  * [Sync] If this file changes, update `pc/src/.folder.md` and the `usb_activate_resident_appearance` command in `pc/src-tauri/src/lib.rs`.
  */
@@ -70,3 +70,67 @@ export async function preloadResidentAppearance({ invoke, appearanceId, boardDev
   return { ok: true, transferred, restored: true };
 }
 
+
+/** Serialize focus changes and preloads, then reconcile the latest target after each device write. */
+export function createPetFollowController({ invoke, onNotice }) {
+  let target = { enabled: false, boardDeviceId: "", appearanceId: "" };
+  let shown = { boardDeviceId: "", appearanceId: "" };
+  let pending = Promise.resolve();
+  const warned = new Set();
+
+  function enqueue(operation) {
+    const request = pending.catch(() => {}).then(operation);
+    pending = request;
+    return request;
+  }
+
+  function warn(appearanceId, outcome) {
+    const message = residentActivationMessage(outcome);
+    const key = `${appearanceId}:${outcome.state}`;
+    if (message && !warned.has(key)) {
+      warned.add(key);
+      onNotice?.({ tone: "warning", title: message });
+    }
+  }
+
+  async function reconcile() {
+    while (target.enabled && target.appearanceId) {
+      const requested = { ...target };
+      if (shown.boardDeviceId === requested.boardDeviceId && shown.appearanceId === requested.appearanceId) return true;
+      const outcome = await activateResidentAppearance({ invoke, ...requested });
+      if (outcome.ok) {
+        // A completed request changed the board even if the focus changed while it was in flight.
+        shown = requested;
+      } else if (target.boardDeviceId === requested.boardDeviceId && target.appearanceId === requested.appearanceId) {
+        warn(requested.appearanceId, outcome);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  return {
+    setShownAppearance(value) { shown = { ...value }; },
+    setTarget(value) {
+      target = { ...value };
+      return enqueue(reconcile);
+    },
+    preload({ appearanceId, boardDeviceId }) {
+      return enqueue(async () => {
+        const previous = { ...shown };
+        const outcome = await preloadResidentAppearance({ invoke, appearanceId, boardDeviceId });
+        if (!outcome.ok) return outcome;
+        shown = { appearanceId, boardDeviceId };
+        if (target.boardDeviceId !== boardDeviceId || !target.enabled) return { ...outcome, restored: false };
+        if (target.appearanceId) return { ...outcome, restored: await reconcile() };
+        // Resident mode holds the actual displayed pet, which can differ from the desktop channel.
+        if (previous.boardDeviceId === boardDeviceId && previous.appearanceId && previous.appearanceId !== appearanceId) {
+          const restored = await activateResidentAppearance({ invoke, ...previous });
+          if (!restored.ok) { warn(previous.appearanceId, restored); return { ...outcome, restored: false }; }
+          shown = previous;
+        }
+        return { ...outcome, restored: await reconcile() };
+      });
+    },
+  };
+}

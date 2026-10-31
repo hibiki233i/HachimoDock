@@ -1,13 +1,13 @@
 /**
  * [Input] The focus Agent, the pet follow mode, the Agent→appearance map, the appearance the board shows, and a notice sink.
- * [Output] Switches the board to the focus Agent's resident appearance and warns once when that appearance is not stored on the board.
+ * [Output] Serializes focus-driven resident activation and preloading, restores the latest focus afterwards, and warns once for an unavailable appearance.
  * [Pos] Focus-driven pet switching in the device dashboard; never transfers assets.
  * [Sync] If this file changes, update `pc/src/dashboard/.folder.md` and `pc/src/.folder.md`.
  */
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { planPetSwitch } from "../lib/agent-focus.js";
-import { activateResidentAppearance, residentActivationMessage } from "../lib/resident-appearance.js";
+import { createPetFollowController } from "../lib/resident-appearance.js";
 
 export function usePetFollowSwitch({
   enabled,
@@ -20,46 +20,25 @@ export function usePetFollowSwitch({
   shownAppearanceId,
   onNotice,
 }) {
-  const shownRef = useRef(shownAppearanceId);
-  const warnedRef = useRef(new Set());
   const noticeRef = useRef(onNotice);
   noticeRef.current = onNotice;
-  // An explicit change from the dashboard (setting a desktop pet) re-bases what the board shows.
-  useEffect(() => {
-    shownRef.current = shownAppearanceId;
-  }, [shownAppearanceId]);
+  const controller = useMemo(() => createPetFollowController({
+    invoke,
+    onNotice: (notice) => noticeRef.current?.(notice),
+  }), [invoke]);
 
   useEffect(() => {
-    if (!enabled) return undefined;
+    controller.setShownAppearance({ boardDeviceId, appearanceId: shownAppearanceId });
+  }, [controller, boardDeviceId, shownAppearanceId]);
+
+  useEffect(() => {
     const plan = planPetSwitch({
-      state: { focusAgentId },
-      petFollowMode,
-      residentAgentId,
-      agentAppearanceMap,
-      shownAppearanceId: shownRef.current,
+      state: { focusAgentId }, petFollowMode, residentAgentId, agentAppearanceMap,
     });
-    if (!plan.switchNeeded) return undefined;
-    let cancelled = false;
-    (async () => {
-      const outcome = await activateResidentAppearance({
-        invoke,
-        appearanceId: plan.appearanceId,
-        boardDeviceId,
-      });
-      if (cancelled) return;
-      if (outcome.ok) {
-        shownRef.current = plan.appearanceId;
-        return;
-      }
-      const message = residentActivationMessage(outcome);
-      const key = `${plan.appearanceId}:${outcome.state}`;
-      if (message && !warnedRef.current.has(key)) {
-        warnedRef.current.add(key);
-        noticeRef.current?.({ tone: "warning", title: message });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [enabled, invoke, boardDeviceId, focusAgentId, petFollowMode, residentAgentId, agentAppearanceMap]);
+    controller.setTarget({ enabled, boardDeviceId, appearanceId: plan.switchNeeded ? plan.appearanceId : "" });
+  }, [controller, enabled, boardDeviceId, focusAgentId, petFollowMode, residentAgentId, agentAppearanceMap]);
+
+  useEffect(() => () => { controller.setTarget({ enabled: false }); }, [controller]);
+
+  return useCallback((input) => controller.preload(input), [controller]);
 }

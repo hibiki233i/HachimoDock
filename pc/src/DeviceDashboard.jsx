@@ -13,6 +13,7 @@
  *          Agent-owned Session state that cannot leak across follow changes,
  *          with polling/reduction and device synchronization delegated to focused hooks,
  *          plus pure routing/merge/terminal-TTL policy in the P4 Session service,
+ *          serialized focus/preload pet activation even when the follow set shrinks to one Agent,
  *          always-on current-Agent conversation visibility with active-only admission,
  *          explicit-transition 60-second done/error retention, serialized P4 downlinks,
  *          empty-queue clearing and full active-ID signals,
@@ -1079,13 +1080,27 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
   const sessionFeed = selectedAgentId === primaryAgentId
     ? primaryFeed
     : extraFeeds[selectedAgentId] || primaryFeed;
+  // Show the focus Agent's pet when it differs from what the board shows. Only appearances already
+  // stored on the board are switched to; a missing one is reported, never transferred here.
+  const preloadFollowAppearance = usePetFollowSwitch({
+    enabled: isP4Runtime && Boolean(usb.connected),
+    invoke,
+    boardDeviceId: p4TargetBoardDeviceId,
+    focusAgentId: selectedAgentId,
+    petFollowMode,
+    residentAgentId: primaryAgentId,
+    agentAppearanceMap,
+    shownAppearanceId: currentDisplay.appearance?.id || "",
+    onNotice: push,
+  });
   const agentFocusValue = useMemo(() => ({
     followAgentIds,
     focusAgentId: selectedAgentId,
     mode: agentFocus.mode,
     step: agentFocus.step,
     release: agentFocus.release,
-  }), [followAgentIds, selectedAgentId, agentFocus.mode, agentFocus.step, agentFocus.release]);
+    preloadAppearance: preloadFollowAppearance,
+  }), [followAgentIds, selectedAgentId, agentFocus.mode, agentFocus.step, agentFocus.release, preloadFollowAppearance]);
   const p4SessionSync = useP4SessionSync({
     enabled: isP4Runtime,
     boardDeviceId: p4TargetBoardDeviceId,
@@ -1099,19 +1114,6 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     onDismissSessions: mergeDismissedP4Sessions,
     formatSessionOption: formatVoiceSessionOption,
     push,
-  });
-  // Show the focus Agent's pet when it differs from what the board shows. Only appearances already
-  // stored on the board are switched to; a missing one is reported, never transferred here.
-  usePetFollowSwitch({
-    enabled: isP4Runtime && Boolean(usb.connected) && followAgentIds.length > 1,
-    invoke,
-    boardDeviceId: p4TargetBoardDeviceId,
-    focusAgentId: selectedAgentId,
-    petFollowMode,
-    residentAgentId: primaryAgentId,
-    agentAppearanceMap,
-    shownAppearanceId: currentDisplay.appearance?.id || "",
-    onNotice: push,
   });
   // Joystick left/right: the board reports an Agent key, the desktop steps the focus and tells the board
   // which Agent it now shows (and, after a change, to flash its name).

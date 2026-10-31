@@ -1,6 +1,6 @@
 /**
  * [Input] Detected local coding agents, persisted appearance records, and localStorage bridge assignment state.
- * [Output] ChatGPT（Codex）-first fixed Agent ordering, explicit first-run selection, shared per-channel appearance mapping, single active desktop-channel helpers, and the separately stored multi-Agent device follow set with the pet follow mode, used by setup, dashboard, and gallery.
+ * [Output] ChatGPT（Codex）-first fixed Agent ordering, explicit first-run selection, shared per-channel appearance mapping, single active desktop-channel helpers, and the separately stored multi-Agent device follow set with the pet follow mode and serialized Bridge monitor synchronization, used by setup, dashboard, and gallery.
  * [Pos] lib node in pc/src/lib
  * [Sync] If this file changes, update `pc/src/.folder.md` and consumers that persist agent assignments.
  */
@@ -216,4 +216,31 @@ export function assignAppearanceToAgent(map, agentId, appearanceId) {
   }
   next[agentId] = appearanceId;
   return next;
+}
+
+/** Keep the desktop selection while enabling monitors for all device-followed Agents. */
+export function createDeviceFollowSynchronizer({ invoke }) {
+  let pending = Promise.resolve();
+  let restartPending = false;
+  return function synchronizeDeviceFollow(agentIds) {
+    const followed = sanitizeDeviceFollowAgents(agentIds);
+    const request = pending.catch(() => {}).then(async () => {
+      const profile = await invoke("load_bridge_profile");
+      const selectedAgentId = profile.selectedAgentId || profile.enabledAgents?.[0] || "";
+      if (!selectedAgentId) return;
+      const enabledAgents = sanitizeDeviceFollowAgents([selectedAgentId, ...followed]);
+      const current = profile.enabledAgents || [];
+      if (current.length !== enabledAgents.length || current.some((id) => !enabledAgents.includes(id))) {
+        await invoke("save_bridge_profile", { input: { ...profile, enabledAgents, selectedAgentId } });
+        restartPending = true;
+      }
+      if (restartPending) {
+        const runtime = await invoke("ensure_bridge_runtime", { input: { forceRestart: true } });
+        if (!runtime?.running) throw new Error(runtime?.message || "Bridge 尚未就绪，无法启用同时跟随");
+        restartPending = false;
+      }
+    });
+    pending = request;
+    return request;
+  };
 }

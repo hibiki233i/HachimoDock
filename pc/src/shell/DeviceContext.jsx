@@ -1,6 +1,7 @@
 /**
  * [Input] children tree consuming useDeviceContext; Tauri invoke/listen for verified P4 USB status, appearance sync progress, manual serial rescan, bindings, and agents; lib helpers for appearance/agent storage.
  * [Output] Single USB-only source of polling and derived state (binding, USB status, deviceOnline, force-refreshable appearances, agentAppearanceMap, enabledAgents, bridge-authoritative selectedAgentId, agentOptions, agentScan, currentDisplay, target-verified per-device currentComponent, cancellable appearanceSync); USB polling is single-flight and suppresses unchanged Context updates; defaults a truly unconfigured first run to Codex while preserving saved local/Bridge selection, exposes deduplicated manual Agent refresh plus focus-triggered stale refresh, hydrates the active channel from the bridge profile before trusting localStorage cache, and keeps follow changes explicitly USB-only; Rust owns background serial auto-connect while manual rescan can explicitly scan/connect.
+ *          Device follow changes synchronize Bridge monitors before persistence while preserving its selected desktop channel.
  *          Saved-persona events refresh the current target immediately; every conversation start reads fresh disk settings.
  *          Current-key usage help is published by the dashboard and consumed across setup surfaces.
  * [Pos] component node in pc/src/shell
@@ -21,6 +22,7 @@ import { buildUsageHelp } from "../lib/usage-help.js";
 import { listen } from "@tauri-apps/api/event";
 import {
   DEFAULT_AGENT_ID,
+  createDeviceFollowSynchronizer,
   FIXED_AGENT_OPTIONS,
   assignAppearanceToAgent,
   assignedAgentIds,
@@ -90,15 +92,18 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
   // Agents the device follows besides the desktop channel, and whether the pet changes with the focus.
   const [deviceFollowAgents, setDeviceFollowAgentsState] = useState(() => loadDeviceFollowAgents() || []);
   const [petFollowMode, setPetFollowModeState] = useState(loadPetFollowMode);
-  const setDeviceFollowAgent = useCallback((agentId, followed) => {
-    setDeviceFollowAgentsState((current) => {
-      const next = sanitizeDeviceFollowAgents(
-        followed ? [...current, agentId] : current.filter((id) => id !== agentId),
-      );
-      try { saveDeviceFollowAgents(next); } catch { /* storage unavailable: keep it for this session */ }
-      return next;
-    });
-  }, []);
+  const followAgentsRef = useRef(deviceFollowAgents);
+  const synchronizeDeviceFollow = useMemo(() => createDeviceFollowSynchronizer({ invoke }), []);
+  const setDeviceFollowAgent = useCallback(async (agentId, followed) => {
+    const current = followAgentsRef.current;
+    const next = sanitizeDeviceFollowAgents(
+      followed ? [...current, agentId] : current.filter((id) => id !== agentId),
+    );
+    await synchronizeDeviceFollow(next);
+    followAgentsRef.current = next;
+    setDeviceFollowAgentsState(next);
+    try { saveDeviceFollowAgents(next); } catch { /* storage unavailable: keep it for this session */ }
+  }, [synchronizeDeviceFollow]);
   const setPetFollowMode = useCallback((mode) => {
     const next = mode === "resident" ? "resident" : "follow";
     try { savePetFollowMode(next); } catch { /* storage unavailable */ }
@@ -108,6 +113,12 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
     () => new Set([DEFAULT_AGENT_ID]),
   );
   const [bridgeSelectedAgentId, setBridgeSelectedAgentId] = useState("");
+  useEffect(() => {
+    if (!bridgeSelectedAgentId) return;
+    synchronizeDeviceFollow(deviceFollowAgents).catch((error) => {
+      console.warn("[DeviceContext] simultaneous follow monitors failed", error);
+    });
+  }, [bridgeSelectedAgentId, deviceFollowAgents, synchronizeDeviceFollow]);
   const [agentOptions, setAgentOptions] = useState(() =>
     FIXED_AGENT_OPTIONS.map((agent) => ({ ...agent, detected: false })),
   );
@@ -373,6 +384,7 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
           agentOptions,
           boardDeviceId: usb.boardDeviceId || onlineBoardDeviceId || binding?.boardDeviceId || "",
           currentAppearanceId,
+          deviceFollowAgents: followAgentsRef.current,
           onProgress: emitAppearanceSyncProgress,
         });
         setAgentAppearanceMap(nextMap);

@@ -3946,17 +3946,13 @@ impl UsbSerialManager {
         appearance_dir: &std::path::Path,
         app_data_dir: &std::path::Path,
         expected_board_device_id: &str,
+        use_device_builtin: bool,
     ) -> Result<P4ResidentActivation, String> {
         let _asset_transfer_guard = self
             .asset_transfer_guard
             .try_lock()
             .map_err(|_| "设备正在同步形象，稍后再切换桌宠".to_string())?;
         self.connected_board_status(expected_board_device_id)?;
-        // A pack that was never prepared cannot be on the board.
-        let Ok(assets) = load_prepared_p4_appearance_pack(appearance_dir) else {
-            return Ok(P4ResidentActivation::NotResident);
-        };
-        let pack_id = p4_pack_id_from_assets(&assets)?;
         let transfer_id = format!(
             "p4-resident-{}",
             std::time::SystemTime::now()
@@ -3964,6 +3960,20 @@ impl UsbSerialManager {
                 .unwrap_or_default()
                 .as_millis()
         );
+        if use_device_builtin {
+            // The protected factory pack may predate the desktop bundle and have no local pack.
+            let state = self.query_p4_appearance_slots(&transfer_id)?;
+            let slot = p4_builtin_slot(&state)?;
+            if state.active_slot == Some(slot.slot) {
+                return Ok(P4ResidentActivation::AlreadyActive);
+            }
+            self.activate_p4_appearance_slot(&transfer_id, slot.slot, &slot.pack_id)?;
+            return Ok(P4ResidentActivation::Activated);
+        }
+        let Ok(assets) = load_prepared_p4_appearance_pack(appearance_dir) else {
+            return Ok(P4ResidentActivation::NotResident);
+        };
+        let pack_id = p4_pack_id_from_assets(&assets)?;
         let outcome = match self.try_activate_cached_p4_pack(&transfer_id, &pack_id)? {
             P4CachedPackActivation::NotFound => return Ok(P4ResidentActivation::NotResident),
             P4CachedPackActivation::AlreadyActive(slot) => (slot, P4ResidentActivation::AlreadyActive),
@@ -7322,6 +7332,79 @@ mod tests {
         assert_eq!(p4_builtin_slot(&state).unwrap().pack_id,"old-factory-hash");
         let missing = P4AppearanceSlotState {active_slot:Some(1),slots:vec![state.slots[1].clone()]};
         assert!(p4_builtin_slot(&missing).is_err());
+    }
+
+    fn resident_builtin_test_manager(active_slot: u32) -> (UsbSerialManager, Arc<Mutex<Vec<serde_json::Value>>>) {
+        struct DeviceWriter {
+            pending: Vec<u8>,
+            commands: Arc<Mutex<Vec<serde_json::Value>>>,
+            waiters: Arc<Mutex<Vec<AssetAckWaiter>>>,
+            active_slot: u32,
+        }
+        impl Write for DeviceWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.pending.extend_from_slice(bytes);
+                while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<_> = self.pending.drain(..=end).collect();
+                    let command: serde_json::Value = serde_json::from_slice(&line).unwrap();
+                    let phase = match command["topic"].as_str().unwrap() {
+                        "asset/slot-query" => "slot-query",
+                        "asset/activate" => "activate",
+                        other => panic!("resident activation must not transfer bytes: {other}"),
+                    };
+                    let ack = serde_json::json!({
+                        "transferId": command["payload"]["transferId"], "phase": phase, "ok": true,
+                        "activeSlot": self.active_slot,
+                        "slots": [{"slot": 0, "packId": "old-factory-pack"}, {"slot": 1, "packId": "custom-pack"}],
+                    });
+                    self.commands.lock().unwrap().push(command);
+                    resolve_asset_ack(&self.waiters, "asset/ack", &ack);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let manager = UsbSerialManager::new();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        *manager.connection.lock().unwrap() = Some(UsbConnection {
+            connection_id: 1, port_name: "resident-test".into(), baud_rate: P4_USB_UART_BAUD,
+            writer: Box::new(DeviceWriter { pending: Vec::new(), commands: commands.clone(), waiters: manager.asset_ack_waiters.clone(), active_slot }),
+            board_device_id: "p4-test".into(), runtime: "esp-p4".into(), device_model: String::new(),
+            firmware: String::new(), build_id: String::new(), git_sha: String::new(), build_dirty: false,
+            protocol_schema: 7, wire_protocol: String::new(),
+            capabilities: serde_json::json!({"appearance": {"builtinProtected": true}}),
+            connected: true, cancel_reader: Arc::new(AtomicBool::new(false)), capture_active: Arc::new(AtomicBool::new(false)),
+        });
+        (manager, commands)
+    }
+
+    #[test]
+    fn resident_builtin_activates_factory_slot_without_a_desktop_prepared_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manager, commands) = resident_builtin_test_manager(1);
+        let result = manager.activate_resident_p4_appearance(&tmp.path().join("terrier-clips"), tmp.path(), "p4-test", true).unwrap();
+        assert_eq!(result, P4ResidentActivation::Activated);
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1]["topic"], "asset/activate");
+        assert_eq!(commands[1]["payload"]["slot"], 0);
+        assert_eq!(commands[1]["payload"]["packId"], "old-factory-pack");
+    }
+
+    #[test]
+    fn resident_builtin_already_active_needs_no_activation_or_asset_transfer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manager, commands) = resident_builtin_test_manager(0);
+        assert_eq!(manager.activate_resident_p4_appearance(&tmp.path().join("terrier-clips"), tmp.path(), "p4-test", true).unwrap(), P4ResidentActivation::AlreadyActive);
+        assert_eq!(commands.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resident_custom_appearance_never_falls_back_to_the_factory_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manager, commands) = resident_builtin_test_manager(1);
+        assert_eq!(manager.activate_resident_p4_appearance(&tmp.path().join("custom-appearance"), tmp.path(), "p4-test", false).unwrap(), P4ResidentActivation::NotResident);
+        assert!(commands.lock().unwrap().is_empty());
     }
 
     #[test]
