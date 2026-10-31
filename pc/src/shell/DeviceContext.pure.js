@@ -1,6 +1,6 @@
 /**
  * [Input] agentAppearanceMap, enabledAgents, appearances, agentOptions, and a verified P4 USB snapshot.
- * [Output] Pure helpers that preserve verified USB runtime/capability/baud metadata, compare normalized snapshots without forcing Context churn, and stay importable in unit tests without pulling in @tauri-apps/api transitively.
+ * [Output] Pure helpers (including the voice-persona pet resolver) that preserve verified USB runtime/capability/baud metadata, compare normalized snapshots without forcing Context churn, and stay importable in unit tests without pulling in @tauri-apps/api transitively.
  * [Pos] lib node in pc/src/shell
  * [Sync] If this file changes, update `pc/src/shell/.folder.md`.
  */
@@ -10,6 +10,14 @@ import {
   appearanceById,
   channelLabelForId,
 } from "../lib/agent-appearance-config.js";
+
+/**
+ * The pet whose persona and voice the board's voice features use: the pet the board was last told to
+ * show, falling back to the main channel's assignment when none was reported or its record is gone.
+ */
+export function resolveVoiceAppearance(appearances, shownAppearanceId, currentAppearance) {
+  return (shownAppearanceId && appearanceById(appearances, shownAppearanceId)) || currentAppearance || null;
+}
 
 export function deriveCurrentDisplay(agentAppearanceMap, enabledAgents, appearances, agentOptions) {
   const active = activeDesktopAssignment(agentAppearanceMap, enabledAgents);

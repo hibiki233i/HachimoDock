@@ -1,6 +1,6 @@
 /**
  * [Input] The focus Agent, the pet follow mode, the Agent→appearance map, the desktop assignment revision, and a notice sink.
- * [Output] Serializes focus-driven resident activation and preloading, confirms the latest focus after initialization, reconnection and preloading, and warns once for an unavailable appearance.
+ * [Output] Serializes focus-driven resident activation and preloading, confirms the latest focus after initialization, reconnection and preloading, and reports each pet it put on the board, and warns once for an unavailable appearance.
  * [Pos] Focus-driven pet switching in the device dashboard; never transfers assets.
  * [Sync] If this file changes, update `pc/src/dashboard/.folder.md` and `pc/src/.folder.md`.
  */
@@ -20,12 +20,16 @@ export function usePetFollowSwitch({
   agentAppearanceMap,
   shownAppearanceId,
   onNotice,
+  onShown,
 }) {
   const noticeRef = useRef(onNotice);
   noticeRef.current = onNotice;
+  const shownRef = useRef(onShown);
+  shownRef.current = onShown;
   const controller = useMemo(() => createPetFollowController({
     invoke,
     onNotice: (notice) => noticeRef.current?.(notice),
+    onShown: (shown) => shownRef.current?.(shown),
   }), [invoke]);
 
   useEffect(() => {

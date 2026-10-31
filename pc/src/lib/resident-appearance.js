@@ -1,6 +1,6 @@
 /**
  * [Input] A Tauri `invoke` adapter, an appearance id and the bound board id.
- * [Output] Resident activation and non-replacing USB preloading with serialized device writes, actual-slot restoration and latest-focus confirmation.
+ * [Output] Resident activation and non-replacing USB preloading with serialized device writes, actual-slot restoration, latest-focus confirmation and a report of each pet put on the board.
  * [Pos] lib node in pc/src/lib; used by focus-driven pet switching over USB or Wi-Fi.
  * [Sync] If this file changes, update `pc/src/.folder.md` and the `usb_activate_resident_appearance` command in `pc/src-tauri/src/lib.rs`.
  */
@@ -53,7 +53,7 @@ export async function preloadResidentAppearance({ invoke, appearanceId, boardDev
 }
 
 /** Serialize focus changes and preloads, then reconcile the latest target after each device write. */
-export function createPetFollowController({ invoke, onNotice }) {
+export function createPetFollowController({ invoke, onNotice, onShown }) {
   let target = { enabled: false, boardDeviceId: "", appearanceId: "" };
   let shown = { boardDeviceId: "", appearanceId: "" };
   let pending = Promise.resolve();
@@ -82,6 +82,7 @@ export function createPetFollowController({ invoke, onNotice }) {
       if (outcome.ok) {
         // A completed request changed the board even if the focus changed while it was in flight.
         shown = requested;
+        onShown?.(requested);
       } else if (target.boardDeviceId === requested.boardDeviceId && target.appearanceId === requested.appearanceId) {
         warn(requested.appearanceId, outcome);
         return false;

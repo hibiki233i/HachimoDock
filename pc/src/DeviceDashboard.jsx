@@ -802,6 +802,7 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     agentAppearanceMap,
     deviceFollowAgents,
     petFollowMode,
+    setDeviceShownAppearance,
     agentOptions,
     agentScan,
     refreshAgents,
@@ -1092,6 +1093,7 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     agentAppearanceMap,
     shownAppearanceId: currentDisplay.appearance?.id || "",
     onNotice: push,
+    onShown: setDeviceShownAppearance,
   });
   const agentFocusValue = useMemo(() => ({
     followAgentIds,

@@ -192,3 +192,29 @@ test("reconnecting the same board confirms its display again", async () => {
   assert.equal(displayed, "pet-a");
   assert.equal(activations, 2);
 });
+
+test("each pet put on the board is reported once, and again after the display is invalidated", async () => {
+  const shown = [];
+  const controller = createPetFollowController({
+    invoke: async () => ({ ok: true, state: "activated" }),
+    onShown: (value) => shown.push(value.appearanceId),
+  });
+  await controller.setTarget({ enabled: true, boardDeviceId: "p4", appearanceId: "pet-b" });
+  await controller.setTarget({ enabled: true, boardDeviceId: "p4", appearanceId: "pet-b" });
+  controller.invalidateShownAppearance();
+  await controller.setTarget({ enabled: true, boardDeviceId: "p4", appearanceId: "pet-a" });
+  controller.invalidateShownAppearance();
+  await controller.setTarget({ enabled: true, boardDeviceId: "p4", appearanceId: "pet-a" });
+  assert.deepEqual(shown, ["pet-b", "pet-a", "pet-a"]);
+});
+
+test("a failed activation is not reported as shown", async () => {
+  const shown = [];
+  const controller = createPetFollowController({
+    invoke: async () => ({ ok: false, state: "notResident" }),
+    onShown: (value) => shown.push(value.appearanceId),
+    onNotice: () => {},
+  });
+  await controller.setTarget({ enabled: true, boardDeviceId: "p4", appearanceId: "pet-b" });
+  assert.deepEqual(shown, []);
+});

@@ -49,6 +49,7 @@ import {
   deriveCurrentDisplay,
   deriveDeviceReachability,
   normalizeUsbStatusPayload,
+  resolveVoiceAppearance,
   usbStatusSnapshotsEqual,
 } from "./DeviceContext.pure.js";
 
@@ -92,6 +93,11 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
   // Agents the device follows besides the desktop channel, and whether the pet changes with the focus.
   const [deviceFollowAgents, setDeviceFollowAgentsState] = useState(() => loadDeviceFollowAgents() || []);
   const [petFollowMode, setPetFollowModeState] = useState(loadPetFollowMode);
+  // The pet the board was last told to show for the focus Agent; "" until reported or after a reset.
+  const [shownAppearanceId, setShownAppearanceId] = useState("");
+  const setDeviceShownAppearance = useCallback((shown) => {
+    setShownAppearanceId(shown?.appearanceId || "");
+  }, []);
   const followAgentsRef = useRef(deviceFollowAgents);
   const synchronizeDeviceFollow = useMemo(() => createDeviceFollowSynchronizer({ invoke }), []);
   const setDeviceFollowAgent = useCallback(async (agentId, followed) => {
@@ -342,6 +348,16 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
     [agentAppearanceMap, enabledAgents, appearances, agentOptions],
   );
 
+  // Voice features speak as the pet on screen, which follows the focus Agent rather than the main channel.
+  const voiceAppearance = useMemo(
+    () => resolveVoiceAppearance(appearances, shownAppearanceId, currentDisplay.appearance),
+    [appearances, shownAppearanceId, currentDisplay.appearance],
+  );
+  // A new main-channel assignment or board is displayed as such until the follow switch reports again.
+  useEffect(() => {
+    setShownAppearanceId("");
+  }, [currentDisplay.appearance?.id, usb.boardDeviceId, usb.connected]);
+
   const { deviceOnline, onlineBoardDeviceId } = useMemo(
     () => deriveDeviceReachability({ usb }),
     [usb],
@@ -450,12 +466,12 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
   const componentVoiceSync = useRef(null);
   if (!componentVoiceSync.current) componentVoiceSync.current = createComponentVoiceSync(invoke);
   useEffect(() => {
-    const input = componentPetVoice(currentDisplay.appearance, usb);
+    const input = componentPetVoice(voiceAppearance, usb);
     const sync = () => componentVoiceSync.current(input);
     void sync();
     const timer = setInterval(sync, 5000);
     return () => { clearInterval(timer); void componentVoiceSync.current(null); };
-  }, [currentDisplay.appearance, usb.boardDeviceId, usb.connected]);
+  }, [voiceAppearance, usb.boardDeviceId, usb.connected]);
   useEffect(() => {
     const onPersonaSaved = (event) => {
       const { appearanceId, personaVoice } = event.detail || {};
@@ -471,10 +487,10 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
   }, []);
   useEffect(() => {
     realtimeTargetRef.current = {
-      appearance: currentDisplay.appearance || null,
+      appearance: voiceAppearance || null,
       boardDeviceId: String(usb.boardDeviceId || "").trim(),
     };
-  }, [currentDisplay.appearance, usb.boardDeviceId]);
+  }, [voiceAppearance, usb.boardDeviceId]);
 
   const startRealtimeChat = useCallback(async (options = {}) => {
     const target = realtimeTargetRef.current;
@@ -555,6 +571,7 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
       setDeviceFollowAgent,
       petFollowMode,
       setPetFollowMode,
+      setDeviceShownAppearance,
       selectedAgentId: bridgeSelectedAgentId,
       agentOptions,
       agentScan,
@@ -589,6 +606,7 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
       setDeviceFollowAgent,
       petFollowMode,
       setPetFollowMode,
+      setDeviceShownAppearance,
       bridgeSelectedAgentId,
       agentOptions,
       agentScan,
