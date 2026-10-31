@@ -16,6 +16,7 @@ import {
   deriveDeviceReachability,
   normalizeUsbStatusPayload,
   resolveUsbRuntime,
+  resolveVoiceAppearance,
   usbStatusSnapshotsEqual,
 } from "./DeviceContext.pure.js";
 
@@ -302,4 +303,20 @@ test("USB status normalization carries the backend transport and treats it as a 
   assert.equal(normalizeUsbStatusPayload({ ...base, transport: "mqtt" }).transport, "usb");
   assert.equal(wifiLink.transport, "wifi");
   assert.equal(usbStatusSnapshotsEqual(usbLink, { ...wifiLink, portName: usbLink.portName }), false);
+});
+
+test("voice features use the pet the board shows, falling back to the main channel's pet", () => {
+  const main = { id: "ap-a" };
+  assert.equal(resolveVoiceAppearance(APPEARANCES, "", main), main, "nothing reported yet");
+  assert.equal(resolveVoiceAppearance(APPEARANCES, "ap-b", main)?.id, "ap-b", "focus Agent's pet is on screen");
+  assert.equal(resolveVoiceAppearance(APPEARANCES, "deleted", main), main, "a removed pet falls back");
+  assert.equal(resolveVoiceAppearance(APPEARANCES, "ap-b", null)?.id, "ap-b", "main channel has no pet");
+  assert.equal(resolveVoiceAppearance(APPEARANCES, "", null), null);
+});
+
+test("realtime chat and component speech read the displayed pet, not the main channel's", () => {
+  const source = readFileSync(join(here, "DeviceContext.jsx"), "utf8");
+  assert.match(source, /componentPetVoice\(voiceAppearance, usb\)/);
+  assert.match(source, /appearance: voiceAppearance \|\| null/);
+  assert.doesNotMatch(source, /componentPetVoice\(currentDisplay\.appearance/);
 });

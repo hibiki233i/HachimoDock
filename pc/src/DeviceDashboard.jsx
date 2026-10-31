@@ -13,6 +13,7 @@
  *          Agent-owned Session state that cannot leak across follow changes,
  *          with polling/reduction and device synchronization delegated to focused hooks,
  *          plus pure routing/merge/terminal-TTL policy in the P4 Session service,
+ *          serialized focus/preload pet activation even when the follow set shrinks to one Agent,
  *          always-on current-Agent conversation visibility with active-only admission,
  *          explicit-transition 60-second done/error retention, serialized P4 downlinks,
  *          empty-queue clearing and full active-ID signals,
@@ -55,6 +56,13 @@ import VoiceAssistantPanel, { buildVoiceSummary, formatVoiceSessionOption } from
 import RealtimeChatPanel, { realtimeStateLabel } from "./dashboard/RealtimeChatPanel.jsx";
 import { isRecoveringAsr } from "./lib/realtime-feedback.js";
 import { useAgentSessionFeed } from "./dashboard/useAgentSessionFeed.js";
+import { useFollowedAgentFeeds } from "./dashboard/useFollowedAgentFeeds.js";
+import { useAgentFocus } from "./dashboard/useAgentFocus.js";
+import { usePetFollowSwitch } from "./dashboard/usePetFollowSwitch.js";
+import { useAgentSwitchEvents } from "./dashboard/useAgentSwitchEvents.js";
+import { useAgentFocusAnnouncer } from "./dashboard/useAgentFocusAnnouncer.js";
+import { AgentFocusContext } from "./dashboard/AgentFocusContext.js";
+import { sanitizeDeviceFollowAgents } from "./lib/agent-appearance-config.js";
 import { useDeviceVoiceRouter } from "./dashboard/useDeviceVoiceRouter.js";
 import { subscribeAsrCredentialUpdates } from "./dashboard/voice-credential-events.js";
 import { useP4SessionSync } from "./dashboard/useP4SessionSync.js";
@@ -107,8 +115,8 @@ export const DEFAULT_BUTTON_ACTIONS = {
   p4_sw3_long: "disabled",
   p4_encoder_press: "page_enter",
   p4_encoder_long: "disabled",
-  p4_encoder_cw: "session_next",
-  p4_encoder_ccw: "session_previous",
+  p4_encoder_cw: "agent_next",
+  p4_encoder_ccw: "agent_previous",
   p4_joystick_up: "session_previous",
   p4_joystick_down: "session_next",
 };
@@ -127,6 +135,8 @@ export const BUTTON_FUNCTION_OPTIONS = [
   { id: "realtime_chat", label: "实时对话", detail: "在宠物界面触发后开始聊天，再次触发结束。组件运行时请先返回宠物界面。" },
   { id: "session_previous", label: "上一个", detail: "宠物界面切换到上一个会话气泡；组件中心切换到上一个组件。" },
   { id: "session_next", label: "下一个", detail: "宠物界面切换到下一个会话气泡；组件中心切换到下一个组件。" },
+  { id: "agent_previous", label: "上一个 Agent", detail: "宠物界面切换到上一个跟随的 Agent 及其桌宠（需要同时跟随两个以上 Agent，否则切换会话气泡）；组件中心切换到上一个组件。" },
+  { id: "agent_next", label: "下一个 Agent", detail: "宠物界面切换到下一个跟随的 Agent 及其桌宠（需要同时跟随两个以上 Agent，否则切换会话气泡）；组件中心切换到下一个组件。" },
   { id: "session_clear", label: "清空主页会话", detail: "清除设备主页当前显示的全部会话；新会话或新活动会自动重新显示。" },
   { id: "component_center", label: "切换宠物/组件", detail: "切换宠物界面和组件列表；组件运行时请先返回。" },
   { id: "page_enter", label: "确认", detail: "发送语音输入的文字，或打开选中的组件；组件内按其玩法操作。" },
@@ -160,6 +170,8 @@ const P4_CUSTOM_ACTION_OPTIONS = [
   "realtime_chat",
   "session_previous",
   "session_next",
+  "agent_previous",
+  "agent_next",
   "session_clear",
   "component_center",
   "page_enter",
@@ -175,8 +187,8 @@ export const P4_BUTTON_CONTROL_ROWS = [
   { id: "p4_sw3_long", controlId: "p4_sw3", label: "SW3 长按", event: "button.sw3.long_press", holdEvent: "button.sw3.hold", voiceTriggerId: "sw3.hold", defaultAction: "disabled", voiceFallbackAction: "disabled", actionOptions: ["voice_ptt", ...P4_CUSTOM_ACTION_OPTIONS], supportsValue: true },
   { id: "p4_joystick_up", controlId: "p4_joystick", label: "摇杆向上", event: "joystick.up", defaultAction: "session_previous", actionOptions: P4_CUSTOM_ACTION_OPTIONS, supportsValue: true },
   { id: "p4_joystick_down", controlId: "p4_joystick", label: "摇杆向下", event: "joystick.down", defaultAction: "session_next", actionOptions: P4_CUSTOM_ACTION_OPTIONS, supportsValue: true },
-  { id: "p4_encoder_ccw", controlId: "p4_joystick", label: "摇杆向左", event: "knob.rotate_ccw", defaultAction: "session_previous", actionOptions: P4_CUSTOM_ACTION_OPTIONS, supportsValue: true },
-  { id: "p4_encoder_cw", controlId: "p4_joystick", label: "摇杆向右", event: "knob.rotate_cw", defaultAction: "session_next", actionOptions: P4_CUSTOM_ACTION_OPTIONS, supportsValue: true },
+  { id: "p4_encoder_ccw", controlId: "p4_joystick", label: "摇杆向左", event: "knob.rotate_ccw", defaultAction: "agent_previous", actionOptions: P4_CUSTOM_ACTION_OPTIONS, supportsValue: true },
+  { id: "p4_encoder_cw", controlId: "p4_joystick", label: "摇杆向右", event: "knob.rotate_cw", defaultAction: "agent_next", actionOptions: P4_CUSTOM_ACTION_OPTIONS, supportsValue: true },
   { id: "p4_encoder_press", controlId: "p4_joystick", label: "摇杆中按短按", event: "button.encoder.short_press", defaultAction: "page_enter", actionOptions: P4_CUSTOM_ACTION_OPTIONS, supportsValue: true },
   { id: "p4_encoder_long", controlId: "p4_joystick", label: "摇杆中按长按", event: "button.encoder.long_press", holdEvent: "button.encoder.hold", voiceTriggerId: "encoder_button.hold", defaultAction: "disabled", voiceFallbackAction: "disabled", actionOptions: ["voice_ptt", ...P4_CUSTOM_ACTION_OPTIONS], supportsValue: true },
 ];
@@ -275,6 +287,21 @@ const P4_V7_DEFAULT_BUTTON_ACTIONS = {
   p4_joystick_down: "disabled",
 };
 
+const P4_V9_DEFAULT_BUTTON_ACTIONS = {
+  p4_sw1_short: "page_enter",
+  p4_sw1_long: "voice_ptt",
+  p4_sw2_short: "component_center",
+  p4_sw2_long: "realtime_chat",
+  p4_sw3_short: "page_back",
+  p4_sw3_long: "disabled",
+  p4_encoder_press: "page_enter",
+  p4_encoder_long: "disabled",
+  p4_encoder_cw: "session_next",
+  p4_encoder_ccw: "session_previous",
+  p4_joystick_up: "session_previous",
+  p4_joystick_down: "session_next",
+};
+
 const P4_V8_DEFAULT_BUTTON_ACTIONS = {
   p4_sw1_short: "page_enter",
   p4_sw1_long: "voice_ptt",
@@ -362,7 +389,9 @@ function normalizeVoiceConfig(value = {}) {
   const storedButtonModelVersion = Number(value.buttonModelVersion || 0);
   const migrateLegacyP4Defaults = storedButtonModelVersion !== DEVICE_BUTTON_CONFIG_MODEL_VERSION
     && Object.keys(incoming).some((key) => key.startsWith("p4_"));
-  const previousP4Defaults = storedButtonModelVersion === 8
+  const previousP4Defaults = storedButtonModelVersion === 9
+    ? P4_V9_DEFAULT_BUTTON_ACTIONS
+    : storedButtonModelVersion === 8
     ? P4_V8_DEFAULT_BUTTON_ACTIONS
     : storedButtonModelVersion === 7
     ? P4_V7_DEFAULT_BUTTON_ACTIONS
@@ -770,6 +799,11 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     deviceOnline,
     onlineBoardDeviceId,
     currentDisplay,
+    agentAppearanceMap,
+    deviceFollowAgents,
+    petFollowMode,
+    setDeviceShownAppearance,
+    agentOptions,
     agentScan,
     refreshAgents,
     realtimeChat,
@@ -1003,7 +1037,13 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     if (shouldAutoOpenOnboarding(ONBOARDING_PAGE_IDS.DEVICE)) setGuideOpen(true);
   }, [active, binding, hasKnownRuntime]);
 
-  const selectedAgentId = currentDisplay.agentId;
+  // The desktop channel is always followed; further Agents are opted in. The board shows one of
+  // them at a time (the focus Agent): the earliest active one, or the one picked with the switch.
+  const primaryAgentId = currentDisplay.agentId;
+  const followAgentIds = useMemo(
+    () => sanitizeDeviceFollowAgents([primaryAgentId, ...(deviceFollowAgents || [])].filter(Boolean)),
+    [primaryAgentId, deviceFollowAgents],
+  );
   const p4TargetBoardDeviceId = isP4Runtime
     ? (usb.boardDeviceId || onlineBoardDeviceId || binding?.boardDeviceId || "")
     : "";
@@ -1011,11 +1051,58 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
   const mergeDismissedP4Sessions = useCallback((dismissed) => {
     setDismissedP4Sessions((current) => ({ ...current, ...dismissed }));
   }, []);
-  const sessionFeed = useAgentSessionFeed({
-    agentId: selectedAgentId,
+  const primaryFeed = useAgentSessionFeed({
+    agentId: primaryAgentId,
     displayEnabled: true,
     dismissedSessions: dismissedP4Sessions,
   });
+  const extraAgentIds = useMemo(
+    () => followAgentIds.filter((agentId) => agentId !== primaryAgentId),
+    [followAgentIds, primaryAgentId],
+  );
+  const extraFeeds = useFollowedAgentFeeds({
+    agentIds: extraAgentIds,
+    dismissedSessions: dismissedP4Sessions,
+  });
+  const primarySessions = primaryFeed.sessions;
+  const sessionsByAgent = useMemo(
+    () => Object.fromEntries(followAgentIds.map((agentId) => [
+      agentId,
+      (agentId === primaryAgentId ? primarySessions : extraFeeds[agentId]?.sessions) || [],
+    ])),
+    [followAgentIds, primaryAgentId, primarySessions, extraFeeds],
+  );
+  const agentFocus = useAgentFocus({
+    followAgentIds,
+    sessionsByAgent,
+    defaultAgentId: primaryAgentId,
+  });
+  const selectedAgentId = agentFocus.focusAgentId || primaryAgentId;
+  const sessionFeed = selectedAgentId === primaryAgentId
+    ? primaryFeed
+    : extraFeeds[selectedAgentId] || primaryFeed;
+  // Show the focus Agent's pet when it differs from what the board shows. Only appearances already
+  // stored on the board are switched to; a missing one is reported, never transferred here.
+  const preloadFollowAppearance = usePetFollowSwitch({
+    enabled: isP4Runtime && Boolean(usb.connected),
+    invoke,
+    boardDeviceId: p4TargetBoardDeviceId,
+    focusAgentId: selectedAgentId,
+    petFollowMode,
+    residentAgentId: primaryAgentId,
+    agentAppearanceMap,
+    shownAppearanceId: currentDisplay.appearance?.id || "",
+    onNotice: push,
+    onShown: setDeviceShownAppearance,
+  });
+  const agentFocusValue = useMemo(() => ({
+    followAgentIds,
+    focusAgentId: selectedAgentId,
+    mode: agentFocus.mode,
+    step: agentFocus.step,
+    release: agentFocus.release,
+    preloadAppearance: preloadFollowAppearance,
+  }), [followAgentIds, selectedAgentId, agentFocus.mode, agentFocus.step, agentFocus.release, preloadFollowAppearance]);
   const p4SessionSync = useP4SessionSync({
     enabled: isP4Runtime,
     boardDeviceId: p4TargetBoardDeviceId,
@@ -1029,6 +1116,21 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     onDismissSessions: mergeDismissedP4Sessions,
     formatSessionOption: formatVoiceSessionOption,
     push,
+  });
+  // Joystick left/right: the board reports an Agent key, the desktop steps the focus and tells the board
+  // which Agent it now shows (and, after a change, to flash its name).
+  useAgentSwitchEvents({
+    enabled: isP4Runtime && Boolean(usb.connected) && followAgentIds.length > 1,
+    boardDeviceId: p4TargetBoardDeviceId,
+    onStep: agentFocus.step,
+  });
+  useAgentFocusAnnouncer({
+    enabled: isP4Runtime && Boolean(usb.connected),
+    invoke,
+    boardDeviceId: p4TargetBoardDeviceId,
+    followAgentIds,
+    focusAgentId: selectedAgentId,
+    agentOptions,
   });
   const selectedAgentBusSessions = sessionFeed.sessions;
   const selectedAgentRoutingSessions = sessionFeed.routingSessions;
@@ -1527,7 +1629,9 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
           </Button>
         )}
       >
-        <ChannelMatrixCard />
+        <AgentFocusContext.Provider value={agentFocusValue}>
+          <ChannelMatrixCard />
+        </AgentFocusContext.Provider>
       </Card>
 
       <Card>

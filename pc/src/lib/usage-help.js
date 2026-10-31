@@ -25,6 +25,10 @@ export function buildUsageHelp(rows = [], actions = {}, enabled = true, pending 
     sessions: labels("session_previous").length || labels("session_next").length
       ? `在宠物界面，使用「上一个／下一个」切换会话气泡。${[binding("session_previous"), binding("session_next")].filter(Boolean).join("；")}。`
       : unbound,
+    agents: labels("agent_previous").length || labels("agent_next").length
+      ? `在宠物界面，使用「上一个／下一个 Agent」切换设备显示的 Agent 和它的桌宠（需要同时跟随两个以上 Agent，否则切换会话气泡）。${[binding("agent_previous"), binding("agent_next")].filter(Boolean).join("；")}。`
+      : unbound,
+    agentsBound: Boolean(labels("agent_previous").length || labels("agent_next").length),
     component: binding("component_center") ? `${binding("component_center")}，在宠物界面与组件列表之间切换。组件运行时请先返回。` : unbound,
     select: [binding("session_previous") && `${binding("session_previous")}选择上一个`, binding("session_next") && `${binding("session_next")}选择下一个`].filter(Boolean).join("；") || unbound,
     enter: confirm ? `${confirm}打开选中的组件。` : unbound,

@@ -27,6 +27,8 @@ extern "C" {
 #define PET_P4_STATUS_TEXT_MAX 96
 #define PET_P4_SESSION_TITLE_MAX 256
 #define PET_P4_SESSION_NOTICE_MAX 96
+/* How long the Agent-switch hint stays on screen after the desktop announces a focus change. */
+#define PET_P4_AGENT_HINT_MS 1800ULL
 #define PET_P4_SESSION_QUEUE_MAX 8
 #define PET_P4_SESSION_QUEUE_ID_MAX 128
 #define PET_P4_SESSION_QUEUE_TITLE_MAX 192
@@ -87,6 +89,13 @@ typedef struct {
   unsigned int current_session_index;
   unsigned int current_session_count;
   unsigned long long session_notice_until_ms;
+  /* Focus Agent announced by the desktop (`agent/focus`). With two or more followed Agents, joystick
+   * left/right switch the Agent instead of the Session; the desktop owns the decision. */
+  unsigned int agent_focus_index; /* 1-based, 0 = unknown */
+  unsigned int agent_focus_count;
+  char agent_focus_label[PET_P4_AGENT_MAX];
+  unsigned long long agent_focus_seen_ms;
+  unsigned long long agent_hint_until_ms;
   pet_p4_session_queue_item_t session_queue[PET_P4_SESSION_QUEUE_MAX];
   pet_p4_session_queue_item_t session_queue_staging[PET_P4_SESSION_QUEUE_MAX];
   unsigned int session_queue_count;
@@ -167,6 +176,12 @@ bool pet_p4_state_host_connected(
   const pet_p4_runtime_state_t *state,
   unsigned long long now_ms
 );
+/* True when joystick left/right should switch the focus Agent: the desktop is connected and follows
+ * at least two Agents. Otherwise the same keys keep selecting Sessions. */
+bool pet_p4_state_agent_switch_available(
+  const pet_p4_runtime_state_t *state,
+  unsigned long long now_ms
+);
 void pet_p4_load_asset_manifest(pet_p4_runtime_state_t *state);
 bool pet_p4_asset_fs_path(const char *logical_path, char *out, size_t out_size);
 bool pet_p4_asset_read_all(
@@ -177,6 +192,8 @@ bool pet_p4_asset_read_all(
 bool pet_p4_asset_fs_path_for_slot(int slot, const char *logical_path, bool tmp, char *out, size_t out_size);
 int pet_p4_asset_active_slot(void);
 int pet_p4_asset_inactive_slot(void);
+/* True when an appearance transfer may write `slot` (exists, and is not a protected slot). */
+bool pet_p4_asset_slot_is_transfer_target(int slot);
 bool pet_p4_asset_set_active_slot(int slot);
 bool pet_p4_asset_slot_has_pack_id(int slot);
 bool pet_p4_asset_mark_slot_ready(int slot);

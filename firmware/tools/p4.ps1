@@ -115,9 +115,10 @@ function Assert-CurrentAbLayout {
     $hasOta0 = $Layout -match "(?m)^ota_0,app,ota_0,0x10000,(2560K|0x280000),"
     $hasOta1 = $Layout -match "(?m)^ota_1,app,ota_1,0x290000,(2560K|0x280000),"
     $hasStorage = $Layout -match "(?m)^storage,data,spiffs,0x520000,(7040K|0x6E0000),"
-    $hasAppearance0 = $Layout -match "(?m)^appearance0,data,64,0xc00000,(10M|0xA00000),"
-    $hasAppearance1 = $Layout -match "(?m)^appearance1,data,65,0x1600000,(10M|0xA00000),"
-    if (-not ($hasOta0 -and $hasOta1 -and $hasStorage -and $hasAppearance0 -and $hasAppearance1)) {
+    $hasAppearance0 = $Layout -match "(?m)^appearance0,data,64,0xc00000,(5M|0x500000),"
+    $hasAppearance1 = $Layout -match "(?m)^appearance1,data,65,0x1100000,(5M|0x500000),"
+    $hasAppearance2 = $Layout -match "(?m)^appearance2,data,66,0x1600000,(5M|0x500000),"
+    if (-not ($hasOta0 -and $hasOta1 -and $hasStorage -and $hasAppearance0 -and $hasAppearance1 -and $hasAppearance2)) {
         throw "Device does not use the current dual-OTA + 640x480 appearance layout. Use factory-flash -FactoryReset."
     }
 }

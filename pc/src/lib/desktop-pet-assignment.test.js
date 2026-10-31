@@ -461,3 +461,27 @@ test("applyDesktopPetAssignment names pre-transfer device steps instead of a fro
     indeterminate: true,
   }]);
 });
+
+
+test("changing the primary pet keeps extra followed Agent monitors enabled and one selected channel", async () => {
+  const calls = [];
+  let saved;
+  const invoke = async (command, args) => {
+    calls.push(command);
+    if (command === "usb_get_status") return { connected: true };
+    if (command === "load_bridge_profile") return {
+      desktopDeviceId: "desk-1", mqttUrl: "mqtt://localhost", selectedAgentId: "claude-code", enabledAgents: ["claude-code"],
+    };
+    if (command === "save_bridge_profile") { saved = args.input; return args.input; }
+    if (command === "ensure_bridge_runtime") return { running: true };
+    return { ok: true };
+  };
+  await applyDesktopPetAssignment({
+    invoke, agentAppearanceMap: { "claude-code": "pet-a", codex: "pet-b" },
+    agentId: "claude-code", appearance: { id: "pet-a", name: "A" }, agentOptions: [],
+    currentAppearanceId: "pet-a", boardDeviceId: "p4-1", deviceFollowAgents: ["codex"],
+  });
+  assert.deepEqual(saved?.enabledAgents, ["codex", "claude-code"]);
+  assert.equal(saved.selectedAgentId, "claude-code");
+  assert.ok(calls.includes("ensure_bridge_runtime"));
+});

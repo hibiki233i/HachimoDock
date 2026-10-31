@@ -17,7 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define PET_P4_RAW_SLOT_COUNT 2
+#define PET_P4_RAW_SLOT_COUNT PET_P4_APPEARANCE_SLOT_COUNT
 #define PET_P4_RAW_HEADER_BYTES 4096U
 #define PET_P4_RAW_HEADER_VERSION 1U
 #define PET_P4_RAW_HEADER_ENTRY_OFFSET 88U
@@ -43,6 +43,7 @@ typedef struct {
 
 typedef struct {
   bool prepared;
+  int slot;
   uint32_t cursor;
   unsigned int entry_count;
   pet_p4_raw_entry_t entries[PET_P4_RAW_MAX_FILES];
@@ -128,6 +129,7 @@ static const esp_partition_t *raw_partition_for_slot(int slot) {
   static const char *labels[PET_P4_RAW_SLOT_COUNT] = {
     "appearance0",
     "appearance1",
+    "appearance2",
   };
   if (slot < 0 || slot >= PET_P4_RAW_SLOT_COUNT) return NULL;
   if (!g_partitions[slot]) {
@@ -140,8 +142,9 @@ static const esp_partition_t *raw_partition_for_slot(int slot) {
   return g_partitions[slot];
 }
 
-static const esp_partition_t *raw_partition(void) {
-  return raw_partition_for_slot(PET_P4_RAW_APPEARANCE_SLOT);
+/* The partition the in-flight transfer was prepared for. */
+static const esp_partition_t *transfer_partition(void) {
+  return g_transfer.prepared ? raw_partition_for_slot(g_transfer.slot) : NULL;
 }
 
 static uint32_t align_up(uint32_t value, uint32_t alignment) {
@@ -212,6 +215,14 @@ bool pet_p4_raw_assets_slot_available(int slot) {
   return raw_partition_for_slot(slot) != NULL;
 }
 
+int pet_p4_raw_assets_available_slot_count(void) {
+  int count = 0;
+  for (int slot = 0; slot < PET_P4_RAW_SLOT_COUNT; slot += 1) {
+    if (raw_partition_for_slot(slot)) count += 1;
+  }
+  return count;
+}
+
 unsigned long long pet_p4_raw_assets_slot_capacity_bytes(int slot) {
   const esp_partition_t *partition = raw_partition_for_slot(slot);
   if (!partition || partition->size <= PET_P4_RAW_HEADER_BYTES) return 0;
@@ -237,11 +248,12 @@ bool pet_p4_raw_assets_supports_path(const char *logical_path) {
 }
 
 bool pet_p4_raw_assets_prepare(
+  int slot,
   unsigned long long total_bytes,
   char *error,
   size_t error_size
 ) {
-  const esp_partition_t *partition = raw_partition();
+  const esp_partition_t *partition = raw_partition_for_slot(slot);
   unsigned long long requested;
   uint32_t erase_bytes;
   if (!partition) {
@@ -258,20 +270,21 @@ bool pet_p4_raw_assets_prepare(
   erase_bytes = align_up((uint32_t) requested, PET_P4_RAW_ERASE_BYTES);
   if (erase_bytes > partition->size) erase_bytes = partition->size;
   pet_p4_raw_assets_reset_transfer();
-  invalidate_cache(PET_P4_RAW_APPEARANCE_SLOT);
+  invalidate_cache(slot);
   if (!erase_range_yielding(partition, 0, erase_bytes)) {
     set_error(error, error_size, "appearance partition erase failed");
     return false;
   }
   g_transfer.prepared = true;
+  g_transfer.slot = slot;
   g_transfer.cursor = PET_P4_RAW_HEADER_BYTES;
   return true;
 }
 
-bool pet_p4_raw_assets_invalidate(char *error, size_t error_size) {
-  const esp_partition_t *partition = raw_partition();
+bool pet_p4_raw_assets_invalidate(int slot, char *error, size_t error_size) {
+  const esp_partition_t *partition = raw_partition_for_slot(slot);
   pet_p4_raw_assets_reset_transfer();
-  invalidate_cache(PET_P4_RAW_APPEARANCE_SLOT);
+  invalidate_cache(slot);
   if (!partition) return true;
   if (!erase_range_yielding(partition, 0, PET_P4_RAW_ERASE_BYTES)) {
     set_error(error, error_size, "appearance partition header erase failed");
@@ -288,7 +301,7 @@ bool pet_p4_raw_assets_write_chunk(
   char *error,
   size_t error_size
 ) {
-  const esp_partition_t *partition = raw_partition();
+  const esp_partition_t *partition = transfer_partition();
   uint32_t chunk_index;
   unsigned long long chunk_checksum;
   bool starts_file;
@@ -412,8 +425,9 @@ bool pet_p4_raw_assets_commit(
   char *error,
   size_t error_size
 ) {
-  const esp_partition_t *partition = raw_partition();
+  const esp_partition_t *partition = transfer_partition();
   unsigned char *header;
+  int committed_slot;
   if (!partition || !g_transfer.prepared || g_transfer.file_active
       || g_transfer.entry_count == 0 || !pack_id_is_valid(pack_id)) {
     set_error(error, error_size, "raw appearance commit state is invalid");
@@ -445,8 +459,9 @@ bool pet_p4_raw_assets_commit(
     return false;
   }
   free(header);
+  committed_slot = g_transfer.slot;
   pet_p4_raw_assets_reset_transfer();
-  invalidate_cache(PET_P4_RAW_APPEARANCE_SLOT);
+  invalidate_cache(committed_slot);
   return true;
 }
 

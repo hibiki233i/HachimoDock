@@ -242,6 +242,7 @@ export default function BoardButtonPanel({
             <dt>退出组件</dt><dd>{help.back} 组件内的其他操作以「怎么玩」为准。</dd>
             <dt>实时对话</dt><dd>{help.chat} 等它说完再说。</dd>
             <dt>查看会话</dt><dd>{help.sessions}</dd>
+            {help.agentsBound && <><dt>切换 Agent</dt><dd>{help.agents}</dd></>}
           </dl>
           <p>使用语音功能时，请保持设备连接电脑，并让 Pet Manager 持续运行。</p>
         </details>

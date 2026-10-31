@@ -57,6 +57,8 @@ WiFi 通过配套板上的 ESP32-C6 提供：固件使用 `esp_wifi_remote 1.6.3
 
 `factory-config.json` 读取 `../pc/public/terrier-clips/` 与 `../pc/builtin-clawpkgs/`，把形象和组件放入出厂存储。默认构建的 factory-image 后处理脚本生成完整镜像及清单；不要将仅应用分区的 `.bin` 当作完整烧录包。
 
+**出厂默认桌宠 / Default pets.** 出厂镜像把默认桌宠各放进一个独立的形象槽（`appearance0`…`appearance2`，每槽 5 MiB），第一只为首次开机显示的桌宠；没有配置任何桌宠时，设备开机后会显示“连接电脑导入桌宠”的提示。提交到仓库的 `factory-config.json` 中 `appearances` 为空；你自己的桌宠写在被 git 忽略的 `factory-config.local.json`，每项为 `{ "id", "slot", "readyRoot" }`，`readyRoot` 指向含有 `p4/manifest.json` 与视频、音效的目录（例如 `local-defaults/<id>/`，同样被 git 忽略）。第三方素材不要提交。构建脚本会校验清单契约、H.264（Baseline、Level ≤ 3.0、640×480、每个访问单元一个 slice）、`packId` 与槽容量。更换分区表后必须整片重刷（`factory-flash -FactoryReset`），`storage` 与旧槽内容会被清空。
+
 在仓库根目录执行 / From the repository root:
 
 ```sh

@@ -14,7 +14,13 @@ import {
   DEFAULT_AGENT_ID,
   ENABLED_AGENTS_STORAGE_KEY,
   FIXED_AGENT_OPTIONS,
+  DEVICE_FOLLOW_AGENTS_STORAGE_KEY,
+  loadDeviceFollowAgents,
   loadEnabledAgents,
+  loadPetFollowMode,
+  saveDeviceFollowAgents,
+  savePetFollowMode,
+  sanitizeDeviceFollowAgents,
   normalizeDetectedAgents,
   pickFirstDetectedAgentId,
   sanitizeAgentAppearanceMap,
@@ -168,4 +174,69 @@ test("pickFirstDetectedAgentId falls back to first detected when followed agent 
   assert.equal(pickFirstDetectedAgentId(agents, "claude-code"), "codex");
   assert.equal(pickFirstDetectedAgentId(agents), "codex");
   assert.equal(pickFirstDetectedAgentId([]), "");
+});
+
+test("the device follow set is stored apart from the desktop channel and keeps fixed Agent order", () => {
+  const values = installStorage({ [ENABLED_AGENTS_STORAGE_KEY]: JSON.stringify(["claude-code"]) });
+  assert.deepEqual(loadDeviceFollowAgents(), ["claude-code"], "legacy single selection seeds the first run");
+
+  saveDeviceFollowAgents(new Set(["openclaw", "codex", "unknown"]));
+  assert.deepEqual(JSON.parse(values.get(DEVICE_FOLLOW_AGENTS_STORAGE_KEY)), ["codex", "openclaw"]);
+  assert.deepEqual(loadDeviceFollowAgents(), ["codex", "openclaw"]);
+  assert.deepEqual([...loadEnabledAgents()], ["claude-code"], "the desktop-pet channel is untouched");
+});
+
+test("loadDeviceFollowAgents returns null when nothing was ever chosen and survives corrupt data", () => {
+  installStorage();
+  assert.equal(loadDeviceFollowAgents(), null);
+  installStorage({ [DEVICE_FOLLOW_AGENTS_STORAGE_KEY]: "{not json" });
+  assert.equal(loadDeviceFollowAgents(), null);
+  assert.deepEqual(sanitizeDeviceFollowAgents("workbuddy"), ["workbuddy"]);
+});
+
+test("the pet follow mode defaults to follow and only accepts known values", () => {
+  installStorage();
+  assert.equal(loadPetFollowMode(), "follow");
+  savePetFollowMode("resident");
+  assert.equal(loadPetFollowMode(), "resident");
+  savePetFollowMode("bogus");
+  assert.equal(loadPetFollowMode(), "follow");
+});
+
+
+import * as followConfig from "./agent-appearance-config.js";
+
+test("device follow changes restart the monitors without changing the selected desktop channel", async () => {
+  assert.equal(typeof followConfig.createDeviceFollowSynchronizer, "function");
+  let profile = { desktopDeviceId: "desk-1", mqttUrl: "mqtt://localhost", enabledAgents: ["claude-code"], selectedAgentId: "claude-code" };
+  let restarts = 0;
+  const synchronize = followConfig.createDeviceFollowSynchronizer({ invoke: async (command, args) => {
+    if (command === "load_bridge_profile") return profile;
+    if (command === "save_bridge_profile") { profile = args.input; return profile; }
+    if (command === "ensure_bridge_runtime") { assert.equal(args.input.forceRestart, true); restarts += 1; return { running: true }; }
+    throw new Error(command);
+  } });
+  await synchronize(["codex"]);
+  assert.deepEqual(profile.enabledAgents, ["codex", "claude-code"]);
+  assert.equal(profile.selectedAgentId, "claude-code");
+  await synchronize([]);
+  assert.deepEqual(profile.enabledAgents, ["claude-code"]);
+  assert.equal(profile.selectedAgentId, "claude-code");
+  await synchronize([]);
+  assert.equal(restarts, 2, "an unchanged monitor set must not restart Bridge");
+});
+
+test("a failed Bridge restart is reported and retried even after the profile was saved", async () => {
+  assert.equal(typeof followConfig.createDeviceFollowSynchronizer, "function");
+  let profile = { desktopDeviceId: "desk-1", mqttUrl: "mqtt://localhost", enabledAgents: ["claude-code"], selectedAgentId: "claude-code" };
+  let restarts = 0;
+  const synchronize = followConfig.createDeviceFollowSynchronizer({ invoke: async (command, args) => {
+    if (command === "load_bridge_profile") return profile;
+    if (command === "save_bridge_profile") { profile = args.input; return profile; }
+    if (command === "ensure_bridge_runtime") return { running: ++restarts > 1, message: "not ready" };
+    throw new Error(command);
+  } });
+  await assert.rejects(synchronize(["codex"]), /not ready/);
+  await synchronize(["codex"]);
+  assert.equal(restarts, 2);
 });

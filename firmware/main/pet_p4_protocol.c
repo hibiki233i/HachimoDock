@@ -2,7 +2,7 @@
  * [Input] JSON-line control/state envelopes from USB-UART and native USB.
  * [Output] validated runtime updates, ACK/NACK responses, persisted input
  *          configuration snapshots, transfer routing, deterministic appearance
- *          pack discovery/reactivation across both flash slots, compatible
+ *          pack discovery/reactivation across available flash slots, compatible
  *          v3/v4 component capabilities with bounded sprite limits, restart-safe
  *          slot cleanup, idle-transfer recovery and legacy-pack migration, 60-second per-session
  *          terminal conversation visibility across active-queue refreshes,
@@ -54,7 +54,7 @@
 #define PET_P4_FS_PATH_MAX 64
 #define PET_P4_LOGICAL_PATH_MAX 128
 #define PET_P4_DECODED_CHUNK_LIMIT (64 * 1024)
-#define PET_P4_ASSET_SLOT_COUNT 2
+#define PET_P4_ASSET_SLOT_COUNT PET_P4_APPEARANCE_SLOT_COUNT
 #define PET_P4_PACK_ID_MAX 65
 #define PET_P4_RAW_ASSET_CHUNK_LIMIT (64 * 1024)
 #define PET_P4_ASSET_BEGIN_GC_BYTES (64 * 1024)
@@ -66,6 +66,8 @@
 static const char *TAG = "pet-p4-protocol";
 static int g_asset_active_slot = -1;
 static int g_asset_transfer_slot = -1;
+/* Slot named by asset/begin; -1 keeps the legacy single custom slot. */
+static int g_asset_requested_slot = -1;
 static char g_asset_transfer_id[PET_P4_DEVICE_ID_MAX];
 static unsigned long long g_asset_transfer_last_activity_ms;
 static FILE *g_asset_chunk_file;
@@ -478,7 +480,7 @@ static void read_active_slot_marker(void) {
   if (!file) return;
   ch = fgetc(file);
   fclose(file);
-  if (ch == '0' || ch == '1') {
+  if (ch >= '0' && ch <= '9' && slot_is_valid(ch - '0')) {
     g_asset_active_slot = ch - '0';
   }
 }
@@ -504,6 +506,13 @@ int pet_p4_asset_inactive_slot(void) {
   return PET_P4_RAW_APPEARANCE_SLOT;
 }
 
+bool pet_p4_asset_slot_is_transfer_target(int slot) {
+  if (!slot_is_valid(slot)) return false;
+  if (PET_P4_BUILTIN_SLOT_PROTECTED && slot == PET_P4_BUILTIN_APPEARANCE_SLOT) return false;
+  // Only the legacy custom slot may fall back to SPIFFS files; every other slot is raw-only.
+  return slot == PET_P4_RAW_APPEARANCE_SLOT || pet_p4_raw_assets_slot_available(slot);
+}
+
 static bool clear_slot_files(int slot) {
   char prefix[8];
   snprintf(prefix, sizeof(prefix), "s%d_", slot);
@@ -521,9 +530,9 @@ static bool clear_slot_files(int slot) {
     }
     closedir(dir);
     if (!found) {
-      if (slot == PET_P4_RAW_APPEARANCE_SLOT && pet_p4_raw_assets_available()) {
+      if (pet_p4_raw_assets_slot_available(slot)) {
         char error[96];
-        if (!pet_p4_raw_assets_invalidate(error, sizeof(error))) {
+        if (!pet_p4_raw_assets_invalidate(slot, error, sizeof(error))) {
           ESP_LOGE(TAG, "failed to invalidate raw appearance slot: %s", error);
           return false;
         }
@@ -544,8 +553,13 @@ static bool ensure_asset_transfer_slot(const char *transfer_id) {
   if (g_asset_transfer_slot < 0 || strcmp(g_asset_transfer_id, id) != 0) {
     reset_asset_chunk_tracking();
     pet_p4_asset_clean_legacy_files();
-    g_asset_transfer_slot = PET_P4_RAW_APPEARANCE_SLOT;
-    if (!slot_is_valid(g_asset_transfer_slot)) return false;
+    g_asset_transfer_slot = g_asset_requested_slot >= 0
+      ? g_asset_requested_slot
+      : PET_P4_RAW_APPEARANCE_SLOT;
+    if (!pet_p4_asset_slot_is_transfer_target(g_asset_transfer_slot)) {
+      g_asset_transfer_slot = -1;
+      return false;
+    }
     if (!clear_slot_files(g_asset_transfer_slot)) return false;
     copy_text(g_asset_transfer_id, sizeof(g_asset_transfer_id), id);
   }
@@ -555,6 +569,7 @@ static bool ensure_asset_transfer_slot(const char *transfer_id) {
 static void reset_asset_transfer_slot(void) {
   pet_p4_raw_assets_reset_transfer();
   g_asset_transfer_slot = -1;
+  g_asset_requested_slot = -1;
   g_asset_transfer_id[0] = '\0';
 }
 
@@ -787,7 +802,7 @@ static void send_asset_slot_query_ack(
   int active_slot = pet_p4_asset_active_slot();
   cJSON_AddStringToObject(payload, "transferId", transfer_id ? transfer_id : "");
   cJSON_AddStringToObject(payload, "phase", "slot-query");
-  cJSON_AddBoolToObject(payload, "builtinProtected", true);
+  cJSON_AddBoolToObject(payload, "builtinProtected", PET_P4_BUILTIN_SLOT_PROTECTED != 0);
   cJSON_AddBoolToObject(payload, "systemCues", true);
   cJSON_AddBoolToObject(payload, "ok", true);
   if (slot_is_valid(active_slot)) cJSON_AddNumberToObject(payload, "activeSlot", active_slot);
@@ -904,8 +919,7 @@ static bool write_asset_chunk_bytes(
     copy_text(g_asset_chunk_error, sizeof(g_asset_chunk_error), "slot prepare failed");
     return false;
   }
-  if (g_asset_transfer_slot == PET_P4_RAW_APPEARANCE_SLOT
-      && pet_p4_raw_assets_available()
+  if (pet_p4_raw_assets_slot_available(g_asset_transfer_slot)
       && pet_p4_raw_assets_supports_path(path)) {
     return pet_p4_raw_assets_write_chunk(
       path,
@@ -1242,8 +1256,7 @@ static void handle_asset_file(
     send_asset_ack(send_line, ctx, transfer_id, "file", path, false, "slot prepare failed");
     return;
   }
-  if (g_asset_transfer_slot == PET_P4_RAW_APPEARANCE_SLOT
-      && pet_p4_raw_assets_available()
+  if (pet_p4_raw_assets_slot_available(g_asset_transfer_slot)
       && pet_p4_raw_assets_supports_path(path)) {
     bool ok = pet_p4_raw_assets_finish_file(
       path,
@@ -1327,16 +1340,19 @@ static void handle_asset_topic(
     reset_raw_asset_chunk();
     reset_asset_chunk_tracking();
     reset_asset_transfer_slot();
+    {
+      const cJSON *slot_item = cJSON_GetObjectItemCaseSensitive(payload, "slot");
+      g_asset_requested_slot = cJSON_IsNumber(slot_item) ? slot_item->valueint : -1;
+    }
     if (!ensure_asset_transfer_slot(transfer_id)) {
       state->asset_transfer_active = false;
       g_asset_transfer_last_activity_ms = 0;
       send_asset_ack(send_line, ctx, transfer_id, "begin", NULL, false, "slot prepare failed");
       return;
     }
-    if (g_asset_transfer_slot == PET_P4_RAW_APPEARANCE_SLOT
-        && pet_p4_raw_assets_available()) {
+    if (pet_p4_raw_assets_slot_available(g_asset_transfer_slot)) {
       char error[128];
-      if (!pet_p4_raw_assets_prepare(raw_bytes, error, sizeof(error))) {
+      if (!pet_p4_raw_assets_prepare(g_asset_transfer_slot, raw_bytes, error, sizeof(error))) {
         (void) clear_slot_files(g_asset_transfer_slot);
         reset_asset_transfer_slot();
         state->asset_transfer_active = false;
@@ -1389,8 +1405,7 @@ static void handle_asset_topic(
     reset_raw_asset_chunk();
     reset_asset_chunk_tracking();
     copy_text(commit_error, sizeof(commit_error), "slot commit failed");
-    if (commit_ok && g_asset_transfer_slot == PET_P4_RAW_APPEARANCE_SLOT
-        && pet_p4_raw_assets_available()) {
+    if (commit_ok && pet_p4_raw_assets_slot_available(g_asset_transfer_slot)) {
       char pack_id[PET_P4_PACK_ID_MAX];
       commit_ok = read_slot_pack_id(g_asset_transfer_slot, pack_id, sizeof(pack_id))
                && pet_p4_raw_assets_commit(pack_id, commit_error, sizeof(commit_error));
@@ -1580,6 +1595,13 @@ void pet_p4_state_set_native_usb_mounted(
   state->native_usb_mounted = mounted;
   if (mounted) state->host_last_seen_ms = now_ms;
   state->last_update_ms += 1;
+}
+
+bool pet_p4_state_agent_switch_available(
+  const pet_p4_runtime_state_t *state,
+  unsigned long long now_ms
+) {
+  return state && state->agent_focus_count >= 2 && pet_p4_state_host_connected(state, now_ms);
 }
 
 bool pet_p4_state_host_connected(
@@ -1832,7 +1854,11 @@ void pet_p4_send_hello(const pet_p4_runtime_state_t *state, pet_p4_send_line_fn 
   cJSON_AddBoolToObject(capabilities, "usbOnly", true);
   cJSON_AddBoolToObject(capabilities, "nativeUsb", true);
   cJSON_AddBoolToObject(capabilities, "bulk", true);
-  cJSON_AddNumberToObject(capabilities, "maxAppearanceSlots", 2);
+  cJSON_AddNumberToObject(
+    capabilities,
+    "maxAppearanceSlots",
+    pet_p4_raw_assets_available_slot_count()
+  );
   cJSON_AddBoolToObject(capabilities, "appearanceSlotReuse", true);
   cJSON_AddBoolToObject(
     capabilities,
@@ -1986,11 +2012,21 @@ void pet_p4_send_hello(const pet_p4_runtime_state_t *state, pet_p4_send_line_fn 
   cJSON_AddItemToArray(appearance_formats, cJSON_CreateString("p4-h264-v1"));
   cJSON_AddItemToArray(appearance_formats, cJSON_CreateString("p4-pcm-wav-v1"));
   cJSON_AddItemToObject(appearance, "formats", appearance_formats);
-  cJSON_AddNumberToObject(appearance, "maxSlots", 2);
+  cJSON_AddNumberToObject(appearance, "maxSlots", pet_p4_raw_assets_available_slot_count());
+  {
+    cJSON *slot_capacity = cJSON_CreateArray();
+    for (int slot = 0; slot < PET_P4_APPEARANCE_SLOT_COUNT; slot += 1) {
+      cJSON_AddItemToArray(
+        slot_capacity,
+        cJSON_CreateNumber((double) pet_p4_raw_assets_slot_capacity_bytes(slot))
+      );
+    }
+    cJSON_AddItemToObject(appearance, "slotCapacityBytes", slot_capacity);
+  }
   cJSON_AddBoolToObject(appearance, "slotReuse", true);
   cJSON_AddNumberToObject(appearance, "builtinSlot", 0);
   cJSON_AddNumberToObject(appearance, "customSlot", PET_P4_RAW_APPEARANCE_SLOT);
-  cJSON_AddBoolToObject(appearance, "builtinProtected", true);
+  cJSON_AddBoolToObject(appearance, "builtinProtected", PET_P4_BUILTIN_SLOT_PROTECTED != 0);
   cJSON_AddBoolToObject(appearance, "systemCues", true);
   cJSON_AddBoolToObject(
     appearance,
@@ -2146,6 +2182,25 @@ static void handle_stats_update(pet_p4_runtime_state_t *state, const cJSON *payl
   }
   pet_p4_miniapp_sync_stats(&state->stats);
   state->last_update_ms = json_u64(payload, "tsMs", state->last_update_ms);
+}
+
+/* `agent/focus`: {label, index, count, hint}. The desktop announces which Agent the board shows and how
+ * many are followed; `hint:true` asks for the short on-screen label after a switch. */
+static void handle_agent_focus(pet_p4_runtime_state_t *state, const cJSON *payload) {
+  const cJSON *hint = cJSON_GetObjectItemCaseSensitive(payload, "hint");
+  unsigned long long count = json_u64(payload, "count", 0);
+  unsigned long long index = json_u64(payload, "index", 0);
+  unsigned long long now_ms = (unsigned long long) (esp_timer_get_time() / 1000ULL);
+  if (count > 8) count = 8;
+  if (index > count) index = 0;
+  state->agent_focus_count = (unsigned int) count;
+  state->agent_focus_index = (unsigned int) index;
+  copy_text(state->agent_focus_label, sizeof(state->agent_focus_label), json_string(payload, "label"));
+  state->agent_focus_seen_ms = now_ms;
+  state->agent_hint_until_ms = cJSON_IsTrue(hint) && state->agent_focus_label[0]
+    ? now_ms + PET_P4_AGENT_HINT_MS
+    : 0;
+  state->last_update_ms = now_ms;
 }
 
 static void handle_session_current(pet_p4_runtime_state_t *state, const cJSON *payload) {
@@ -2472,6 +2527,9 @@ bool pet_p4_handle_line(
     send_protocol_ack_if_requested(send_line, ctx, topic, payload);
   } else if (strcmp(topic, "session/current") == 0) {
     handle_session_current(state, payload);
+    send_protocol_ack_if_requested(send_line, ctx, topic, payload);
+  } else if (strcmp(topic, "agent/focus") == 0) {
+    handle_agent_focus(state, payload);
     send_protocol_ack_if_requested(send_line, ctx, topic, payload);
   } else if (strcmp(topic, "control/screen-page") == 0) {
     const char *page = json_string(payload, "page");

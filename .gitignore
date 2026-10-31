@@ -41,3 +41,7 @@ firmware/sdkconfig.*
 !firmware/sdkconfig.v3.defaults
 pc/public/terrier-clips/p4-ready/*
 !pc/public/terrier-clips/p4-ready/v9-640x480-15fps-225f-h264-crf27/
+
+# Private default pets baked into the local factory image (third-party artwork).
+firmware/factory-config.local.json
+firmware/local-defaults/

@@ -283,8 +283,10 @@ test("ESP32-P4 exposes button presses plus all four joystick directions", () => 
   assert.match(dashboard, /p4_sw3_long:\s*"disabled"/);
   assert.match(dashboard, /p4_encoder_press:\s*"page_enter"/);
   assert.match(dashboard, /p4_encoder_long:\s*"disabled"/);
-  assert.match(dashboard, /p4_encoder_cw:\s*"session_next"/);
-  assert.match(dashboard, /p4_encoder_ccw:\s*"session_previous"/);
+  assert.match(dashboard.match(/export const DEFAULT_BUTTON_ACTIONS = \{([\s\S]*?)\};/)[1], /p4_encoder_cw:\s*"agent_next"/);
+  assert.match(dashboard.match(/export const DEFAULT_BUTTON_ACTIONS = \{([\s\S]*?)\};/)[1], /p4_encoder_ccw:\s*"agent_previous"/);
+  // The previous (v9) shipped defaults are kept so a stored config that still equals them migrates.
+  assert.match(dashboard.match(/const P4_V9_DEFAULT_BUTTON_ACTIONS = \{([\s\S]*?)\};/)[1], /p4_encoder_cw:\s*"session_next"/);
   assert.match(dashboard, /p4_joystick_up:\s*"session_previous"/);
   assert.match(dashboard, /p4_joystick_down:\s*"session_next"/);
   assert.match(dashboard, /event:\s*"button\.sw1\.short_press"/);

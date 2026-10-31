@@ -1,14 +1,16 @@
 /**
  * [Input] Detected local coding agents, persisted appearance records, and localStorage bridge assignment state.
- * [Output] ChatGPT（Codex）-first fixed Agent ordering, explicit first-run selection, shared per-channel appearance mapping, and single active desktop-channel helpers used by setup, dashboard, and gallery.
+ * [Output] ChatGPT（Codex）-first fixed Agent ordering, explicit first-run selection, shared per-channel appearance mapping, single active desktop-channel helpers, and the separately stored multi-Agent device follow set with the pet follow mode and serialized Bridge monitor synchronization, used by setup, dashboard, and gallery.
  * [Pos] lib node in pc/src/lib
  * [Sync] If this file changes, update `pc/src/.folder.md` and consumers that persist agent assignments.
  */
 
 import { BUILTIN_TERRIER_APPEARANCE_ID } from "./builtin-appearances.js";
+import { PET_FOLLOW_MODE_STORAGE_KEY, normalizePetFollowMode } from "./agent-focus.js";
 
 export const AGENT_APPEARANCE_MAP_STORAGE_KEY = "pet-manager.agent-appearance-map";
 export const ENABLED_AGENTS_STORAGE_KEY = "pet-manager.enabled-agents";
+export const DEVICE_FOLLOW_AGENTS_STORAGE_KEY = "pet-manager.device-follow-agents";
 export const DEFAULT_AGENT_ID = "codex";
 
 export const FIXED_AGENT_OPTIONS = [
@@ -49,6 +51,47 @@ export function loadEnabledAgents() {
 
 export function saveEnabledAgents(set) {
   localStorage.setItem(ENABLED_AGENTS_STORAGE_KEY, JSON.stringify([...set]));
+}
+
+/** Keep known Agent ids only, in fixed option order, so joystick cycling and tie-breaks stay deterministic. */
+export function sanitizeDeviceFollowAgents(value) {
+  const requested = new Set(
+    typeof value === "string" ? [value] : Array.isArray(value) ? value : [...(value || [])],
+  );
+  return FIXED_AGENT_OPTIONS.map((agent) => agent.id).filter((id) => requested.has(id));
+}
+
+/**
+ * Agents whose Sessions feed the device. Stored apart from the single desktop-pet
+ * channel; an install that only has the legacy single selection starts from it.
+ * Returns `null` when nothing was ever chosen so callers can apply their own default.
+ */
+export function loadDeviceFollowAgents() {
+  try {
+    const raw = localStorage.getItem(DEVICE_FOLLOW_AGENTS_STORAGE_KEY);
+    if (raw) return sanitizeDeviceFollowAgents(JSON.parse(raw));
+  } catch {}
+  const legacy = loadEnabledAgents();
+  return legacy ? sanitizeDeviceFollowAgents(legacy) : null;
+}
+
+export function saveDeviceFollowAgents(agentIds) {
+  localStorage.setItem(
+    DEVICE_FOLLOW_AGENTS_STORAGE_KEY,
+    JSON.stringify(sanitizeDeviceFollowAgents(agentIds)),
+  );
+}
+
+export function loadPetFollowMode() {
+  try {
+    return normalizePetFollowMode(localStorage.getItem(PET_FOLLOW_MODE_STORAGE_KEY));
+  } catch {
+    return normalizePetFollowMode(null);
+  }
+}
+
+export function savePetFollowMode(mode) {
+  localStorage.setItem(PET_FOLLOW_MODE_STORAGE_KEY, normalizePetFollowMode(mode));
 }
 
 export function normalizeDetectedAgents(agents = []) {
@@ -173,4 +216,31 @@ export function assignAppearanceToAgent(map, agentId, appearanceId) {
   }
   next[agentId] = appearanceId;
   return next;
+}
+
+/** Keep the desktop selection while enabling monitors for all device-followed Agents. */
+export function createDeviceFollowSynchronizer({ invoke }) {
+  let pending = Promise.resolve();
+  let restartPending = false;
+  return function synchronizeDeviceFollow(agentIds) {
+    const followed = sanitizeDeviceFollowAgents(agentIds);
+    const request = pending.catch(() => {}).then(async () => {
+      const profile = await invoke("load_bridge_profile");
+      const selectedAgentId = profile.selectedAgentId || profile.enabledAgents?.[0] || "";
+      if (!selectedAgentId) return;
+      const enabledAgents = sanitizeDeviceFollowAgents([selectedAgentId, ...followed]);
+      const current = profile.enabledAgents || [];
+      if (current.length !== enabledAgents.length || current.some((id) => !enabledAgents.includes(id))) {
+        await invoke("save_bridge_profile", { input: { ...profile, enabledAgents, selectedAgentId } });
+        restartPending = true;
+      }
+      if (restartPending) {
+        const runtime = await invoke("ensure_bridge_runtime", { input: { forceRestart: true } });
+        if (!runtime?.running) throw new Error(runtime?.message || "Bridge 尚未就绪，无法启用同时跟随");
+        restartPending = false;
+      }
+    });
+    pending = request;
+    return request;
+  };
 }

@@ -319,3 +319,14 @@ pet_p4_joystick_direction_t pet_p4_joystick_decoder_update(
   );
   return decoder->direction;
 }
+
+pet_p4_agent_key_route_t pet_p4_agent_key_route(
+  const char *page,
+  bool agent_action,
+  bool switch_available
+) {
+  if (!page) return PET_P4_AGENT_KEY_NONE;
+  if (strcmp(page, "components") == 0) return PET_P4_AGENT_KEY_CATALOG;
+  if (strcmp(page, "main") != 0) return PET_P4_AGENT_KEY_NONE;
+  return agent_action && switch_available ? PET_P4_AGENT_KEY_AGENT : PET_P4_AGENT_KEY_SESSION;
+}

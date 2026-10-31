@@ -121,6 +121,22 @@ pet_p4_joystick_direction_t pet_p4_joystick_decoder_update(
   uint32_t elapsed_ms
 );
 
+typedef enum {
+  PET_P4_AGENT_KEY_NONE = 0, /* not applicable on this page */
+  PET_P4_AGENT_KEY_CATALOG,  /* component center: previous/next component */
+  PET_P4_AGENT_KEY_AGENT,    /* main page, two or more followed Agents: the desktop switches Agent */
+  PET_P4_AGENT_KEY_SESSION   /* main page otherwise: previous/next Session */
+} pet_p4_agent_key_route_t;
+
+/* Where a previous/next key goes. `agent_action` is false for session_* actions, which never switch
+ * the Agent. With a single followed Agent (or no desktop) the agent_* actions keep their old Session
+ * meaning, so such setups see no behaviour change. */
+pet_p4_agent_key_route_t pet_p4_agent_key_route(
+  const char *page,
+  bool agent_action,
+  bool switch_available
+);
+
 #ifdef __cplusplus
 }
 #endif
