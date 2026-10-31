@@ -25,10 +25,15 @@ import {
   assignAppearanceToAgent,
   assignedAgentIds,
   loadAgentAppearanceMap,
+  loadDeviceFollowAgents,
   loadEnabledAgents,
+  loadPetFollowMode,
   normalizeDetectedAgents,
+  sanitizeDeviceFollowAgents,
   saveAgentAppearanceMap,
+  saveDeviceFollowAgents,
   saveEnabledAgents,
+  savePetFollowMode,
 } from "../lib/agent-appearance-config.js";
 import { applyDesktopPetAssignment } from "../lib/desktop-pet-assignment.js";
 import { getAppearance, listAppearances } from "../lib/appearance-store.js";
@@ -82,6 +87,23 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
   const [usb, setUsb] = useState({ connected: false, portName: "", boardDeviceId: "" });
   const [appearances, setAppearances] = useState([]);
   const [agentAppearanceMap, setAgentAppearanceMap] = useState({});
+  // Agents the device follows besides the desktop channel, and whether the pet changes with the focus.
+  const [deviceFollowAgents, setDeviceFollowAgentsState] = useState(() => loadDeviceFollowAgents() || []);
+  const [petFollowMode, setPetFollowModeState] = useState(loadPetFollowMode);
+  const setDeviceFollowAgent = useCallback((agentId, followed) => {
+    setDeviceFollowAgentsState((current) => {
+      const next = sanitizeDeviceFollowAgents(
+        followed ? [...current, agentId] : current.filter((id) => id !== agentId),
+      );
+      try { saveDeviceFollowAgents(next); } catch { /* storage unavailable: keep it for this session */ }
+      return next;
+    });
+  }, []);
+  const setPetFollowMode = useCallback((mode) => {
+    const next = mode === "resident" ? "resident" : "follow";
+    try { savePetFollowMode(next); } catch { /* storage unavailable */ }
+    setPetFollowModeState(next);
+  }, []);
   const [enabledAgents, setEnabledAgents] = useState(
     () => new Set([DEFAULT_AGENT_ID]),
   );
@@ -517,6 +539,10 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
       appearances,
       agentAppearanceMap,
       enabledAgents,
+      deviceFollowAgents,
+      setDeviceFollowAgent,
+      petFollowMode,
+      setPetFollowMode,
       selectedAgentId: bridgeSelectedAgentId,
       agentOptions,
       agentScan,
@@ -547,6 +573,10 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
       appearances,
       agentAppearanceMap,
       enabledAgents,
+      deviceFollowAgents,
+      setDeviceFollowAgent,
+      petFollowMode,
+      setPetFollowMode,
       bridgeSelectedAgentId,
       agentOptions,
       agentScan,

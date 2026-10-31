@@ -81,7 +81,8 @@ mod widget_transaction;
 
 use appearance_transaction::{
     asset_checksum_hex, build_asset_file_commit_payload, compute_p4_pack_id,
-    digest_appearance_assets, p4_pack_id_from_assets, p4_raw_transfer_fallback_slot, p4_builtin_slot,
+    choose_p4_target_slot, digest_appearance_assets, p4_pack_id_from_assets, p4_transfer_fallback_slot,
+    p4_builtin_slot, parse_p4_slot_capacities, P4SlotAssignments, P4_RAW_APPEARANCE_SLOT as P4_LEGACY_CUSTOM_SLOT,
     parse_missing_asset_ack_phase, parse_p4_appearance_slot_state,
     plan_appearance_sync_from_digests, should_retry_appearance_with_legacy_full_sync,
     AppearanceAssetAckPhase, AppearanceAssetDigest, AppearanceAssetEntry, AppearanceFullSyncMode,
@@ -222,7 +223,20 @@ const P4_READY_DIR_NAME: &str = "p4-ready";
 const P4_READY_PROFILE_VERSION: u32 = 10;
 const P4_APPEARANCE_AUDIO_MAX_BYTES: usize = 1024 * 1024;
 const P4_APPEARANCE_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
-const P4_APPEARANCE_SLOT_MAX_BYTES: u64 = 10_481_664;
+/// One appearance slot is 5 MiB; its first 4 KiB is the commit header.
+const P4_APPEARANCE_SLOT_MAX_BYTES: u64 = 5 * 1024 * 1024 - 4096;
+/// Temporary: the bundled factory pack predates 5 MiB slots. Remove this together with the factory pack.
+const P4_FACTORY_PACK_MAX_BYTES: u64 = 10_481_664;
+const P4_FACTORY_PROFILE_DIR: &str = "v9-640x480-15fps-225f-h264-crf27";
+/// The high tier chases this PSNR per action instead of a fixed bitrate; its fixed target stays the ceiling.
+/// Measured on community pixel-art pets: 900 kbps already reaches 41-42 dB, and every doubling adds ~3.3-3.9 dB.
+const P4_HIGH_QUALITY_TARGET_PSNR_DB: f64 = 44.0;
+const P4_PSNR_PROBE_RATE_KBPS: u32 = 900;
+/// Slightly under the measured gain so the estimate errs towards a higher rate.
+const P4_PSNR_DB_PER_RATE_DOUBLING: f64 = 3.0;
+const P4_ADAPTIVE_RATE_FLOOR_KBPS: u32 = 400;
+const P4_ADAPTIVE_RATE_STEP_KBPS: u32 = 50;
+const P4_PSNR_PROBE_CACHE_FILE: &str = "psnr-probes.json";
 // Keep the logical raw chunk bounded so each checksum/ACK retry stays cheap.
 // The physical CH343 write must still be paced below because this link has no
 // RTS/CTS and silently drops bytes when macOS queues one large write.
@@ -1016,7 +1030,7 @@ fn probe_serial_port(
 
 pub fn sync_appearance_p4_native<F>(
     appearance_dir: &std::path::Path,
-    _app_data_dir: &std::path::Path,
+    app_data_dir: &std::path::Path,
     expected_board_device_id: &str,
     use_device_builtin: bool,
     cancel_requested: &AtomicBool,
@@ -1034,7 +1048,7 @@ where
         transport.send_json_value(&serde_json::json!({"topic":"asset/slot-query","payload":{"transferId":id}}))?;
         let ack = transport.wait_asset_ack_timeout(&id,"slot-query",None,cancel_requested,ASSET_STAT_TIMEOUT)?;
         if ack["builtinProtected"] != true {
-            return Err("设备尚未声明受保护的内置形象，请先升级固件；未自动重传。".into());
+            return Err("设备没有受保护的内置形象（所有桌宠槽都可替换），原生 USB 模式无法写入完整形象；请切回 USB 串口模式后重新同步该形象。".into());
         }
         let state = parse_p4_appearance_slot_state(&ack)?;
         let slot = p4_builtin_slot(&state)?;
@@ -1094,6 +1108,7 @@ where
                         "[usb-p4-native-ota] skip transfer: active slot already has pack_id={}",
                         pack_id
                     );
+                    record_p4_slot_assignment(app_data_dir, expected_board_device_id, appearance_dir, cached.slot);
                     on_progress(0, total_files, 0, total_bytes);
                     return Ok((0, 0, false));
                 }
@@ -1116,6 +1131,7 @@ where
                     "[usb-p4-native-ota] reactivated cached slot={} pack_id={}",
                     cached.slot, pack_id
                 );
+                record_p4_slot_assignment(app_data_dir, expected_board_device_id, appearance_dir, cached.slot);
                 on_progress(0, total_files, 0, total_bytes);
                 return Ok((0, 0, true));
             }
@@ -1254,6 +1270,52 @@ where
         transport.best_effort_asset_abort(&transfer_id);
     }
     transfer_result
+}
+
+fn build_asset_begin_payload(
+    transfer_id: &str,
+    total_bytes: u64,
+    raw_bytes: Option<u64>,
+    slot: Option<u32>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "transferId": transfer_id,
+        "totalBytes": total_bytes,
+    });
+    if let Some(raw_bytes) = raw_bytes {
+        payload["rawBytes"] = serde_json::Value::from(raw_bytes);
+    }
+    if let Some(slot) = slot {
+        payload["slot"] = serde_json::Value::from(slot);
+    }
+    payload
+}
+
+/// Outcome of asking the board to show an appearance without transferring anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P4ResidentActivation {
+    /// The pack was already the one on screen.
+    AlreadyActive,
+    /// The pack sat in another slot and was switched to.
+    Activated,
+    /// The pack is not on the board; a USB sync is needed first.
+    NotResident,
+}
+
+/// Remember that `slot` holds this appearance. Best effort: a failed write only costs slot reuse.
+fn record_p4_slot_assignment(app_data_dir: &Path, board_device_id: &str, appearance_dir: &Path, slot: u32) {
+    let Some(appearance_id) = appearance_dir.file_name().map(|name| name.to_string_lossy().to_string()) else {
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut assignments = P4SlotAssignments::load(app_data_dir);
+    assignments.record(board_device_id, slot, &appearance_id, now_ms);
+    if let Err(error) = assignments.save(app_data_dir) {
+        eprintln!("[usb-p4-ota] could not save slot assignments: {error}");
+    }
 }
 
 fn ensure_p4_native_full_pack_supported(assets: &[AppearanceAssetEntry]) -> Result<(), String> {
@@ -3233,23 +3295,19 @@ impl UsbSerialManager {
     /// Send asset_begin with ack - the unchecked `send_asset_begin` was
     /// removed 2026-06-01; the checked variant is the sole entry point.
     fn send_asset_begin_checked(&self, transfer_id: &str, total_bytes: u64) -> Result<(), String> {
-        self.send_asset_begin_checked_with_raw_bytes(transfer_id, total_bytes, None)
+        self.send_asset_begin_checked_with_raw_bytes(transfer_id, total_bytes, None, None)
     }
 
+    /// `slot` names the target appearance slot; firmware without multiple slots must not receive it.
     fn send_asset_begin_checked_with_raw_bytes(
         &self,
         transfer_id: &str,
         total_bytes: u64,
         raw_bytes: Option<u64>,
+        slot: Option<u32>,
     ) -> Result<(), String> {
         self.ensure_appearance_sync_not_cancelled(None)?;
-        let mut payload = serde_json::json!({
-            "transferId": transfer_id,
-            "totalBytes": total_bytes,
-        });
-        if let Some(raw_bytes) = raw_bytes {
-            payload["rawBytes"] = serde_json::Value::from(raw_bytes);
-        }
+        let payload = build_asset_begin_payload(transfer_id, total_bytes, raw_bytes, slot);
         self.send_asset_command_and_wait_timeout(
             "asset/begin",
             &payload,
@@ -3848,13 +3906,21 @@ impl UsbSerialManager {
         Ok(())
     }
 
-    fn prepare_p4_raw_transfer_slot(&self, transfer_id: &str) -> Result<bool, String> {
+    /// Choose the slot a pack is written to and keep the board displaying something else meanwhile.
+    fn prepare_p4_raw_transfer_slot(
+        &self,
+        transfer_id: &str,
+        raw_bytes: u64,
+        capacities: Option<&[u64]>,
+        preferred: Option<u32>,
+        synced_at: &HashMap<u32, u64>,
+    ) -> Result<u32, String> {
         let state = self.query_p4_appearance_slots(transfer_id)?;
-        let Some(fallback) = p4_raw_transfer_fallback_slot(&state) else {
-            return Ok(false);
-        };
-        self.activate_p4_appearance_slot(transfer_id, fallback.slot, &fallback.pack_id)?;
-        Ok(true)
+        let target = choose_p4_target_slot(&state, capacities, raw_bytes, preferred, synced_at)?;
+        if let Some(fallback) = p4_transfer_fallback_slot(&state, target) {
+            self.activate_p4_appearance_slot(transfer_id, fallback.slot, &fallback.pack_id)?;
+        }
+        Ok(target)
     }
 
     fn try_activate_cached_p4_pack(
@@ -3867,10 +3933,44 @@ impl UsbSerialManager {
             return Ok(P4CachedPackActivation::NotFound);
         };
         if state.active_slot == Some(cached.slot) {
-            return Ok(P4CachedPackActivation::AlreadyActive);
+            return Ok(P4CachedPackActivation::AlreadyActive(cached.slot));
         }
         self.activate_p4_appearance_slot(transfer_id, cached.slot, pack_id)?;
-        Ok(P4CachedPackActivation::Activated)
+        Ok(P4CachedPackActivation::Activated(cached.slot))
+    }
+
+    /// Show an appearance that already sits in one of the board's slots. It moves no asset bytes, so
+    /// it also works over Wi-Fi; a pack that is not resident is reported rather than transferred.
+    pub fn activate_resident_p4_appearance(
+        &self,
+        appearance_dir: &std::path::Path,
+        app_data_dir: &std::path::Path,
+        expected_board_device_id: &str,
+    ) -> Result<P4ResidentActivation, String> {
+        let _asset_transfer_guard = self
+            .asset_transfer_guard
+            .try_lock()
+            .map_err(|_| "设备正在同步形象，稍后再切换桌宠".to_string())?;
+        self.connected_board_status(expected_board_device_id)?;
+        // A pack that was never prepared cannot be on the board.
+        let Ok(assets) = load_prepared_p4_appearance_pack(appearance_dir) else {
+            return Ok(P4ResidentActivation::NotResident);
+        };
+        let pack_id = p4_pack_id_from_assets(&assets)?;
+        let transfer_id = format!(
+            "p4-resident-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        let outcome = match self.try_activate_cached_p4_pack(&transfer_id, &pack_id)? {
+            P4CachedPackActivation::NotFound => return Ok(P4ResidentActivation::NotResident),
+            P4CachedPackActivation::AlreadyActive(slot) => (slot, P4ResidentActivation::AlreadyActive),
+            P4CachedPackActivation::Activated(slot) => (slot, P4ResidentActivation::Activated),
+        };
+        record_p4_slot_assignment(app_data_dir, expected_board_device_id, appearance_dir, outcome.0);
+        Ok(outcome.1)
     }
 
     fn send_asset_patch_commit_checked(
@@ -4765,7 +4865,6 @@ impl UsbSerialManager {
             on_progress(0,0,0,0);
             return Ok((0,0,true));
         }
-        let _ = app_data_dir;
         let assets = load_prepared_p4_appearance_pack(appearance_dir)?;
         self.ensure_appearance_sync_not_cancelled(None)?;
 
@@ -4798,19 +4897,21 @@ impl UsbSerialManager {
                     .as_millis()
             );
             match self.try_activate_cached_p4_pack(&cache_transfer_id, &pack_id) {
-                Ok(P4CachedPackActivation::Activated) => {
+                Ok(P4CachedPackActivation::Activated(slot)) => {
                     eprintln!(
-                        "[usb-p4-ota] reactivated cached appearance pack_id={}",
-                        pack_id
+                        "[usb-p4-ota] reactivated cached appearance pack_id={} slot={}",
+                        pack_id, slot
                     );
+                    record_p4_slot_assignment(app_data_dir, expected_board_device_id, appearance_dir, slot);
                     on_progress(0, total_files, 0, total_bytes);
                     return Ok((0, 0, true));
                 }
-                Ok(P4CachedPackActivation::AlreadyActive) => {
+                Ok(P4CachedPackActivation::AlreadyActive(slot)) => {
                     eprintln!(
                         "[usb-p4-ota] skip transfer: active slot already has pack_id={}",
                         pack_id
                     );
+                    record_p4_slot_assignment(app_data_dir, expected_board_device_id, appearance_dir, slot);
                     on_progress(0, total_files, 0, total_bytes);
                     return Ok((0, 0, false));
                 }
@@ -4845,7 +4946,21 @@ impl UsbSerialManager {
 
         let use_raw_chunks = self.supports_p4_raw_asset_chunks();
         let use_raw_slot = use_raw_chunks && self.supports_p4_raw_appearance_slot();
-        if use_raw_slot {
+        // Firmware with several slots reports each slot's capacity and accepts a target slot.
+        let slot_capacities = if use_raw_slot {
+            parse_p4_slot_capacities(&self.status().capabilities)
+        } else {
+            None
+        };
+        let appearance_id = appearance_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let assignments = P4SlotAssignments::load(app_data_dir);
+        let preferred_slot = assignments.preferred_slot(expected_board_device_id, &appearance_id);
+        let synced_at = assignments.synced_at(expected_board_device_id);
+        let target_slot = std::cell::Cell::new(P4_LEGACY_CUSTOM_SLOT);
+        if use_raw_slot && slot_capacities.is_none() {
             let capabilities = self.status().capabilities;
             let raw_capacity = capabilities
                 .get("rawAppearanceCapacityBytes")
@@ -4879,11 +4994,14 @@ impl UsbSerialManager {
             );
             if use_raw_slot {
                 stage("preparing_slot");
-            }
-            if use_raw_slot && self.prepare_p4_raw_transfer_slot(&transfer_id)? {
-                eprintln!(
-                    "[usb-p4-ota] activated slot0 before full sync so raw slot1 remains the transfer target"
-                );
+                target_slot.set(self.prepare_p4_raw_transfer_slot(
+                    &transfer_id,
+                    raw_bytes,
+                    slot_capacities.as_deref(),
+                    preferred_slot,
+                    &synced_at,
+                )?);
+                eprintln!("[usb-p4-ota] target appearance slot={}", target_slot.get());
             }
             eprintln!(
                 "[usb-p4-ota] begin transfer_id={} files={} bytes={} transport={} baud={} chunk_bytes={}",
@@ -4911,6 +5029,7 @@ impl UsbSerialManager {
                     "baud": negotiated_baud,
                     "chunkBytes": chunk_size,
                     "packId": pack_id.as_str(),
+                    "slot": target_slot.get(),
                 }),
             );
             let transfer_started = Instant::now();
@@ -4923,6 +5042,7 @@ impl UsbSerialManager {
                     &transfer_id,
                     total_bytes,
                     use_raw_slot.then_some(raw_bytes),
+                    (use_raw_slot && slot_capacities.is_some()).then_some(target_slot.get()),
                 )?;
                 transfer_log::record(
                     "appearance",
@@ -5089,7 +5209,7 @@ impl UsbSerialManager {
         };
 
         let result = run_transfer(preferred_chunk_size);
-        match result {
+        let outcome = match result {
             Err(error)
                 if use_raw_chunks
                     && preferred_chunk_size > P4_RAW_APPEARANCE_SAFE_CHUNK_SIZE
@@ -5112,7 +5232,11 @@ impl UsbSerialManager {
                 run_transfer(P4_RAW_APPEARANCE_SAFE_CHUNK_SIZE)
             }
             other => other,
+        };
+        if outcome.is_ok() {
+            record_p4_slot_assignment(app_data_dir, expected_board_device_id, appearance_dir, target_slot.get());
         }
+        outcome
     }
 
     pub fn sync_appearance_p4_native_only<F>(
@@ -5458,7 +5582,7 @@ fn p4_ready_prepare_lock() -> &'static Mutex<()> {
 fn p4_ready_profile_root(appearance_dir: &Path) -> PathBuf {
     let ready = appearance_dir.join(P4_READY_DIR_NAME);
     let current = ready.join(p4_ready_profile_id());
-    let factory = ready.join("v9-640x480-15fps-225f-h264-crf27");
+    let factory = ready.join(P4_FACTORY_PROFILE_DIR);
     if appearance_dir.file_name().is_some_and(|name| name == "terrier-clips") && !current.exists() && factory.is_dir() { factory } else { current }
 }
 
@@ -5479,6 +5603,7 @@ fn p4_ready_asset_path(profile_root: &Path, device_path: &str) -> Result<PathBuf
 fn prepared_p4_summary(
     assets: &[AppearanceAssetEntry],
     pack_id: String,
+    slot_limit_bytes: u64,
 ) -> Result<PreparedP4Appearance, String> {
     let byte_count = assets.iter().try_fold(0u64, |total, asset| {
         let size = std::fs::metadata(&asset.source_path)
@@ -5495,7 +5620,7 @@ fn prepared_p4_summary(
         }
         Ok::<u64, String>(total.saturating_add(size))
     })?;
-    if byte_count > P4_APPEARANCE_SLOT_MAX_BYTES {
+    if byte_count > slot_limit_bytes {
         return Err("P4 appearance exceeds slot storage; use standard or lower bitrate, or shorter/simpler content".to_string());
     }
     Ok(PreparedP4Appearance {
@@ -5506,7 +5631,7 @@ fn prepared_p4_summary(
         byte_count,
         settings: P4AppearanceSettings::default(),
         actual_bitrates_kbps: Default::default(),
-        slot_limit_bytes: P4_APPEARANCE_SLOT_MAX_BYTES,
+        slot_limit_bytes,
     })
 }
 
@@ -5669,9 +5794,14 @@ fn load_p4_pack_from_profile_root(
             "P4 ready pack checksum mismatch: manifest={pack_id} computed={computed_pack_id}"
         ));
     }
-    let mut summary = prepared_p4_summary(&assets, pack_id)?;
-    if profile_root.file_name().is_some_and(|name| name == "v9-640x480-15fps-225f-h264-crf27") {
-        summary.profile = "v9-640x480-15fps-225f-h264-crf27".to_string();
+    let is_factory = profile_root.file_name().is_some_and(|name| name == P4_FACTORY_PROFILE_DIR);
+    let mut summary = prepared_p4_summary(
+        &assets,
+        pack_id,
+        if is_factory { P4_FACTORY_PACK_MAX_BYTES } else { P4_APPEARANCE_SLOT_MAX_BYTES },
+    )?;
+    if is_factory {
+        summary.profile = P4_FACTORY_PROFILE_DIR.to_string();
     }
     if let Ok(bytes) = std::fs::read(profile_root.join("settings.json")) {
         summary.settings = serde_json::from_slice(&bytes).map_err(|error| format!("invalid P4 settings: {error}"))?;
@@ -5815,6 +5945,8 @@ fn prepare_p4_appearance_with_settings(
     let mut inputs = Vec::new();
     let mut audio_bytes = 0u64;
     let mut budget_specs = Vec::new();
+    let probe_cache_path = ready_base.join(P4_PSNR_PROBE_CACHE_FILE);
+    let mut probe_cache = load_p4_psnr_probe_cache(&probe_cache_path);
     for family in &export_families {
         if family["ok"] != true { continue; }
         let name = family["family"].as_str().unwrap_or("unknown");
@@ -5823,8 +5955,18 @@ fn prepare_p4_appearance_with_settings(
         let source = if input.extension().is_some_and(|ext| ext == "txt") {
             format!("{}:{}", p4_file_sha256_hex(&appearance_dir.join("source.webp"))?, crate::codex_import::atlas_action_identity(name)?)
         } else { p4_file_sha256_hex(&input)? };
-        let target = target_for(name);
         let duration = probe_video_duration_ms(&ffmpeg, &input)?;
+        let mut target = target_for(name);
+        // An explicit per-action bitrate is honoured as written; otherwise the high tier only spends
+        // what the content needs to reach the PSNR target, never more than its fixed target.
+        if settings.quality == "high" && !settings.bitrates_kbps.contains_key(name) {
+            if let Some(rate) = adaptive_p4_rate_cap(
+                &ffmpeg, &input, &source, &settings.scaler, &encoder_identity, encoder.codec_name(),
+                target, duration, &atlas_frames.path().join("psnr-probe"), &mut probe_cache,
+            ) {
+                target = rate;
+            }
+        }
         let audio_path = if let Some(audio) = p4_custom_audio_path(family, name, &input, appearance_dir, app_data_dir).filter(|p| p.is_file()) {
             let output = atlas_frames.path().join("audio").join(format!("{}.wav", p4_safe_family_file_stem(name)));
             stage_p4_audio_cue(&audio, &output)?;
@@ -5834,6 +5976,7 @@ fn prepare_p4_appearance_with_settings(
         budget_specs.push(P4FrameSpec { family_name: name.into(), device_path: format!("p4/families/sha256-{}.h264", "0".repeat(24)), frames: 225, stream_bytes: 2_097_152, fps: 15, frame_duration_ms: u32::MAX, duration_ms: u32::MAX, audio_device_path: audio_path });
         inputs.push((name.to_string(), source, target, duration));
     }
+    save_p4_psnr_probe_cache(&probe_cache_path, &probe_cache);
     let budget_manifest = build_p4_h264_manifest(&budget_specs, P4_APPEARANCE_WIDTH, P4_APPEARANCE_HEIGHT, P4_APPEARANCE_FPS, &"0".repeat(64));
     let manifest_bytes = serde_json::to_vec_pretty(&budget_manifest).map_err(|e| e.to_string())?.len() as u64;
     let actual_rates = allocate_p4_bitrates(&inputs, audio_bytes, manifest_bytes)?;
@@ -6339,6 +6482,112 @@ fn p4_exported_stream(
     })
 }
 
+/// The device-resolution filter chain shared by the export and the PSNR reference, so both see the same pixels.
+fn p4_scale_filter(width: u32, height: u32, sampling_fps: f64, scale_flags: &str) -> String {
+    format!(
+        "fps={sampling_fps:.6},scale={width}:{height}:force_original_aspect_ratio=decrease:flags={scale_flags},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+    )
+}
+
+/// Average PSNR (dB) from ffmpeg's `psnr` filter summary line; `inf` means the frames are identical.
+fn parse_psnr_average_db(stderr: &str) -> Option<f64> {
+    let line = stderr.lines().rev().find(|line| line.contains("PSNR") && line.contains("average:"))?;
+    let value = line.split("average:").nth(1)?.split_whitespace().next()?;
+    if value == "inf" {
+        return Some(f64::INFINITY);
+    }
+    value.parse::<f64>().ok().filter(|db| db.is_finite())
+}
+
+/// Bitrate expected to reach `target_db`, extrapolated from one probe encode and capped at `ceiling_kbps`.
+/// PSNR grows by roughly the same number of dB per doubling of bitrate for this kind of content.
+fn p4_rate_for_target_psnr(probe_kbps: u32, probe_psnr_db: f64, target_db: f64, ceiling_kbps: u32) -> u32 {
+    if probe_psnr_db.is_nan() {
+        return ceiling_kbps;
+    }
+    let floor = P4_ADAPTIVE_RATE_FLOOR_KBPS.min(ceiling_kbps);
+    if probe_psnr_db.is_infinite() {
+        return floor;
+    }
+    let needed = f64::from(probe_kbps) * 2f64.powf((target_db - probe_psnr_db) / P4_PSNR_DB_PER_RATE_DOUBLING);
+    let step = f64::from(P4_ADAPTIVE_RATE_STEP_KBPS);
+    let stepped = ((needed.min(1_000_000.0) / step).ceil() * step) as u32;
+    stepped.clamp(floor, ceiling_kbps)
+}
+
+fn measure_p4_psnr_db(ffmpeg: &str, stream: &Path, source: &Path, scaler: &str, sampling_fps: f64) -> Option<f64> {
+    let flags = if scaler == "nearest" { "neighbor" } else { "lanczos" };
+    let filter = format!(
+        "[1:v]{}[ref];[0:v][ref]psnr",
+        p4_scale_filter(P4_APPEARANCE_WIDTH, P4_APPEARANCE_HEIGHT, sampling_fps, flags)
+    );
+    let mut command = crate::command_for_host(ffmpeg);
+    command
+        .args(["-hide_banner", "-nostdin", "-r"])
+        .arg(format!("{sampling_fps:.6}"))
+        .args(["-f", "h264", "-i"])
+        .arg(stream);
+    if source.extension().is_some_and(|ext| ext == "txt") {
+        command.args(["-f", "concat", "-safe", "0"]);
+    }
+    let output = command
+        .arg("-i")
+        .arg(source)
+        .arg("-lavfi")
+        .arg(filter)
+        .args(["-f", "null", "-"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_psnr_average_db(&String::from_utf8_lossy(&output.stderr))
+}
+
+/// PSNR probe results survive between rebuilds; JSON cannot hold `inf`, so lossless is stored as 99 dB.
+fn load_p4_psnr_probe_cache(path: &Path) -> std::collections::BTreeMap<String, f64> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_p4_psnr_probe_cache(path: &Path, cache: &std::collections::BTreeMap<String, f64>) {
+    if let Ok(bytes) = serde_json::to_vec(cache) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+/// Content-adaptive ceiling for the high tier: one probe encode at a reference rate tells how hard the
+/// action is to compress. Returns `None` (keep the fixed tier target) when the probe cannot be measured.
+#[allow(clippy::too_many_arguments)]
+fn adaptive_p4_rate_cap(
+    ffmpeg: &str,
+    input: &Path,
+    source_identity: &str,
+    scaler: &str,
+    encoder_identity: &[u8],
+    codec: &str,
+    ceiling_kbps: u32,
+    duration_ms: u64,
+    probe_dir: &Path,
+    cache: &mut std::collections::BTreeMap<String, f64>,
+) -> Option<u32> {
+    let key = p4_export_identity(source_identity, P4_PSNR_PROBE_RATE_KBPS, scaler, encoder_identity, codec);
+    let psnr = if let Some(cached) = cache.get(&key) {
+        *cached
+    } else {
+        let stream = probe_dir.join(format!("{}.h264", &key[..24]));
+        export_p4_h264_stream_with_settings(ffmpeg, input, &stream, P4_PSNR_PROBE_RATE_KBPS, scaler).ok()?;
+        let measured = measure_p4_psnr_db(ffmpeg, &stream, input, scaler, p4_sampling_fps(duration_ms))?;
+        let _ = std::fs::remove_file(&stream);
+        let stored = if measured.is_infinite() { 99.0 } else { measured };
+        cache.insert(key, stored);
+        stored
+    };
+    Some(p4_rate_for_target_psnr(P4_PSNR_PROBE_RATE_KBPS, psnr, P4_HIGH_QUALITY_TARGET_PSNR_DB, ceiling_kbps))
+}
+
 fn build_p4_h264_ffmpeg_args(
     input: &Path,
     output: &Path,
@@ -6359,9 +6608,7 @@ fn build_p4_h264_ffmpeg_args(
     }
     args.extend([
         "-i".to_string(), input.display().to_string(), "-vf".to_string(),
-        format!(
-            "fps={sampling_fps:.6},scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
-        ),
+        p4_scale_filter(width, height, sampling_fps, "lanczos"),
         "-frames:v".to_string(),
         max_frames.to_string(),
         "-an".to_string(),
@@ -8402,11 +8649,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("asset");
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len(10_481_664).unwrap();
+        file.set_len(P4_APPEARANCE_SLOT_MAX_BYTES).unwrap();
         let assets = vec![AppearanceAssetEntry { family_name: "video".into(), kind: "p4-h264", source_path: path, device_path: "p4/video.h264".into() }];
-        assert!(prepared_p4_summary(&assets, "test".into()).is_ok());
-        file.set_len(10_481_665).unwrap();
-        assert!(prepared_p4_summary(&assets, "test".into()).is_err());
+        assert!(prepared_p4_summary(&assets, "test".into(), P4_APPEARANCE_SLOT_MAX_BYTES).is_ok());
+        file.set_len(P4_APPEARANCE_SLOT_MAX_BYTES + 1).unwrap();
+        assert!(prepared_p4_summary(&assets, "test".into(), P4_APPEARANCE_SLOT_MAX_BYTES).is_err());
+        assert!(
+            prepared_p4_summary(&assets, "test".into(), P4_FACTORY_PACK_MAX_BYTES).is_ok(),
+            "the legacy factory pack keeps its larger limit until it is removed"
+        );
+        assert_eq!(P4_APPEARANCE_SLOT_MAX_BYTES, 5_238_784, "5 MiB slot minus the 4 KiB header");
     }
 
     #[test]
@@ -8416,7 +8668,76 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(65_536).unwrap();
         let assets = vec![AppearanceAssetEntry { family_name: "manifest".into(), kind: "p4-manifest", source_path: path, device_path: "p4/manifest.json".into() }];
-        assert!(prepared_p4_summary(&assets, "test".into()).is_err());
+        assert!(prepared_p4_summary(&assets, "test".into(), P4_APPEARANCE_SLOT_MAX_BYTES).is_err());
+    }
+
+    #[test]
+    fn psnr_summary_line_is_parsed_including_lossless() {
+        let stderr = "frame=1\n[Parsed_psnr_2 @ 0x1] PSNR y:41.2 u:44.1 v:43.9 average:41.282765 min:38.0 max:50.1\n";
+        assert_eq!(parse_psnr_average_db(stderr), Some(41.282765));
+        assert_eq!(
+            parse_psnr_average_db("[Parsed_psnr_2 @ 0x1] PSNR y:inf u:inf v:inf average:inf min:inf max:inf"),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(parse_psnr_average_db("no summary here"), None);
+    }
+
+    #[test]
+    fn target_psnr_rate_scales_with_the_gap_and_respects_floor_ceiling_and_step() {
+        // Already at the target: the probe rate is enough (rounded up to the 50 kbps step).
+        assert_eq!(p4_rate_for_target_psnr(900, 44.0, 44.0, 1800), 900);
+        // 3 dB short means one doubling; easier content needs less.
+        assert_eq!(p4_rate_for_target_psnr(900, 41.0, 44.0, 3000), 1800);
+        assert_eq!(p4_rate_for_target_psnr(900, 47.0, 44.0, 1800), 450);
+        // The tier's fixed target stays the ceiling; hard content cannot exceed it.
+        assert_eq!(p4_rate_for_target_psnr(900, 30.0, 44.0, 1800), 1800);
+        // Very easy or lossless content stops at the floor, and a missing measurement keeps the ceiling.
+        assert_eq!(p4_rate_for_target_psnr(900, 80.0, 44.0, 1800), P4_ADAPTIVE_RATE_FLOOR_KBPS);
+        assert_eq!(p4_rate_for_target_psnr(900, f64::INFINITY, 44.0, 1800), P4_ADAPTIVE_RATE_FLOOR_KBPS);
+        assert_eq!(p4_rate_for_target_psnr(900, f64::NAN, 44.0, 1800), 1800);
+        // A ceiling below the floor wins.
+        assert_eq!(p4_rate_for_target_psnr(900, 80.0, 44.0, 300), 300);
+        // Measured pixel-art pets (~41.3 dB at 900 kbps) land well under the old fixed 1800 kbps.
+        let rate = p4_rate_for_target_psnr(900, 41.28, 44.0, 1800);
+        assert!((1400..=1700).contains(&rate), "{rate}");
+    }
+
+    #[test]
+    fn adaptive_rate_cap_uses_the_cached_probe_without_running_ffmpeg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = p4_export_identity("source", P4_PSNR_PROBE_RATE_KBPS, "smooth", b"enc", "codec");
+        let mut cache = std::collections::BTreeMap::from([(key, 47.0)]);
+        let rate = adaptive_p4_rate_cap(
+            "ffmpeg-that-does-not-exist", Path::new("missing.mp4"), "source", "smooth", b"enc", "codec",
+            1800, 2_000, tmp.path(), &mut cache,
+        );
+        assert_eq!(rate, Some(450));
+        // A different scaler is a different probe, so it is not served from that entry.
+        let other = adaptive_p4_rate_cap(
+            "ffmpeg-that-does-not-exist", Path::new("missing.mp4"), "source", "nearest", b"enc", "codec",
+            1800, 2_000, tmp.path(), &mut cache,
+        );
+        assert_eq!(other, None, "an unmeasurable probe keeps the fixed tier target");
+    }
+
+    #[test]
+    fn probe_cache_round_trips_and_tolerates_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(P4_PSNR_PROBE_CACHE_FILE);
+        assert!(load_p4_psnr_probe_cache(&path).is_empty());
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(load_p4_psnr_probe_cache(&path).is_empty());
+        let cache = std::collections::BTreeMap::from([("k".to_string(), 42.5)]);
+        save_p4_psnr_probe_cache(&path, &cache);
+        assert_eq!(load_p4_psnr_probe_cache(&path), cache);
+    }
+
+    #[test]
+    fn export_and_psnr_reference_share_one_scale_filter() {
+        let args = build_p4_h264_ffmpeg_args(Path::new("s.mp4"), Path::new("o.h264"), 640, 480, 15.0, 225, crate::codex_import::PlatformH264Encoder::VideoToolbox);
+        let filter = &args[args.iter().position(|arg| arg == "-vf").unwrap() + 1];
+        assert_eq!(filter, &p4_scale_filter(640, 480, 15.0, "lanczos"));
+        assert!(p4_scale_filter(640, 480, 15.0, "neighbor").contains("flags=neighbor"));
     }
 
     #[test]
@@ -8503,14 +8824,14 @@ mod tests {
             ("idle".into(), "shared".into(), 1000, 4000),
             ("working".into(), "shared".into(), 1000, 4000),
         ];
-        let allocated = allocate_p4_bitrates(&same, 9_400_000, 81_664).unwrap();
+        let allocated = allocate_p4_bitrates(&same, 4_157_120, 81_664).unwrap();
         assert_eq!(allocated["idle"], 1000);
         assert_eq!(allocated["working"], 1000);
         let different = vec![
             ("idle".into(), "shared".into(), 1000, 4000),
             ("working".into(), "shared".into(), 2000, 4000),
         ];
-        let allocated = allocate_p4_bitrates(&different, 9_400_000, 81_664).unwrap();
+        let allocated = allocate_p4_bitrates(&different, 4_157_120, 81_664).unwrap();
         assert_eq!(allocated["idle"], 533);
         assert_eq!(allocated["working"], 1066);
     }
@@ -8523,7 +8844,7 @@ mod tests {
             ("working".into(), "a".into(), 10_000, 1600),
             ("done".into(), "b".into(), 5000, 1600),
         ];
-        let allocated = allocate_p4_bitrates(&inputs, 8_900_000, 81_664).unwrap();
+        let allocated = allocate_p4_bitrates(&inputs, 3_657_120, 81_664).unwrap();
         assert_eq!(allocated["working"], 4000);
         assert_eq!(allocated["done"], 2000);
     }
@@ -8532,8 +8853,8 @@ mod tests {
     fn bitrate_allocation_caps_long_actions_and_rejects_unusable_budgets() {
         let input = vec![("idle".into(), "source".into(), 1800, 20_000)];
         assert_eq!(allocate_p4_bitrates(&input, 0, 1000).unwrap()["idle"], 671);
-        assert!(allocate_p4_bitrates(&input, 10_481_664, 1).is_err());
-        assert!(allocate_p4_bitrates(&input, 10_481_662, 1).is_err());
+        assert!(allocate_p4_bitrates(&input, P4_APPEARANCE_SLOT_MAX_BYTES, 1).is_err());
+        assert!(allocate_p4_bitrates(&input, P4_APPEARANCE_SLOT_MAX_BYTES - 2, 1).is_err());
         assert!(allocate_p4_bitrates(&[], 0, 1000).is_err());
     }
 
@@ -8857,36 +9178,104 @@ mod tests {
         );
     }
 
+    fn slot_state(active: Option<u32>, packs: &[(u32, &str)]) -> P4AppearanceSlotState {
+        P4AppearanceSlotState {
+            active_slot: active,
+            slots: packs
+                .iter()
+                .map(|(slot, pack)| P4AppearanceSlot { slot: *slot, pack_id: pack.to_string() })
+                .collect(),
+        }
+    }
+
     #[test]
-    fn p4_raw_transfer_uses_valid_slot_zero_only_when_slot_one_is_active() {
-        let raw_active = P4AppearanceSlotState {
-            active_slot: Some(P4_RAW_APPEARANCE_SLOT),
-            slots: vec![
-                P4AppearanceSlot {
-                    slot: P4_BUILTIN_APPEARANCE_SLOT,
-                    pack_id: "builtin-pack".to_string(),
-                },
-                P4AppearanceSlot {
-                    slot: P4_RAW_APPEARANCE_SLOT,
-                    pack_id: "current-pack".to_string(),
-                },
-            ],
-        };
-        let fallback = p4_raw_transfer_fallback_slot(&raw_active).unwrap();
-        assert_eq!(fallback.slot, P4_BUILTIN_APPEARANCE_SLOT);
-        assert_eq!(fallback.pack_id, "builtin-pack");
+    fn p4_transfer_keeps_another_pack_on_screen_while_the_target_is_rewritten() {
+        let state = slot_state(Some(1), &[(0, "pack-a"), (1, "pack-b"), (2, "pack-c")]);
+        let fallback = p4_transfer_fallback_slot(&state, 1).unwrap();
+        assert_eq!((fallback.slot, fallback.pack_id.as_str()), (0, "pack-a"));
+        assert!(p4_transfer_fallback_slot(&state, 2).is_none(), "the shown slot is not touched");
+        let alone = slot_state(Some(1), &[(1, "pack-b")]);
+        assert!(p4_transfer_fallback_slot(&alone, 1).is_none(), "nothing else to show");
+        assert!(p4_transfer_fallback_slot(&slot_state(None, &[(0, "pack-a")]), 0).is_none());
+    }
 
-        let builtin_active = P4AppearanceSlotState {
-            active_slot: Some(P4_BUILTIN_APPEARANCE_SLOT),
-            slots: raw_active.slots.clone(),
+    #[test]
+    fn p4_target_slot_prefers_own_slot_then_empty_then_stalest_inactive() {
+        let caps = [5_000_000u64; 3];
+        let none = HashMap::new();
+        let pick = |state: &P4AppearanceSlotState, preferred, synced: &HashMap<u32, u64>| {
+            choose_p4_target_slot(state, Some(&caps), 2_000_000, preferred, synced)
         };
-        assert!(p4_raw_transfer_fallback_slot(&builtin_active).is_none());
+        // An appearance returns to the slot it used, even when other slots are free.
+        let partly = slot_state(Some(0), &[(0, "f0"), (1, "f1")]);
+        assert_eq!(pick(&partly, Some(1), &none), Ok(1));
+        // Otherwise the lowest empty slot.
+        assert_eq!(pick(&partly, None, &none), Ok(2));
+        assert_eq!(pick(&slot_state(None, &[]), None, &none), Ok(0));
+        // Full board: the stalest slot that is not on screen; unrecorded slots count as oldest.
+        let full = slot_state(Some(1), &[(0, "a"), (1, "b"), (2, "c")]);
+        assert_eq!(pick(&full, None, &HashMap::from([(0, 500), (2, 100)])), Ok(2));
+        assert_eq!(pick(&full, None, &HashMap::from([(0, 500)])), Ok(2), "slot 2 has no record");
+        assert_eq!(pick(&full, None, &HashMap::from([(0, 100), (1, 1), (2, 500)])), Ok(0), "the shown slot is spared");
+        // The shown slot is only chosen when nothing else can hold the pack.
+        let only = choose_p4_target_slot(&slot_state(Some(1), &[(1, "b")]), Some(&[0, 5_000_000, 0]), 2_000_000, None, &none);
+        assert_eq!(only, Ok(1));
+    }
 
-        let missing_builtin = P4AppearanceSlotState {
-            active_slot: Some(P4_RAW_APPEARANCE_SLOT),
-            slots: vec![raw_active.slots[1].clone()],
-        };
-        assert!(p4_raw_transfer_fallback_slot(&missing_builtin).is_none());
+    #[test]
+    fn p4_target_slot_skips_missing_partitions_and_slots_that_are_too_small() {
+        let none = HashMap::new();
+        let state = slot_state(None, &[]);
+        // Slot 0 is too small for the videos, so a preference for it is ignored.
+        let mixed = choose_p4_target_slot(&state, Some(&[1_000_000, 5_000_000, 5_000_000]), 2_000_000, Some(0), &none);
+        assert_eq!(mixed, Ok(1));
+        // A slot without a partition (capacity 0) never qualifies.
+        assert_eq!(choose_p4_target_slot(&state, Some(&[0, 0, 5_000_000]), 1, None, &none), Ok(2));
+        let too_big = choose_p4_target_slot(&state, Some(&[5_000_000; 3]), 6_000_000, None, &none).unwrap_err();
+        assert!(too_big.contains("largest slot only has 5000000"), "{too_big}");
+        // Firmware without per-slot capacities only has the legacy custom slot.
+        assert_eq!(choose_p4_target_slot(&state, None, 9_999_999, Some(2), &none), Ok(P4_RAW_APPEARANCE_SLOT));
+    }
+
+    #[test]
+    fn p4_slot_capacities_come_from_the_appearance_capability() {
+        let caps = serde_json::json!({"appearance": {"slotCapacityBytes": [5238784, 5238784, 0]}});
+        assert_eq!(parse_p4_slot_capacities(&caps), Some(vec![5_238_784, 5_238_784, 0]));
+        assert_eq!(parse_p4_slot_capacities(&serde_json::json!({"appearance": {"maxSlots": 2}})), None);
+        assert_eq!(parse_p4_slot_capacities(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn p4_slot_assignments_replace_persist_and_tolerate_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(P4SlotAssignments::load(dir.path()), P4SlotAssignments::default());
+        let mut assignments = P4SlotAssignments::default();
+        assignments.record("board-a", 2, "pet-a", 100);
+        assignments.record("board-a", 1, "pet-b", 50);
+        assignments.record("board-b", 0, "pet-a", 10);
+        assert_eq!(assignments.preferred_slot("board-a", "pet-a"), Some(2));
+        assert_eq!(assignments.preferred_slot("board-b", "pet-a"), Some(0), "boards are independent");
+        // Moving an appearance forgets its old slot, and a slot holds one appearance.
+        assignments.record("board-a", 0, "pet-a", 200);
+        assert_eq!(assignments.preferred_slot("board-a", "pet-a"), Some(0));
+        assert_eq!(assignments.synced_at("board-a"), HashMap::from([(0, 200), (1, 50)]));
+        assignments.record("board-a", 1, "pet-c", 300);
+        assert_eq!(assignments.preferred_slot("board-a", "pet-b"), None);
+
+        assignments.save(dir.path()).unwrap();
+        assert_eq!(P4SlotAssignments::load(dir.path()), assignments);
+        std::fs::write(dir.path().join("p4-slot-assignments.json"), b"{broken").unwrap();
+        assert_eq!(P4SlotAssignments::load(dir.path()), P4SlotAssignments::default());
+    }
+
+    #[test]
+    fn asset_begin_names_a_slot_only_when_one_is_chosen() {
+        let legacy = build_asset_begin_payload("t1", 100, Some(80), None);
+        assert!(legacy.get("slot").is_none(), "older firmware must not see a slot");
+        assert_eq!(legacy["rawBytes"], 80);
+        let multi = build_asset_begin_payload("t1", 100, Some(80), Some(2));
+        assert_eq!((multi["slot"].as_u64(), multi["totalBytes"].as_u64()), (Some(2), Some(100)));
+        assert!(build_asset_begin_payload("t1", 100, None, None).get("rawBytes").is_none());
     }
 
     #[test]

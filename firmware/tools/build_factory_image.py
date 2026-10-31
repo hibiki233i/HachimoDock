@@ -34,15 +34,15 @@ FACTORY_CONFIG_NAME = "factory-config.json"
 FACTORY_IMAGE_NAME = "pet-manager-p4-factory.bin"
 FACTORY_MANIFEST_NAME = "pet-manager-p4-factory.json"
 FACTORY_FORMAT = "pet-manager-p4-factory-v1"
-SPIFFS_IMAGE_NAME = "default-terrier.spiffs.bin"
-RAW_APPEARANCE_IMAGE_NAME = "default-terrier.appearance0.bin"
+SPIFFS_IMAGE_NAME = "default.spiffs.bin"
+RAW_APPEARANCE_IMAGE_TEMPLATE = "default.appearance{slot}.bin"
 SPIFFS_TREE_NAME = "factory-spiffs"
 P4_MANIFEST_LOGICAL_PATH = "p4/manifest.json"
 ACTIVE_SLOT_MARKER = "p4slot.txt"
 SLOT_READY_MARKER_TEMPLATE = "s{slot}_ready"
 MINIAPP_CATALOG_FILE = "p4-miniapps-0.json"
-BUILTIN_APPEARANCE_PARTITION_LABEL = "appearance0"
-CUSTOM_APPEARANCE_PARTITION_LABEL = "appearance1"
+APPEARANCE_PARTITION_TEMPLATE = "appearance{slot}"
+LOCAL_FACTORY_CONFIG_NAME = "factory-config.local.json"
 RAW_APPEARANCE_HEADER_BYTES = 4096
 RAW_APPEARANCE_HEADER_ENTRY_OFFSET = 88
 RAW_APPEARANCE_HEADER_ENTRY_BYTES = 24
@@ -221,8 +221,74 @@ def p4_minimal_h264_sps(width: int, height: int) -> bytes:
     return b"\x67" + _add_emulation_prevention(rbsp)
 
 
+class _BitReader:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.position = 0
+
+    def bit(self) -> int:
+        byte, offset = divmod(self.position, 8)
+        if byte >= len(self.data):
+            raise ValueError("P4 H.264 SPS is truncated")
+        self.position += 1
+        return (self.data[byte] >> (7 - offset)) & 1
+
+    def bits(self, count: int) -> int:
+        value = 0
+        for _ in range(count):
+            value = (value << 1) | self.bit()
+        return value
+
+    def ue(self) -> int:
+        zeros = 0
+        while self.bit() == 0:
+            zeros += 1
+            if zeros > 31:
+                raise ValueError("P4 H.264 SPS is malformed")
+        return (1 << zeros) - 1 + self.bits(zeros)
+
+
+def parse_sps_geometry(nal: bytes) -> tuple[int, int, int, int]:
+    """Return (profile_idc, level_idc, width, height) of a Baseline SPS NAL (header byte included)."""
+    rbsp = nal[1:].replace(b"\x00\x00\x03", b"\x00\x00")
+    if len(rbsp) < 4:
+        raise ValueError("P4 H.264 SPS is truncated")
+    profile, level = rbsp[0], rbsp[2]
+    if profile != 66:
+        raise ValueError("P4 H.264 stream uses an incompatible SPS: Baseline profile is required")
+    reader = _BitReader(rbsp[3:])
+    reader.ue()  # seq_parameter_set_id
+    reader.ue()  # log2_max_frame_num_minus4
+    poc_type = reader.ue()
+    if poc_type == 0:
+        reader.ue()
+    elif poc_type == 1:
+        reader.bit()
+        reader.ue()
+        reader.ue()
+        for _ in range(reader.ue()):
+            reader.ue()
+    reader.ue()  # max_num_ref_frames
+    reader.bit()  # gaps_in_frame_num_value_allowed_flag
+    width_mbs = reader.ue() + 1
+    height_map_units = reader.ue() + 1
+    frame_mbs_only = reader.bit()
+    if not frame_mbs_only:
+        reader.bit()
+    reader.bit()  # direct_8x8_inference_flag
+    crop_left = crop_right = crop_top = crop_bottom = 0
+    if reader.bit():
+        crop_left, crop_right, crop_top, crop_bottom = (reader.ue() for _ in range(4))
+    scale = 2 - frame_mbs_only
+    return (
+        profile,
+        level,
+        width_mbs * 16 - (crop_left + crop_right) * 2,
+        height_map_units * 16 * scale - (crop_top + crop_bottom) * 2 * scale,
+    )
+
+
 def parse_p4_h264_stream(data: bytes, width: int, height: int) -> tuple[int, int]:
-    expected_sps = p4_minimal_h264_sps(width, height)
     access_units = 0
     slices_in_access_unit = 0
     has_sps = False
@@ -241,8 +307,12 @@ def parse_p4_h264_stream(data: bytes, width: int, height: int) -> tuple[int, int
                     "P4 H.264 stream must contain exactly one slice per access unit"
                 )
         elif nal_type == 7:
-            if data[payload_start:end] != expected_sps:
-                raise ValueError("P4 H.264 stream uses an incompatible SPS")
+            _, level, sps_width, sps_height = parse_sps_geometry(data[payload_start:end])
+            if level > 30 or (sps_width, sps_height) != (width, height):
+                raise ValueError(
+                    "P4 H.264 stream uses an incompatible SPS: "
+                    f"level {level}, {sps_width}x{sps_height}"
+                )
             has_sps = True
         elif nal_type == 8:
             has_pps = True
@@ -383,6 +453,14 @@ def load_factory_config(project_dir: Path, explicit: str | None) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schemaVersion") != 1:
         raise ValueError(f"unsupported factory config schema in {path}")
+    # The committed config ships no default pets. Third-party artwork stays in a git-ignored local
+    # file beside it, which only replaces the `appearances` list.
+    local = path.with_name(LOCAL_FACTORY_CONFIG_NAME)
+    if explicit is None and local.is_file():
+        local_data = json.loads(local.read_text(encoding="utf-8"))
+        if local_data.get("schemaVersion") != 1:
+            raise ValueError(f"unsupported factory config schema in {local}")
+        data["appearances"] = local_data.get("appearances", [])
     return data
 
 
@@ -573,25 +651,25 @@ def build_builtin_component_tree(
     }
 
 
-def build_default_appearance_tree(
+def stage_default_appearance(
     project_dir: Path,
-    build_dir: Path,
-    config: dict,
+    spiffs_tree: Path,
+    contract: dict,
+    item: dict,
 ) -> dict:
-    appearance = config["appearance"]
-    slot = parse_int(appearance["slot"])
-    if slot not in (0, 1):
-        raise ValueError("factory appearance slot must be 0 or 1")
-    clips_dir = (project_dir / appearance["clipsDir"]).resolve()
-    ready_profile = str(appearance.get("readyProfile", "")).strip()
-    if not ready_profile:
-        raise ValueError("factory appearance readyProfile is required")
-    ready_root = clips_dir / "p4-ready" / ready_profile
+    """Copy one prebuilt ready pack into `spiffs_tree` as slot files and list its raw videos."""
+    slot = parse_int(item["slot"])
+    partition_path = project_dir / "partitions.csv"
+    # A slot without a partition fails here, before anything is staged.
+    _, partition_bytes = partition_entry(
+        partition_path, APPEARANCE_PARTITION_TEMPLATE.format(slot=slot)
+    )
+    ready_root = (project_dir / str(item.get("readyRoot", ""))).resolve()
     ready_manifest_path = ready_root / P4_MANIFEST_LOGICAL_PATH
     if not ready_manifest_path.is_file():
         raise FileNotFoundError(
             f"prebuilt P4 ready pack is missing: {ready_manifest_path}. "
-            "Run npm run prepare:p4-assets before building the factory image."
+            f"Copy the pack's p4/ directory to {ready_root}."
         )
     ready_manifest_bytes = ready_manifest_path.read_bytes()
     ready_manifest = json.loads(ready_manifest_bytes.decode("utf-8"))
@@ -599,9 +677,9 @@ def build_default_appearance_tree(
         "format": "p4-h264-v1",
         "codec": "h264",
         "container": "annex-b",
-        "width": parse_int(appearance["width"]),
-        "height": parse_int(appearance["height"]),
-        "fps": parse_int(appearance["fps"]),
+        "width": parse_int(contract["width"]),
+        "height": parse_int(contract["height"]),
+        "fps": parse_int(contract["fps"]),
     }
     for key, expected in expected_contract.items():
         if ready_manifest.get(key) != expected:
@@ -609,22 +687,18 @@ def build_default_appearance_tree(
                 f"P4 ready manifest {key} mismatch: "
                 f"{ready_manifest.get(key)!r} != {expected!r}"
             )
-    expected_pack_id = str(appearance.get("packId", "")).strip()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_pack_id):
-        raise ValueError(
-            "factory appearance packId must be 64 lowercase hexadecimal characters"
-        )
     actual_pack_id = str(ready_manifest.get("packId", "")).strip()
-    if actual_pack_id != expected_pack_id:
+    if not re.fullmatch(r"[0-9a-f]{64}", actual_pack_id):
+        raise ValueError("P4 ready manifest packId must be 64 lowercase hexadecimal characters")
+    pinned_pack_id = str(item.get("packId", "")).strip()
+    if pinned_pack_id and actual_pack_id != pinned_pack_id:
         raise ValueError(
-            f"P4 ready manifest packId mismatch: {actual_pack_id!r} != {expected_pack_id!r}"
+            f"P4 ready manifest packId mismatch: {actual_pack_id!r} != {pinned_pack_id!r}"
         )
 
-    spiffs_tree = build_dir / SPIFFS_TREE_NAME
-    reset_generated_directory(spiffs_tree, build_dir)
-    (spiffs_tree / ACTIVE_SLOT_MARKER).write_text(f"{slot}\n", encoding="ascii")
+    before = {path.name for path in spiffs_tree.iterdir()}
     (spiffs_tree / SLOT_READY_MARKER_TEMPLATE.format(slot=slot)).write_text(
-        f"{ready_manifest['packId']}\n", encoding="ascii"
+        f"{actual_pack_id}\n", encoding="ascii"
     )
     logical_files = []
     raw_files: list[tuple[str, Path]] = []
@@ -640,24 +714,25 @@ def build_default_appearance_tree(
         ready_video_bytes = ready_video.read_bytes()
         frames, stream_bytes = parse_p4_h264_stream(
             ready_video_bytes,
-            parse_int(appearance["width"]),
-            parse_int(appearance["height"]),
+            parse_int(contract["width"]),
+            parse_int(contract["height"]),
         )
         if frames != parse_int(family.get("frames", 0)):
             raise ValueError(f"P4 ready frame index mismatch: {logical_video}")
         if stream_bytes != parse_int(family.get("streamBytes", 0)):
             raise ValueError(f"P4 ready stream size mismatch: {logical_video}")
-        raw_files.append((logical_video, ready_video))
+        if all(existing != logical_video for existing, _ in raw_files):
+            raw_files.append((logical_video, ready_video))
+            raw_payload_bytes += len(ready_video_bytes)
         logical_files.append(logical_video)
-        raw_payload_bytes += len(ready_video_bytes)
 
         logical_audio = str(family.get("audioPath", "")).strip()
-        if logical_audio:
+        if logical_audio and logical_audio not in logical_files:
             if not logical_audio.startswith("p4/") or ".." in logical_audio or "\\" in logical_audio:
                 raise ValueError(f"invalid P4 ready audio path: {logical_audio}")
             ready_audio = ready_root / logical_audio
             if not wav_matches_device_contract(
-                ready_audio, parse_int(appearance["audioSampleRate"])
+                ready_audio, parse_int(contract["audioSampleRate"])
             ):
                 raise ValueError(f"invalid P4 ready audio: {logical_audio}")
             write_slot_file(spiffs_tree, slot, logical_audio, source=ready_audio)
@@ -670,41 +745,61 @@ def build_default_appearance_tree(
         data=ready_manifest_bytes,
     )
     logical_files.append(P4_MANIFEST_LOGICAL_PATH)
-    partition_path = project_dir / "partitions.csv"
-    _, builtin_partition_bytes = partition_entry(
-        partition_path, BUILTIN_APPEARANCE_PARTITION_LABEL
-    )
-    _, custom_partition_bytes = partition_entry(
-        partition_path, CUSTOM_APPEARANCE_PARTITION_LABEL
-    )
-    builtin_capacity_bytes = builtin_partition_bytes - RAW_APPEARANCE_HEADER_BYTES
-    custom_capacity_bytes = custom_partition_bytes - RAW_APPEARANCE_HEADER_BYTES
+    capacity_bytes = partition_bytes - RAW_APPEARANCE_HEADER_BYTES
     required_raw_bytes = raw_payload_bytes + max(0, len(raw_files) - 1) * 3
-    for label, capacity in (
-        ("built-in", builtin_capacity_bytes),
-        ("custom", custom_capacity_bytes),
-    ):
-        if required_raw_bytes > capacity:
-            raise ValueError(
-                f"P4 ready video payload exceeds the {label} appearance slot: "
-                f"{required_raw_bytes} > {capacity}"
-            )
+    if required_raw_bytes > capacity_bytes:
+        raise ValueError(
+            f"P4 ready video payload exceeds appearance slot {slot}: "
+            f"{required_raw_bytes} > {capacity_bytes}"
+        )
+    spiffs_payload_bytes = sum(
+        path.stat().st_size for path in spiffs_tree.iterdir() if path.name not in before
+    )
+    return {
+        "appearanceId": item["id"],
+        "slot": slot,
+        "families": len(families),
+        "packId": actual_pack_id,
+        "logicalFiles": logical_files,
+        "payloadBytes": spiffs_payload_bytes + raw_payload_bytes,
+        "spiffsPayloadBytes": spiffs_payload_bytes,
+        "rawPayloadBytes": raw_payload_bytes,
+        "rawCapacityBytes": capacity_bytes,
+        "rawFiles": raw_files,
+    }
+
+
+def build_default_appearance_tree(
+    project_dir: Path,
+    build_dir: Path,
+    config: dict,
+) -> dict:
+    """Stage every configured default pet, each in its own slot. No pets is a valid factory image."""
+    contract = config["appearanceContract"]
+    items = config.get("appearances", [])
+    slots = [parse_int(item["slot"]) for item in items]
+    if len(set(slots)) != len(slots):
+        raise ValueError("factory appearances must each use a different slot")
+    spiffs_tree = build_dir / SPIFFS_TREE_NAME
+    reset_generated_directory(spiffs_tree, build_dir)
+    packs = [stage_default_appearance(project_dir, spiffs_tree, contract, item) for item in items]
+    if packs:
+        # The first listed pet is the one shown at first boot.
+        (spiffs_tree / ACTIVE_SLOT_MARKER).write_text(f"{packs[0]['slot']}\n", encoding="ascii")
+    raw_payload_bytes = sum(pack["rawPayloadBytes"] for pack in packs)
     spiffs_payload_bytes = sum(
         path.stat().st_size for path in spiffs_tree.iterdir() if path.is_file()
     )
     return {
-        "appearanceId": appearance["id"],
-        "slot": slot,
-        "families": len(families),
-        "packId": ready_manifest["packId"],
-        "readyProfile": ready_profile,
-        "logicalFiles": logical_files,
-        "physicalFiles": len(list(spiffs_tree.iterdir())) + len(raw_files),
+        "count": len(packs),
+        "activeSlot": packs[0]["slot"] if packs else None,
+        "packs": packs,
+        "families": sum(pack["families"] for pack in packs),
+        "physicalFiles": len(list(spiffs_tree.iterdir()))
+        + sum(len(pack["rawFiles"]) for pack in packs),
         "payloadBytes": spiffs_payload_bytes + raw_payload_bytes,
         "spiffsPayloadBytes": spiffs_payload_bytes,
         "rawPayloadBytes": raw_payload_bytes,
-        "rawCapacityBytes": min(builtin_capacity_bytes, custom_capacity_bytes),
-        "rawFiles": raw_files,
         "tree": spiffs_tree,
     }
 
@@ -712,17 +807,18 @@ def build_default_appearance_tree(
 def build_raw_appearance_image(
     project_dir: Path,
     build_dir: Path,
-    appearance_summary: dict,
+    pack: dict,
 ) -> tuple[Path, int, int]:
-    raw_files = appearance_summary["rawFiles"]
+    raw_files = pack["rawFiles"]
     if not raw_files or len(raw_files) > RAW_APPEARANCE_MAX_FILES:
         raise ValueError(
             f"factory raw appearance requires 1-{RAW_APPEARANCE_MAX_FILES} video files"
         )
+    slot = pack["slot"]
     offset, size = partition_entry(
-        project_dir / "partitions.csv", BUILTIN_APPEARANCE_PARTITION_LABEL
+        project_dir / "partitions.csv", APPEARANCE_PARTITION_TEMPLATE.format(slot=slot)
     )
-    output = build_dir / RAW_APPEARANCE_IMAGE_NAME
+    output = build_dir / RAW_APPEARANCE_IMAGE_TEMPLATE.format(slot=slot)
     image = bytearray(b"\xff" * size)
     entries: list[tuple[int, int, int, int]] = []
     cursor = RAW_APPEARANCE_HEADER_BYTES
@@ -742,7 +838,7 @@ def build_raw_appearance_image(
     header = memoryview(image)[:RAW_APPEARANCE_HEADER_BYTES]
     header[:8] = b"P4RAW01\0"
     struct.pack_into("<IIII", header, 8, 1, len(entries), cursor, 0)
-    pack_id = str(appearance_summary["packId"]).encode("ascii")
+    pack_id = str(pack["packId"]).encode("ascii")
     if len(pack_id) != 64:
         raise ValueError("factory raw appearance packId must be 64 lowercase hex bytes")
     header[24:88] = pack_id
@@ -843,8 +939,7 @@ def build_factory_image(
     component_summary: dict,
     spiffs_image: Path,
     spiffs_offset: int,
-    raw_appearance_image: Path,
-    raw_appearance_offset: int,
+    raw_appearance_images: list[tuple[Path, int]],
     esptool: Path,
     output: Path,
 ) -> dict:
@@ -855,7 +950,8 @@ def build_factory_image(
     settings = flasher["flash_settings"]
     flash_size = parse_flash_size(str(settings["flash_size"]))
     segments.append((spiffs_offset, spiffs_image.resolve()))
-    segments.append((raw_appearance_offset, raw_appearance_image.resolve()))
+    for raw_image, raw_offset in raw_appearance_images:
+        segments.append((raw_offset, raw_image.resolve()))
     segments.sort(key=lambda item: item[0])
     validate_segments(segments, flash_size)
     if output.exists():
@@ -886,14 +982,13 @@ def build_factory_image(
         spiffs_image
     ):
         raise RuntimeError("merged factory image does not contain the expected SPIFFS image")
-    if sha256_region(
-        output,
-        raw_appearance_offset,
-        raw_appearance_image.stat().st_size,
-    ) != sha256_file(raw_appearance_image):
-        raise RuntimeError(
-            "merged factory image does not contain the expected built-in appearance image"
-        )
+    for raw_image, raw_offset in raw_appearance_images:
+        if sha256_region(
+            output, raw_offset, raw_image.stat().st_size
+        ) != sha256_file(raw_image):
+            raise RuntimeError(
+                "merged factory image does not contain the expected default appearance image"
+            )
 
     segment_records = [
         {
@@ -920,9 +1015,19 @@ def build_factory_image(
         "bytes": output.stat().st_size,
         "sha256": sha256_file(output),
         "appearance": {
-            key: value
-            for key, value in appearance_summary.items()
-            if key not in ("tree", "logicalFiles", "rawFiles")
+            **{
+                key: value
+                for key, value in appearance_summary.items()
+                if key not in ("tree", "packs")
+            },
+            "packs": [
+                {
+                    key: value
+                    for key, value in pack.items()
+                    if key not in ("logicalFiles", "rawFiles")
+                }
+                for pack in appearance_summary["packs"]
+            ],
         },
         "components": component_summary,
         "spiffsPayloadBytes": (
@@ -958,8 +1063,8 @@ def flash_factory_image(
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build one ESP32-P4 factory image with the built-in Terrier appearance "
-            "and P4 component catalog."
+            "Build one ESP32-P4 factory image with the configured default pets "
+            "(none when the list is empty) and the P4 component catalog."
         )
     )
     parser.add_argument("--build-dir", required=True)
@@ -991,8 +1096,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     appearance = build_default_appearance_tree(project_dir, build_dir, config)
     print(
         "[factory] appearance "
-        f"families={appearance['families']} files={appearance['physicalFiles']} "
-        f"payload={appearance['payloadBytes']}"
+        f"pets={appearance['count']} families={appearance['families']} "
+        f"files={appearance['physicalFiles']} payload={appearance['payloadBytes']}"
     )
     components = build_builtin_component_tree(
         project_dir, config, appearance["tree"]
@@ -1009,11 +1114,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         appearance["tree"],
         spiffsgen,
     )
-    raw_appearance_image, raw_appearance_offset, _ = build_raw_appearance_image(
-        project_dir,
-        build_dir,
-        appearance,
-    )
+    raw_appearance_images = [
+        build_raw_appearance_image(project_dir, build_dir, pack)[:2]
+        for pack in appearance["packs"]
+    ]
     summary = build_factory_image(
         project_dir,
         build_dir,
@@ -1022,8 +1126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         components,
         spiffs_image,
         spiffs_offset,
-        raw_appearance_image,
-        raw_appearance_offset,
+        raw_appearance_images,
         esptool,
         output,
     )

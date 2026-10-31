@@ -13,11 +13,12 @@
 #include <string.h>
 
 static void test_inbound_allowlist(void) {
-  const char *allowed[] = {"ack", "bind", "system/heartbeat", "speech/text", "session/current",
+  const char *allowed[] = {"ack", "bind", "system/heartbeat", "speech/text", "session/current", "agent/focus",
                            "control/screen-page", "stats/update", "runtime/stats",
-                           "state/active", "diagnostics/query", "network/query"};
+                           "state/active", "diagnostics/query", "network/query",
+                           "asset/activate", "asset/slot-query"};
   /* control/command: its audio_bridge variant would arm the microphone on the LAN link. */
-  const char *refused[] = {"control/command", "asset/chunk", "asset/raw-chunk", "firmware/begin", "audio/conversation",
+  const char *refused[] = {"control/command", "asset/begin", "asset/chunk", "asset/raw-chunk", "asset/commit", "asset/abort", "firmware/begin", "audio/conversation",
                            "media/begin", "widget/data", "widget/chunk", "app/snapshot",
                            "ui/conversation", "input/config", "debug/screenshot", "miniapp/event",
                            "", "statex", "acknowledge"};

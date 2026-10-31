@@ -202,6 +202,8 @@ static bool action_is_allowed(const char *action) {
     "agent_prompt",
     "session_next",
     "session_previous",
+    "agent_next",
+    "agent_previous",
     "session_clear",
     "miniapp_screen_tap",
     "miniapp_screen_long_press",
@@ -259,8 +261,8 @@ static void load_default_config(pet_p4_input_config_t *config) {
   add_default_binding(config, "button.encoder.short_press", "page_enter", "");
   add_default_binding(config, "button.encoder.long_press", "disabled", "");
   add_default_binding(config, "button.encoder.hold", "disabled", "");
-  add_default_binding(config, "knob.rotate_cw", "session_next", "");
-  add_default_binding(config, "knob.rotate_ccw", "session_previous", "");
+  add_default_binding(config, "knob.rotate_cw", "agent_next", "");
+  add_default_binding(config, "knob.rotate_ccw", "agent_previous", "");
   add_default_binding(config, "joystick.up", "session_previous", "");
   add_default_binding(config, "joystick.down", "session_next", "");
 }
@@ -468,6 +470,17 @@ static bool migrate_v8_config(pet_p4_input_config_t *config) {
     "session_next",
     ""
   );
+  config->version = 9;
+  return true;
+}
+
+static bool migrate_v9_config(pet_p4_input_config_t *config) {
+  if (!config || config->version != 9 || !config_bindings_are_valid(config)) return false;
+
+  // Version 10 lets joystick left/right switch the focus Agent. Only the shipped Session defaults are
+  // rewritten; a custom action on either direction is preserved.
+  migrate_default_binding(config, "knob.rotate_cw", "session_next", "", "agent_next", "");
+  migrate_default_binding(config, "knob.rotate_ccw", "session_previous", "", "agent_previous", "");
   config->version = PET_P4_INPUT_CONFIG_VERSION;
   return true;
 }
@@ -480,7 +493,8 @@ static bool migrate_input_config(pet_p4_input_config_t *config) {
   if (config->version == 5 && !migrate_v5_config(config)) return false;
   if (config->version == 6 && !migrate_v6_config(config)) return false;
   if (config->version == 7 && !migrate_v7_config(config)) return false;
-  return config->version == 8 && migrate_v8_config(config);
+  if (config->version == 8 && !migrate_v8_config(config)) return false;
+  return config->version == 9 && migrate_v9_config(config);
 }
 
 static esp_err_t persist_config(const pet_p4_input_config_t *config) {
@@ -1068,12 +1082,26 @@ static bool apply_local_action(
     state->last_update_ms = ts_ms;
     return true;
   }
-  if (strcmp(binding->action, "session_next") == 0
+  const bool agent_action = strcmp(binding->action, "agent_next") == 0
+    || strcmp(binding->action, "agent_previous") == 0;
+  if (agent_action
+      || strcmp(binding->action, "session_next") == 0
       || strcmp(binding->action, "session_previous") == 0) {
-    const bool main_open = strcmp(state->screen_page, "main") == 0;
-    const bool center_open = strcmp(state->screen_page, "components") == 0;
-    if (!main_open && !center_open) return false;
-    const int direction = strcmp(binding->action, "session_previous") == 0 ? -1 : 1;
+    const pet_p4_agent_key_route_t route = pet_p4_agent_key_route(
+      state->screen_page,
+      agent_action,
+      pet_p4_state_agent_switch_available(state, ts_ms)
+    );
+    // The desktop owns Agent focus: an Agent key is only reported, and the desktop answers with
+    // `agent/focus`. NONE covers pages (component running, diagnostics) where the key means nothing.
+    if (route == PET_P4_AGENT_KEY_NONE || route == PET_P4_AGENT_KEY_AGENT) return false;
+    const bool center_open = route == PET_P4_AGENT_KEY_CATALOG;
+    const int direction = strcmp(binding->action, "session_previous") == 0
+        || strcmp(binding->action, "agent_previous") == 0 ? -1 : 1;
+    if (agent_action && !center_open) {
+      // One Agent only (or no desktop): the key keeps its old Session meaning.
+      copy_text(action_override, action_override_size, direction < 0 ? "session_previous" : "session_next");
+    }
     if (center_open) {
       if (!pet_p4_miniapp_catalog_move(direction)) return false;
       copy_text(action_override, action_override_size, "component_select");
@@ -1197,6 +1225,8 @@ static bool component_system_action(const char *action) {
       strcmp(action, "page_toggle") == 0
       || strcmp(action, "session_next") == 0
       || strcmp(action, "session_previous") == 0
+      || strcmp(action, "agent_next") == 0
+      || strcmp(action, "agent_previous") == 0
       || strcmp(action, "page_enter") == 0
       || strcmp(action, "page_back") == 0
       || strcmp(action, "page_main") == 0

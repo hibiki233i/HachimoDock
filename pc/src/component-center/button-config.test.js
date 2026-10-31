@@ -18,8 +18,8 @@ import {
   resolveGlobalExitEvents,
 } from "./button-config.js";
 
-test("device button config model advances for joystick up/down navigation defaults", () => {
-  assert.equal(DEVICE_BUTTON_CONFIG_MODEL_VERSION, 9);
+test("device button config model advances for the joystick left/right Agent-switch defaults", () => {
+  assert.equal(DEVICE_BUTTON_CONFIG_MODEL_VERSION, 10);
 });
 
 test("the exact shipped v7 board map migrates SW1/SW3 without changing custom maps", () => {
@@ -47,7 +47,7 @@ test("the exact shipped v7 board map migrates SW1/SW3 without changing custom ma
   );
 
   assert.equal(migration.migrated, true);
-  assert.equal(migration.response.config.version, 9);
+  assert.equal(migration.response.config.version, DEVICE_BUTTON_CONFIG_MODEL_VERSION);
   assert.equal(
     migration.response.config.bindings.find((binding) => binding.event === "button.sw1.short_press")?.action,
     "page_enter",

@@ -5,11 +5,12 @@
  * [Sync] If this file changes, update `pc/.folder.md`.
  */
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV1A64_PRIME: u64 = 0x00000100000001b3;
@@ -50,11 +51,12 @@ pub(super) struct P4AppearanceSlotState {
     pub(super) slots: Vec<P4AppearanceSlot>,
 }
 
+/// Outcome of looking for an exact pack among the board's slots; the slot says where it lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum P4CachedPackActivation {
     NotFound,
-    AlreadyActive,
-    Activated,
+    AlreadyActive(u32),
+    Activated(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,16 +208,132 @@ pub(super) fn parse_p4_appearance_slot_state(
     Ok(P4AppearanceSlotState { active_slot, slots })
 }
 
-pub(super) fn p4_raw_transfer_fallback_slot(
+/// Raw video capacities per slot (`appearance.slotCapacityBytes`, 0 = no such partition).
+/// `None` means firmware that predates multiple slots: only the legacy custom slot exists.
+pub(super) fn parse_p4_slot_capacities(capabilities: &Value) -> Option<Vec<u64>> {
+    let list = capabilities
+        .get("appearance")?
+        .get("slotCapacityBytes")?
+        .as_array()?;
+    Some(list.iter().map(|value| value.as_u64().unwrap_or(0)).collect())
+}
+
+/// Pick the slot a new pack is written to.
+///
+/// 1. Only slots that exist and can hold `raw_bytes` of video qualify.
+/// 2. The slot this appearance used last time wins, so re-syncing an edited appearance replaces
+///    its own copy instead of consuming another slot.
+/// 3. Otherwise the lowest empty slot.
+/// 4. Otherwise the slot synced longest ago, never the one currently shown unless it is the only
+///    choice. Slots with no record (factory defaults) count as oldest.
+pub(super) fn choose_p4_target_slot(
     state: &P4AppearanceSlotState,
+    capacities: Option<&[u64]>,
+    raw_bytes: u64,
+    preferred: Option<u32>,
+    synced_at: &HashMap<u32, u64>,
+) -> Result<u32, String> {
+    let Some(capacities) = capacities else {
+        return Ok(P4_RAW_APPEARANCE_SLOT);
+    };
+    let candidates: Vec<u32> = (0..capacities.len() as u32)
+        .filter(|slot| {
+            let capacity = capacities[*slot as usize];
+            capacity > 0 && raw_bytes <= capacity
+        })
+        .collect();
+    if candidates.is_empty() {
+        let largest = capacities.iter().copied().max().unwrap_or(0);
+        return Err(format!(
+            "P4 appearance videos require {raw_bytes} bytes but the largest slot only has {largest} bytes"
+        ));
+    }
+    if let Some(slot) = preferred.filter(|slot| candidates.contains(slot)) {
+        return Ok(slot);
+    }
+    let occupied = |slot: u32| state.slots.iter().any(|entry| entry.slot == slot);
+    if let Some(slot) = candidates.iter().copied().find(|slot| !occupied(*slot)) {
+        return Ok(slot);
+    }
+    Ok(candidates
+        .iter()
+        .copied()
+        .filter(|slot| state.active_slot != Some(*slot))
+        .min_by_key(|slot| (synced_at.get(slot).copied().unwrap_or(0), *slot))
+        .unwrap_or(candidates[0]))
+}
+
+/// While `target` is rewritten the board must not be left showing it: when it is the active slot,
+/// activate any other slot that holds a valid pack first.
+pub(super) fn p4_transfer_fallback_slot(
+    state: &P4AppearanceSlotState,
+    target: u32,
 ) -> Option<&P4AppearanceSlot> {
-    if state.active_slot != Some(P4_RAW_APPEARANCE_SLOT) {
+    if state.active_slot != Some(target) {
         return None;
     }
-    state
-        .slots
-        .iter()
-        .find(|slot| slot.slot == P4_BUILTIN_APPEARANCE_SLOT)
+    state.slots.iter().find(|slot| slot.slot != target)
+}
+
+const P4_SLOT_ASSIGNMENTS_FILE: &str = "p4-slot-assignments.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct P4SlotAssignment {
+    pub(super) appearance_id: String,
+    pub(super) synced_at_ms: u64,
+}
+
+/// Which appearance last went into which slot of which board. The board only knows pack ids, so
+/// this is what lets a re-sync reuse a slot and lets eviction pick the stalest one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct P4SlotAssignments {
+    boards: BTreeMap<String, BTreeMap<u32, P4SlotAssignment>>,
+}
+
+impl P4SlotAssignments {
+    pub(super) fn load(app_data_dir: &Path) -> Self {
+        std::fs::read(app_data_dir.join(P4_SLOT_ASSIGNMENTS_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn save(&self, app_data_dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(app_data_dir).map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
+        let temporary = tempfile::NamedTempFile::new_in(app_data_dir).map_err(|error| error.to_string())?;
+        std::fs::write(temporary.path(), bytes).map_err(|error| error.to_string())?;
+        temporary
+            .persist(app_data_dir.join(P4_SLOT_ASSIGNMENTS_FILE))
+            .map_err(|error| error.error.to_string())?;
+        Ok(())
+    }
+
+    pub(super) fn preferred_slot(&self, board: &str, appearance_id: &str) -> Option<u32> {
+        self.boards
+            .get(board)?
+            .iter()
+            .find(|(_, entry)| entry.appearance_id == appearance_id)
+            .map(|(slot, _)| *slot)
+    }
+
+    pub(super) fn synced_at(&self, board: &str) -> HashMap<u32, u64> {
+        self.boards
+            .get(board)
+            .map(|slots| slots.iter().map(|(slot, entry)| (*slot, entry.synced_at_ms)).collect())
+            .unwrap_or_default()
+    }
+
+    /// `slot` now holds `appearance_id`; any older slot of the same appearance is forgotten.
+    pub(super) fn record(&mut self, board: &str, slot: u32, appearance_id: &str, now_ms: u64) {
+        let slots = self.boards.entry(board.to_string()).or_default();
+        slots.retain(|_, entry| entry.appearance_id != appearance_id);
+        slots.insert(
+            slot,
+            P4SlotAssignment { appearance_id: appearance_id.to_string(), synced_at_ms: now_ms },
+        );
+    }
 }
 
 // A protected factory appearance is addressed by its slot identity, not the

@@ -1,5 +1,13 @@
 {
   "schemaVersion": 1,
+  "appearanceContract": {
+    "width": 640,
+    "height": 480,
+    "fps": 15,
+    "maxFrames": 225,
+    "audioSampleRate": 16000
+  },
+  "appearances": [],
   "appearance": {
     "id": "builtin-terrier",
     "systemCues": true,

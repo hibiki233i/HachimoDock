@@ -2782,6 +2782,86 @@ static void draw_connection_banner(
   );
 }
 
+/* How long the board waits after boot before concluding that no pet is installed. */
+#define PET_P4_IMPORT_HINT_DELAY_MS 2500ULL
+
+static void draw_text_centered_line(const char *text, int y, uint16_t color, int scale) {
+  int width = utf8_text_width(text, -1, scale);
+  draw_text_line(text, (PET_P4_UI_WIDTH - width) / 2, y, PET_P4_UI_WIDTH - 40, color, scale, false);
+}
+
+/*
+ * Empty-slot screen: a monitor wired to the board says how to get a pet. It repaints its whole
+ * region every frame, like a video frame would, so session cards drawn afterwards stay on top and
+ * stale pixels never survive a card closing.
+ */
+static void draw_import_hint(void) {
+  const uint16_t background = rgb565(0, 0, 0);
+  const uint16_t bezel = rgb565(88, 96, 93);
+  const uint16_t screen = rgb565(30, 38, 35);
+  const uint16_t fur = rgb565(250, 226, 170);
+  const uint16_t ink = rgb565(36, 32, 28);
+  const uint16_t cable = rgb565(255, 163, 31);
+  const int cx = PET_P4_UI_WIDTH / 2;
+
+  fill_rect(0, 56, PET_P4_UI_WIDTH, PET_P4_SESSION_CARD_BOTTOM - 56, background);
+
+  /* Monitor with a pet on its screen. */
+  fill_round_rect(cx - 110, 92, 220, 140, 14, bezel);
+  fill_round_rect(cx - 100, 102, 200, 112, 8, screen);
+  fill_triangle(cx - 30, 140, cx - 24, 112, cx - 4, 134, fur);
+  fill_triangle(cx + 30, 140, cx + 24, 112, cx + 4, 134, fur);
+  fill_ellipse(cx, 162, 36, 30, fur);
+  fill_ellipse(cx - 14, 160, 4, 5, ink);
+  fill_ellipse(cx + 14, 160, 4, 5, ink);
+  fill_ellipse(cx, 170, 4, 3, ink);
+  draw_line(cx, 173, cx - 6, 178, ink);
+  draw_line(cx, 173, cx + 6, 178, ink);
+  fill_rect(cx - 10, 232, 20, 14, bezel);
+  fill_round_rect(cx - 40, 246, 80, 10, 4, bezel);
+
+  /* USB cable down to the board, which shows the same pet waiting to arrive. */
+  fill_rect(cx - 2, 256, 4, 36, cable);
+  fill_round_rect(cx - 10, 288, 20, 12, 3, cable);
+  fill_round_rect(cx - 58, 298, 116, 52, 10, bezel);
+  fill_round_rect(cx - 52, 304, 104, 40, 6, screen);
+  fill_triangle(cx - 11, 320, cx - 9, 310, cx - 3, 317, fur);
+  fill_triangle(cx + 11, 320, cx + 9, 310, cx + 3, 317, fur);
+  fill_ellipse(cx, 327, 12, 10, fur);
+  fill_ellipse(cx - 5, 326, 2, 2, ink);
+  fill_ellipse(cx + 5, 326, 2, 2, ink);
+
+  draw_text_centered_line("还没有桌宠", 364, rgb565(250, 241, 204), 2);
+  draw_text_centered_line("用 USB 线连接电脑，打开 Pet Manager", 410, rgb565(190, 196, 193), 1);
+  draw_text_centered_line("导入桌宠后，它就会出现在这里", 434, rgb565(190, 196, 193), 1);
+}
+
+/*
+ * Short label after the focus Agent changes: "Claude  2/3". It sits at y=60, below the page dots and
+ * the status banner, and inside the region the import hint repaints, so it never leaves residue
+ * once it expires.
+ */
+static void draw_agent_hint(const pet_p4_runtime_state_t *state, unsigned long long now_ms) {
+  char text[PET_P4_AGENT_MAX + 16];
+  if (!state || !state->agent_focus_label[0] || now_ms >= state->agent_hint_until_ms) return;
+  if (state->agent_focus_index > 0 && state->agent_focus_count > 1) {
+    snprintf(text, sizeof(text), "%s  %u/%u", state->agent_focus_label,
+             state->agent_focus_index, state->agent_focus_count);
+  } else {
+    snprintf(text, sizeof(text), "%s", state->agent_focus_label);
+  }
+  int width = utf8_text_width(text, -1, 2) + 40;
+  if (width < 140) width = 140;
+  if (width > PET_P4_UI_WIDTH - 80) width = PET_P4_UI_WIDTH - 80;
+  if (width & 1) width += 1;
+  const int height = 40;
+  const int x = (PET_P4_UI_WIDTH - width) / 2;
+  const int y = 60;
+  fill_round_rect(x, y, width, height, 14, rgb565(11, 14, 13));
+  fill_ellipse(x + 18, y + height / 2, 4, 4, rgb565(255, 163, 31));
+  draw_text_line_vcenter(text, x + 32, y, height, width - 44, rgb565(250, 241, 204), 2, true);
+}
+
 static void draw_text_right(
   const char *text,
   int right_x,
@@ -5259,11 +5339,17 @@ esp_err_t pet_p4_renderer_render(
         ESP_LOGI(TAG, "no usable P4 appearance frames yet; keeping bubble/status visible");
         g_logged_missing_asset = true;
       }
+      // Only when no pet is installed at all; a pet that is merely loading or backing off keeps its frame.
+      if (state && state->asset_family_count == 0 && now_ms >= PET_P4_IMPORT_HINT_DELAY_MS) {
+        draw_import_hint();
+      }
     }
     if (view && view->show_voice_overlay) draw_standalone_voice_overlay();
     else if (!show_session_queue) draw_bubble(view, now_ms);
     if (!realtime) draw_session_queue(state, now_ms);
     else g_session_overlay_cache_valid = false;
+    // Drawn last so the Agent label sits above the pet and the Session cards.
+    if (!realtime) draw_agent_hint(state, now_ms);
   }
   const bool media_page = strcmp(page, "app") == 0 && pet_p4_miniapp_media_active();
   const bool instrument_page = strcmp(page, "app") == 0

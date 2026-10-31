@@ -13,8 +13,10 @@
 /* No `control/command`: on the P4 it only carries `audio_bridge` (arms the microphone on the
  * requesting link) and the legacy `button_config`, both USB-only. */
 static const char *const k_inbound_topics[] = {
-  "ack", "bind", "system/heartbeat", "speech/text", "session/current", "control/screen-page",
+  "ack", "bind", "system/heartbeat", "speech/text", "session/current", "agent/focus", "control/screen-page",
   "stats/update", "runtime/stats",
+  /* Switching between appearances already stored in the slots moves no asset bytes. */
+  "asset/activate", "asset/slot-query",
 };
 static const char *const k_inbound_prefixes[] = {"state/", "diagnostics/", "network/"};
 

@@ -14,7 +14,13 @@ import {
   DEFAULT_AGENT_ID,
   ENABLED_AGENTS_STORAGE_KEY,
   FIXED_AGENT_OPTIONS,
+  DEVICE_FOLLOW_AGENTS_STORAGE_KEY,
+  loadDeviceFollowAgents,
   loadEnabledAgents,
+  loadPetFollowMode,
+  saveDeviceFollowAgents,
+  savePetFollowMode,
+  sanitizeDeviceFollowAgents,
   normalizeDetectedAgents,
   pickFirstDetectedAgentId,
   sanitizeAgentAppearanceMap,
@@ -168,4 +174,31 @@ test("pickFirstDetectedAgentId falls back to first detected when followed agent 
   assert.equal(pickFirstDetectedAgentId(agents, "claude-code"), "codex");
   assert.equal(pickFirstDetectedAgentId(agents), "codex");
   assert.equal(pickFirstDetectedAgentId([]), "");
+});
+
+test("the device follow set is stored apart from the desktop channel and keeps fixed Agent order", () => {
+  const values = installStorage({ [ENABLED_AGENTS_STORAGE_KEY]: JSON.stringify(["claude-code"]) });
+  assert.deepEqual(loadDeviceFollowAgents(), ["claude-code"], "legacy single selection seeds the first run");
+
+  saveDeviceFollowAgents(new Set(["openclaw", "codex", "unknown"]));
+  assert.deepEqual(JSON.parse(values.get(DEVICE_FOLLOW_AGENTS_STORAGE_KEY)), ["codex", "openclaw"]);
+  assert.deepEqual(loadDeviceFollowAgents(), ["codex", "openclaw"]);
+  assert.deepEqual([...loadEnabledAgents()], ["claude-code"], "the desktop-pet channel is untouched");
+});
+
+test("loadDeviceFollowAgents returns null when nothing was ever chosen and survives corrupt data", () => {
+  installStorage();
+  assert.equal(loadDeviceFollowAgents(), null);
+  installStorage({ [DEVICE_FOLLOW_AGENTS_STORAGE_KEY]: "{not json" });
+  assert.equal(loadDeviceFollowAgents(), null);
+  assert.deepEqual(sanitizeDeviceFollowAgents("workbuddy"), ["workbuddy"]);
+});
+
+test("the pet follow mode defaults to follow and only accepts known values", () => {
+  installStorage();
+  assert.equal(loadPetFollowMode(), "follow");
+  savePetFollowMode("resident");
+  assert.equal(loadPetFollowMode(), "resident");
+  savePetFollowMode("bogus");
+  assert.equal(loadPetFollowMode(), "follow");
 });

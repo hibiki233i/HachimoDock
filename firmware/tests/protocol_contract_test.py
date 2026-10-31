@@ -140,7 +140,7 @@ def test_p4_native_usb_vendor_bulk_contract_is_declared():
     assert "vendor bulk" in doc
     assert "0x303A" in doc
     assert "0x4040" in doc
-    assert '"maxAppearanceSlots": 2' in doc
+    assert '"maxAppearanceSlots": 3' in doc
     assert '"appearanceSlotReuse": true' in doc
     assert '"bulk": true' in doc
     assert "pet_p4_usb_native.c" in cmake
@@ -1705,8 +1705,10 @@ def test_p4_flash_layout_allocates_dual_10m_appearance_slots_on_32m_flash():
     assert "ota_1,    app,  ota_1,   0x290000, 0x280000," in partitions
     assert "otadata,  data, ota,     0x510000, 0x2000," in partitions
     assert "storage,  data, spiffs,  0x520000, 0x6E0000," in partitions
-    assert "appearance0,data, 0x40,   0xC00000, 0xA00000," in partitions
-    assert "appearance1,data, 0x41,   0x1600000,0xA00000," in partitions
+    assert "appearance0,data, 0x40,   0xC00000, 0x500000," in partitions
+    assert "appearance1,data, 0x41,   0x1100000,0x500000," in partitions
+    assert "appearance2,data, 0x42,   0x1600000,0x500000," in partitions
+    assert "appearance3" not in partitions, "the last 5 MiB stays unassigned"
     assert "board_build.flash_size = 32MB" in platformio
     assert "board_upload.flash_size = 32MB" in platformio
     assert "CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y" in sdkconfig
@@ -1722,8 +1724,9 @@ def test_p4_flash_layout_allocates_dual_10m_appearance_slots_on_32m_flash():
     assert "| `ota_0` | `0x010000` | 2.5 MiB |" in runtime_readme
     assert "| `ota_1` | `0x290000` | 2.5 MiB |" in runtime_readme
     assert "| `storage` | `0x520000` | 6.875 MiB |" in runtime_readme
-    assert "| `appearance0` | `0xC00000` | 10 MiB |" in runtime_readme
-    assert "| `appearance1` | `0x1600000` | 10 MiB |" in runtime_readme
+    assert "| `appearance0` | `0xC00000` | 5 MiB |" in runtime_readme
+    assert "| `appearance1` | `0x1100000` | 5 MiB |" in runtime_readme
+    assert "| `appearance2` | `0x1600000` | 5 MiB |" in runtime_readme
     assert ".\\tools\\migrate_to_ab.ps1 -Port COM5 -FactoryReset" in runtime_readme
     assert "inactive 2.5MiB OTA slot" in protocol_doc
     assert "two 4MB OTA slots" not in runtime_readme
@@ -1979,7 +1982,7 @@ def test_p4_asset_transfer_prepares_spiffs_and_raw_slot_without_rereads():
     assert 'esp_spiffs_gc("storage", target)' in source
     assert 'json_u64(payload, "totalBytes", 0)' in source
     assert 'json_u64(payload, "rawBytes", total_bytes)' in source
-    assert "pet_p4_raw_assets_prepare(raw_bytes" in source
+    assert "pet_p4_raw_assets_prepare(g_asset_transfer_slot, raw_bytes" in source
     assert "esp_partition_erase_range" in raw
     assert "erase_range_yielding" in raw
     # Erase on absolute 64 KiB boundaries so full slices use block erase.
@@ -2028,7 +2031,12 @@ def test_p4_serial_asset_sync_uses_replaceable_slot_until_commit():
 
     assert "ensure_asset_transfer_slot" in source
     assert "return PET_P4_RAW_APPEARANCE_SLOT" in source
-    assert "g_asset_transfer_slot = PET_P4_RAW_APPEARANCE_SLOT" in source
+    assert "g_asset_requested_slot" in source, "asset/begin may name the target slot"
+    assert "      : PET_P4_RAW_APPEARANCE_SLOT;" in source, "without a slot the legacy custom slot is used"
+    assert "pet_p4_asset_slot_is_transfer_target(g_asset_transfer_slot)" in source
+    assert "PET_P4_BUILTIN_SLOT_PROTECTED && slot == PET_P4_BUILTIN_APPEARANCE_SLOT" in source
+    assert "slot == PET_P4_RAW_APPEARANCE_SLOT || pet_p4_raw_assets_slot_available(slot)" in source, \
+        "extra slots are raw-only"
     assert "pet_p4_asset_clean_legacy_files()" in source
     assert "clear_slot_files(g_asset_transfer_slot)" in source
     assert "pet_p4_asset_fs_path_for_slot(g_asset_transfer_slot, path" in source
@@ -2089,7 +2097,7 @@ def test_p4_desktop_serializes_every_appearance_bulk_path():
     assert "asset_transfer_guard" in serial_sync
     assert "asset_transfer_guard" in native_only_sync
 
-def test_p4_pre_marker_pack_migration_preserves_the_builtin_slot():
+def test_p4_pre_marker_pack_migration_preserves_every_slot():
     serial = read("main/pet_p4_protocol.c")
     native = read("main/pet_p4_usb_native.c")
     protocol = read("protocol.md")
@@ -2101,8 +2109,63 @@ def test_p4_pre_marker_pack_migration_preserves_the_builtin_slot():
     for source in (serial, native):
         assert "!clear_slot_files(0) || !clear_slot_files(1)" not in source
     assert "bool pet_p4_asset_slot_has_pack_id(int slot)" in serial
-    assert "never erases protected" in protocol
-    assert "slot `0`" in protocol
+    assert "Other slots are never erased" in protocol
+
+
+def test_p4_joystick_agent_switch_is_announced_routed_and_documented():
+    protocol = read("main/pet_p4_protocol.c")
+    header = read("main/pet_p4_protocol.h")
+    input_source = read("main/pet_p4_input.c")
+    core = read("main/pet_p4_input_core.c")
+    net_core = read("main/pet_p4_net_core.c")
+    renderer = read("main/pet_p4_renderer.c")
+    doc = read("protocol.md")
+
+    assert 'strcmp(topic, "agent/focus") == 0' in protocol
+    assert "static void handle_agent_focus(" in protocol
+    assert "bool pet_p4_state_agent_switch_available(" in protocol
+    assert "state->agent_focus_count >= 2 && pet_p4_state_host_connected(state, now_ms)" in protocol
+    assert "agent_hint_until_ms" in header and "agent_focus_count" in header
+    assert '"agent_next"' in input_source and '"agent_previous"' in input_source
+    assert "pet_p4_agent_key_route(" in input_source
+    assert "route == PET_P4_AGENT_KEY_NONE || route == PET_P4_AGENT_KEY_AGENT" in input_source
+    assert 'strcmp(action, "agent_next") == 0' in input_source, "components cannot own the Agent actions"
+    assert "agent_action && switch_available ? PET_P4_AGENT_KEY_AGENT" in core
+    assert '"agent/focus"' in net_core
+    assert "draw_agent_hint(state, now_ms);" in renderer
+    assert "now_ms >= state->agent_hint_until_ms" in renderer
+    for phrase in ("## Agent focus and the joystick Agent switch", "`agent/focus` (desktop to board", "input config version 10"):
+        assert phrase in doc, phrase
+
+
+def test_p4_asset_begin_names_a_target_slot_and_capabilities_report_real_slots():
+    source = read("main/pet_p4_protocol.c")
+    raw = read("main/pet_p4_raw_assets.c")
+    header = read("main/pet_p4_raw_assets.h")
+    protocol = read("protocol.md")
+
+    assert 'cJSON_GetObjectItemCaseSensitive(payload, "slot")' in source
+    assert "pet_p4_raw_assets_available_slot_count()" in source
+    assert '"slotCapacityBytes"' in source
+    assert "#define PET_P4_APPEARANCE_SLOT_COUNT 3" in header
+    assert '"appearance2"' in raw
+    # The legacy single custom slot stays the default so an older desktop is unaffected.
+    assert "      : PET_P4_RAW_APPEARANCE_SLOT;" in source
+    assert "`appearance.slotCapacityBytes`" in protocol
+    assert "optional integer `slot`" in protocol
+    native = read("main/pet_p4_usb_native.c")
+    assert 'cJSON_GetObjectItemCaseSensitive(root, "slot")' in native
+    assert "pet_p4_asset_slot_is_transfer_target(slot)" in native
+    assert "appearance slot cannot change during a transfer" in native
+    assert "#define PET_P4_BUILTIN_SLOT_PROTECTED 0" in header
+    renderer = read("main/pet_p4_renderer.c")
+    assert "state->asset_family_count == 0 && now_ms >= PET_P4_IMPORT_HINT_DELAY_MS" in renderer
+    assert "draw_import_hint();" in renderer
+    assert "还没有桌宠" in renderer and "用 USB 线连接电脑" in renderer
+    # Slot count in the table and the capability the desktop reads must not drift apart.
+    partitions = read("partitions.csv")
+    declared = sum(1 for line in partitions.splitlines() if line.startswith("appearance"))
+    assert declared == 3
 
 
 def test_p4_appearance_slots_can_reactivate_an_exact_cached_pack():
@@ -2114,7 +2177,7 @@ def test_p4_appearance_slots_can_reactivate_an_exact_cached_pack():
     assert '"slotReuse", true' in source
     assert '"builtinSlot", 0' in source
     assert '"customSlot", PET_P4_RAW_APPEARANCE_SLOT' in source
-    assert '"builtinProtected", true' in source
+    assert '"builtinProtected", PET_P4_BUILTIN_SLOT_PROTECTED != 0' in source
     assert "return PET_P4_RAW_APPEARANCE_SLOT" in source
     assert 'strcmp(topic, "asset/slot-query") == 0' in source
     assert 'strcmp(topic, "asset/activate") == 0' in source
@@ -2200,8 +2263,9 @@ def test_p4_hardware_inputs_are_debounced_persistent_and_configurable():
     assert '"button.encoder.short_press", "page_enter"' in input_source
     assert '"button.encoder.long_press", "disabled"' in input_source
     assert '"button.encoder.hold", "disabled"' in input_source
-    assert '"knob.rotate_cw", "session_next"' in input_source
-    assert '"knob.rotate_ccw", "session_previous"' in input_source
+    # Joystick left/right switch the focus Agent; they fall back to Sessions when one Agent is followed.
+    assert '"knob.rotate_cw", "agent_next"' in input_source
+    assert '"knob.rotate_ccw", "agent_previous"' in input_source
     assert '"joystick.up", "session_previous"' in input_source
     assert '"joystick.down", "session_next"' in input_source
     assert 'strcmp(binding->action, "session_next") == 0' in input_source
@@ -2219,8 +2283,11 @@ def test_p4_hardware_inputs_are_debounced_persistent_and_configurable():
     assert "migrate_v6_config" in input_source
     assert "migrate_v7_config" in input_source
     assert "migrate_v8_config" in input_source
+    assert "migrate_v9_config" in input_source
+    assert 'migrate_default_binding(config, "knob.rotate_cw", "session_next", "", "agent_next", "")' in input_source
+    assert 'migrate_default_binding(config, "knob.rotate_ccw", "session_previous", "", "agent_previous", "")' in input_source
     assert "migrate_input_config" in input_source
-    assert "PET_P4_INPUT_CONFIG_VERSION 9" in read_required("main/pet_p4_input.h")
+    assert "PET_P4_INPUT_CONFIG_VERSION 10" in read_required("main/pet_p4_input.h")
     assert "center_binding" not in input_source
     assert '"page_toggle"' in input_source
     assert '"page_enter"' in input_source
@@ -2515,7 +2582,9 @@ if __name__ == "__main__":
         test_p4_serial_asset_sync_uses_replaceable_slot_until_commit,
         test_p4_inactive_slot_cleanup_restarts_after_each_spiffs_delete,
         test_p4_native_usb_does_not_leave_a_serial_raw_transfer_open,
-        test_p4_pre_marker_pack_migration_preserves_the_builtin_slot,
+        test_p4_pre_marker_pack_migration_preserves_every_slot,
+        test_p4_joystick_agent_switch_is_announced_routed_and_documented,
+        test_p4_asset_begin_names_a_target_slot_and_capabilities_report_real_slots,
         test_p4_appearance_slots_can_reactivate_an_exact_cached_pack,
         test_p4_appearance_slots_require_transaction_ready_markers,
         test_p4_asset_chunks_carry_decoded_size_guard,

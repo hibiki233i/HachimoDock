@@ -3910,6 +3910,8 @@ fn is_allowed_button_config_action(action: &str) -> bool {
             | "agent_prompt"
             | "session_next"
             | "session_previous"
+            | "agent_next"
+            | "agent_previous"
             | "session_clear"
             | "miniapp_screen_tap"
             | "miniapp_screen_long_press"
@@ -6686,6 +6688,47 @@ async fn usb_send_speech(
     Ok(())
 }
 
+/// Longest Agent label sent to the board: its field holds 64 bytes, and a cut must not split a character.
+const AGENT_FOCUS_LABEL_MAX_BYTES: usize = 60;
+
+fn build_agent_focus_payload(agent_id: &str, label: &str, index: u32, count: u32, hint: bool) -> serde_json::Value {
+    let mut end = label.len().min(AGENT_FOCUS_LABEL_MAX_BYTES);
+    while !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    serde_json::json!({
+        "agentId": agent_id,
+        "label": &label[..end],
+        "index": index,
+        "count": count,
+        "hint": hint,
+    })
+}
+
+/// Tell the board which Agent it shows and how many are followed. With two or more, joystick
+/// left/right switch Agents; `hint` asks for the short on-screen label after a switch. `agent/focus`
+/// is accepted over Wi-Fi as well. A board other than the connected one is ignored.
+#[tauri::command]
+async fn usb_send_agent_focus(
+    usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
+    board_device_id: String,
+    agent_id: String,
+    label: String,
+    index: u32,
+    count: u32,
+    hint: bool,
+) -> Result<(), String> {
+    let status = usb_manager.status();
+    if !status.connected || status.board_device_id != board_device_id {
+        return Ok(());
+    }
+    usb_manager.send_to_board(
+        &board_device_id,
+        "agent/focus",
+        &build_agent_focus_payload(&agent_id, &label, index, count, hint),
+    )
+}
+
 #[tauri::command]
 async fn usb_send_command(
     usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
@@ -6960,6 +7003,14 @@ async fn usb_update_bundled_firmware(
         ));
     }
     run_usb_firmware_update(app_handle, manager, firmware_path, expected_board_device_id).await
+}
+
+/// `state` is `active`, `activated` or `notResident` (the pack is not in any slot of the board).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsbActivateResidentResult {
+    ok: bool,
+    state: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7373,6 +7424,11 @@ fn resolve_appearance_sync_board_device_id(
     Ok(requested_board_device_id.to_string())
 }
 
+/// The bundled factory pack is only usable as is by a device that keeps it in a protected slot.
+fn builtin_terrier_needs_prepared_pack(has_overrides: bool, device_has_builtin: bool) -> bool {
+    has_overrides || !device_has_builtin
+}
+
 #[tauri::command]
 async fn usb_sync_appearance(
     app_handle: tauri::AppHandle,
@@ -7415,8 +7471,14 @@ async fn usb_sync_appearance(
             .join("custom-appearances")
             .join("builtin-terrier");
         let has_overrides = builtin_terrier_has_customization(&local_dir, &app_local_data_dir)?;
+        // A device without a protected factory slot cannot hold the bundled 8.6 MB pack, so the
+        // default appearance is encoded to the slot budget like any other appearance.
+        let device_has_builtin = !serial_connected
+            || status.capabilities["appearance"]["builtinProtected"] == true;
         match sync_runtime {
-            UsbAppearanceSyncRuntime::EspP4 if has_overrides => {
+            UsbAppearanceSyncRuntime::EspP4
+                if builtin_terrier_needs_prepared_pack(has_overrides, device_has_builtin) =>
+            {
                 prepare_builtin_p4_if_stale(
                     &local_dir,
                     usb_serial::inspect_prepared_p4_appearance(&local_dir).is_ok(),
@@ -7553,6 +7615,55 @@ async fn usb_sync_appearance(
     .await;
     mgr.finish_appearance_sync();
     worker_result.map_err(|e| e.to_string())?
+}
+
+/// Switch the board to an appearance that already sits in one of its slots. Nothing is transferred,
+/// so this works over Wi-Fi as well as USB; an appearance that is not resident reports `notResident`
+/// and needs a USB sync first.
+#[tauri::command]
+async fn usb_activate_resident_appearance(
+    app_handle: tauri::AppHandle,
+    usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
+    appearance_id: String,
+    board_device_id: Option<String>,
+) -> Result<UsbActivateResidentResult, String> {
+    let status = usb_manager.status();
+    if !status.connected {
+        return Err("设备未连接，无法切换桌宠".to_string());
+    }
+    let requested_board_device_id = board_device_id.unwrap_or_default().trim().to_string();
+    let expected_board_device_id = resolve_appearance_sync_board_device_id(
+        true,
+        &status.board_device_id,
+        &requested_board_device_id,
+    )?;
+    let appearance_id = validate_appearance_id(&appearance_id)?.to_string();
+    let app_local_data_dir = app_handle
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("无法解析 AppLocalData 目录: {}", e))?;
+    // The default appearance is prepared in the same directory a sync would use for it.
+    let appearance_dir = app_local_data_dir
+        .join("custom-appearances")
+        .join(&appearance_id);
+    let manager = usb_manager.inner().clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        manager.activate_resident_p4_appearance(
+            &appearance_dir,
+            &app_local_data_dir,
+            &expected_board_device_id,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(UsbActivateResidentResult {
+        ok: !matches!(outcome, usb_serial::P4ResidentActivation::NotResident),
+        state: match outcome {
+            usb_serial::P4ResidentActivation::AlreadyActive => "active",
+            usb_serial::P4ResidentActivation::Activated => "activated",
+            usb_serial::P4ResidentActivation::NotResident => "notResident",
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -10778,6 +10889,8 @@ pub fn run() {
             inspect_p4_appearance,
             usb_cancel_appearance_sync,
             usb_sync_appearance,
+            usb_activate_resident_appearance,
+            usb_send_agent_focus,
             resolve_builtin_clawpkg_path,
             install_clawpkg_over_usb,
             install_clawpkg_over_ssh,
@@ -12827,6 +12940,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_focus_payload_carries_the_focus_and_never_splits_a_character() {
+        let payload = build_agent_focus_payload("claude-code", "Claude", 2, 3, true);
+        assert_eq!(payload["agentId"], "claude-code");
+        assert_eq!((payload["label"].as_str(), payload["index"].as_u64(), payload["count"].as_u64()), (Some("Claude"), Some(2), Some(3)));
+        assert_eq!(payload["hint"], true);
+        // 30 three-byte characters are 90 bytes; the cut falls on a boundary at or below 60 bytes.
+        let long = "宠".repeat(30);
+        let cut = build_agent_focus_payload("codex", &long, 1, 2, false);
+        let label = cut["label"].as_str().unwrap();
+        assert!(label.len() <= AGENT_FOCUS_LABEL_MAX_BYTES && label.chars().all(|c| c == '宠'), "{label}");
+        assert_eq!(label.len(), 60);
+    }
+
+    #[test]
+    fn default_appearance_is_encoded_to_the_slot_budget_when_the_device_has_no_factory_slot() {
+        assert!(builtin_terrier_needs_prepared_pack(true, true), "customised: always prepared");
+        assert!(builtin_terrier_needs_prepared_pack(false, false), "no factory slot: cannot send the bundled pack");
+        assert!(!builtin_terrier_needs_prepared_pack(false, true), "factory slot present: activate or send as bundled");
+    }
+
+    #[test]
     fn builtin_sync_reuses_valid_pack_without_preparing_or_ffmpeg() {
         let temp = tempfile::tempdir().unwrap();
         let prepared = prepare_builtin_p4_if_stale(temp.path(), true, || {
@@ -13979,6 +14113,9 @@ mod tests {
         assert!(is_allowed_button_config_event("joystick.down"));
         assert!(is_allowed_button_config_action("session_next"));
         assert!(is_allowed_button_config_action("session_previous"));
+        assert!(is_allowed_button_config_action("agent_next"));
+        assert!(is_allowed_button_config_action("agent_previous"));
+        assert!(!is_allowed_button_config_action("agent_other"));
         assert!(is_allowed_button_config_action("session_clear"));
         assert!(is_allowed_button_config_action("miniapp_screen_tap"));
         assert!(is_allowed_button_config_action("miniapp_screen_long_press"));

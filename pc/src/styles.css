@@ -13938,6 +13938,63 @@ select:focus-visible {
   }
 }
 
+.channel-row__follow {
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.channel-row__also-follow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.channel-row.is-focus {
+  border-color: var(--accent);
+}
+
+.channel-matrix__focus {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+}
+
+.channel-matrix__focus-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 220px;
+}
+
+.channel-matrix__focus-copy span {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.channel-matrix__focus-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.channel-matrix__resident {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
 @media (max-width: 600px) {
   .channel-row {
     grid-template-columns: minmax(0, 1fr) auto;

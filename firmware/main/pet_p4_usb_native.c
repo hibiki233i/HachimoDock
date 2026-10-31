@@ -82,6 +82,8 @@ static unsigned long long g_expected_size;
 static unsigned long long g_received_size;
 static unsigned long long g_transfer_last_activity_ms;
 static int g_target_slot = -1;
+/* Slot named by the transfer's first file-begin; -1 keeps the legacy custom slot. */
+static int g_requested_slot = -1;
 
 static unsigned long long native_now_ms(void) {
   return (unsigned long long) (esp_timer_get_time() / 1000ULL);
@@ -228,9 +230,9 @@ static bool clear_slot_files(int slot) {
     }
     closedir(dir);
     if (!found) {
-      if (slot == PET_P4_RAW_APPEARANCE_SLOT && pet_p4_raw_assets_available()) {
+      if (pet_p4_raw_assets_slot_available(slot)) {
         char error[96];
-        if (!pet_p4_raw_assets_invalidate(error, sizeof(error))) {
+        if (!pet_p4_raw_assets_invalidate(slot, error, sizeof(error))) {
           ESP_LOGE(TAG, "failed to invalidate native raw slot: %s", error);
           return false;
         }
@@ -248,7 +250,9 @@ static bool clear_slot_files(int slot) {
 
 static bool ensure_transfer_slot(const char *transfer_id) {
   if (g_target_slot < 0 || strcmp(g_cleaned_transfer_id, transfer_id ? transfer_id : "") != 0) {
-    g_target_slot = PET_P4_RAW_APPEARANCE_SLOT;
+    int slot = g_requested_slot >= 0 ? g_requested_slot : PET_P4_RAW_APPEARANCE_SLOT;
+    if (!pet_p4_asset_slot_is_transfer_target(slot)) return false;
+    g_target_slot = slot;
     if (!clear_slot_files(g_target_slot)) return false;
     snprintf(g_cleaned_transfer_id, sizeof(g_cleaned_transfer_id), "%s", transfer_id ? transfer_id : "");
   }
@@ -273,6 +277,18 @@ static void handle_file_begin(const uint8_t *payload, uint32_t len) {
                    "device firmware update or reboot is active");
     cJSON_Delete(root);
     return;
+  }
+  {
+    const cJSON *slot_item = cJSON_GetObjectItemCaseSensitive(root, "slot");
+    int requested = cJSON_IsNumber(slot_item) ? slot_item->valueint : -1;
+    bool same_transfer = g_target_slot >= 0 && strcmp(g_cleaned_transfer_id, transfer_id) == 0;
+    if (same_transfer && requested >= 0 && requested != g_target_slot) {
+      send_asset_ack(transfer_id, "file-begin", path, false,
+                     "appearance slot cannot change during a transfer");
+      cJSON_Delete(root);
+      return;
+    }
+    if (!same_transfer) g_requested_slot = requested;
   }
   if (!ensure_transfer_slot(transfer_id) ||
       !pet_p4_asset_fs_path_for_slot(g_target_slot, path, true, tmp_path, sizeof(tmp_path))) {
@@ -416,6 +432,7 @@ static bool handle_asset_abort_json(const uint8_t *payload, uint32_t len) {
   g_expected_size = 0;
   g_received_size = 0;
   g_target_slot = -1;
+  g_requested_slot = -1;
   g_transfer_last_activity_ms = 0;
   if (g_state) g_state->asset_transfer_active = false;
   send_asset_ack(transfer_id, "abort", NULL, true, NULL);
@@ -444,6 +461,7 @@ void pet_p4_native_usb_process(unsigned long long now_ms) {
   g_expected_size = 0;
   g_received_size = 0;
   g_target_slot = -1;
+  g_requested_slot = -1;
   g_transfer_last_activity_ms = 0;
   g_state->asset_transfer_active = false;
 }

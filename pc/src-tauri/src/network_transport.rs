@@ -114,9 +114,13 @@ const NETWORK_TOPICS: &[&str] = &[
     "system/heartbeat",
     "speech/text",
     "session/current",
+    "agent/focus",
     "control/screen-page",
     "stats/update",
     "runtime/stats",
+    // Switching between appearances already stored in the slots moves no asset bytes.
+    "asset/activate",
+    "asset/slot-query",
 ];
 const NETWORK_TOPIC_PREFIXES: &[&str] = &["state/", "diagnostics/", "network/"];
 
@@ -843,11 +847,12 @@ mod tests {
 
     #[test]
     fn only_status_session_and_key_traffic_is_allowed_over_wifi() {
-        for topic in ["state/active", "session/current", "speech/text", "system/heartbeat", "bind",
-                      "control/screen-page", "stats/update", "diagnostics/query", "network/status"] {
+        for topic in ["state/active", "session/current", "agent/focus", "speech/text", "system/heartbeat", "bind",
+                      "control/screen-page", "stats/update", "diagnostics/query", "network/status",
+                      "asset/activate", "asset/slot-query"] {
             assert!(topic_allowed_over_network(topic), "{topic}");
         }
-        for topic in ["asset/chunk", "asset/raw-chunk", "firmware/begin", "audio/conversation",
+        for topic in ["asset/begin", "asset/chunk", "asset/raw-chunk", "asset/commit", "asset/abort", "firmware/begin", "audio/conversation",
                       "media/begin", "widget/data", "widget/chunk", "app/snapshot",
                       "ui/conversation", "input/config", "debug/screenshot", "miniapp/event",
                       "control/command"] {

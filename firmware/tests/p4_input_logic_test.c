@@ -1,7 +1,8 @@
 /*
  * [Input] Deterministic centered and directional joystick samples.
  * [Output] Assertions for center-aware four-way hysteresis, limited-travel
- *          direction recognition, dominant-axis resolution, and held repeat.
+ *          direction recognition, dominant-axis resolution, held repeat, and
+ *          the page routing of the Agent previous/next keys.
  * [Pos] Native C regression executable for P4 input logic.
  * [Sync] If this file changes, update `p4_input_logic_test.py` and the decoder.
  */
@@ -68,6 +69,18 @@ int main(void) {
   assert(pet_p4_joystick_decoder_update(&joystick, 3500, 3100, 10) == PET_P4_JOYSTICK_RIGHT);
   assert(pet_p4_joystick_decoder_update(&joystick, 3500, 3100, 140) == PET_P4_JOYSTICK_RIGHT);
   release_to_center(&joystick);
+
+  // Joystick left/right: Agent switch only on the main page with two or more followed Agents.
+  assert(pet_p4_agent_key_route("main", true, true) == PET_P4_AGENT_KEY_AGENT);
+  assert(pet_p4_agent_key_route("main", true, false) == PET_P4_AGENT_KEY_SESSION);
+  assert(pet_p4_agent_key_route("main", false, true) == PET_P4_AGENT_KEY_SESSION);
+  assert(pet_p4_agent_key_route("main", false, false) == PET_P4_AGENT_KEY_SESSION);
+  assert(pet_p4_agent_key_route("components", true, true) == PET_P4_AGENT_KEY_CATALOG);
+  assert(pet_p4_agent_key_route("components", false, false) == PET_P4_AGENT_KEY_CATALOG);
+  assert(pet_p4_agent_key_route("app", true, true) == PET_P4_AGENT_KEY_NONE);
+  assert(pet_p4_agent_key_route("touch_test", false, true) == PET_P4_AGENT_KEY_NONE);
+  assert(pet_p4_agent_key_route("", true, true) == PET_P4_AGENT_KEY_NONE);
+  assert(pet_p4_agent_key_route(NULL, true, true) == PET_P4_AGENT_KEY_NONE);
 
   return 0;
 }

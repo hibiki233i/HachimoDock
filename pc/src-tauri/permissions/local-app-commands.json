@@ -107,6 +107,8 @@
           "inspect_p4_appearance",
           "usb_cancel_appearance_sync",
           "usb_sync_appearance",
+          "usb_activate_resident_appearance",
+          "usb_send_agent_focus",
           "resolve_builtin_clawpkg_path",
           "install_clawpkg_over_usb",
           "install_clawpkg_over_ssh",

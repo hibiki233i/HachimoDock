@@ -6,9 +6,12 @@
  */
 
 import React, { useCallback, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   CheckCircle,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Braces,
   Code,
   Loader,
@@ -29,6 +32,8 @@ import {
 } from "../lib/desktop-pet-assignment.js";
 import AppearancePreview from "../AppearancePreview.jsx";
 import { resolveDashboardPreviewMedia } from "../lib/appearance-preview.js";
+import { preloadResidentAppearance } from "../lib/resident-appearance.js";
+import { useAgentFocusContext } from "./AgentFocusContext.js";
 import { useDeviceContext } from "../shell/DeviceContext.jsx";
 import Button from "../shell/Button.jsx";
 import { useToast } from "../shell/ToastStack.jsx";
@@ -82,9 +87,15 @@ export default function ChannelMatrixCard() {
     applyDesktopPet,
     cancelAppearanceSync,
     saveAgentAppearance,
+    deviceFollowAgents,
+    setDeviceFollowAgent,
+    petFollowMode,
+    setPetFollowMode,
   } = useDeviceContext();
+  const focus = useAgentFocusContext();
   const { push } = useToast();
 
+  const [followBusyId, setFollowBusyId] = useState("");
   const [pickerState, setPickerState] = useState(null); // { agentId }
   const [pendingFollow, setPendingFollow] = useState(null); // { agentId, appearance }
   const syncing = appearanceSync?.pending === true;
@@ -190,6 +201,46 @@ export default function ChannelMatrixCard() {
     }
   }, [agentOptions, applyDesktopPet, currentDisplay.appearance?.id, pendingFollow, push]);
 
+  // Opting an Agent in stores its pet on the board first, so the focus can switch to it later without a
+  // transfer. That needs USB; opting out only changes the follow set.
+  const handleToggleDeviceFollow = useCallback(async (agent, checked) => {
+    if (!checked) {
+      setDeviceFollowAgent(agent.id, false);
+      return;
+    }
+    if (!usb?.connected || usb.transport === "wifi") {
+      push({
+        tone: "warning",
+        title: "加入同时跟随需要 USB 连接",
+        message: "要先把该 Agent 的桌宠存入设备，之后才能在 USB 或 WiFi 下自动切换。",
+      });
+      return;
+    }
+    const appearance = appearanceForAgent(agent.id);
+    if (!appearance) return;
+    setFollowBusyId(agent.id);
+    try {
+      const outcome = await preloadResidentAppearance({
+        invoke,
+        appearanceId: appearance.id,
+        boardDeviceId: usb.boardDeviceId,
+        restoreAppearanceId: currentDisplay.appearance?.id || "",
+      });
+      if (!outcome.ok) {
+        push({ tone: "error", title: "无法把桌宠存入设备", message: outcome.error });
+        return;
+      }
+      setDeviceFollowAgent(agent.id, true);
+      push({
+        tone: "success",
+        title: `已把「${appearance.name}」存入设备`,
+        message: `${agent.label} 比其他 Agent 更早活跃时，设备会自动切换到它的桌宠。`,
+      });
+    } finally {
+      setFollowBusyId("");
+    }
+  }, [appearanceForAgent, currentDisplay.appearance?.id, push, setDeviceFollowAgent, usb]);
+
   const handleCancelAppearanceSync = useCallback(async () => {
     try {
       await cancelAppearanceSync();
@@ -241,6 +292,48 @@ export default function ChannelMatrixCard() {
         </div>
       )}
 
+      {focus.followAgentIds.length > 1 && (
+        <div className="channel-matrix__focus" aria-live="polite">
+          <div className="channel-matrix__focus-copy">
+            <strong>设备当前显示：{channelLabelForId(agentOptions, focus.focusAgentId)}</strong>
+            <span>
+              {focus.mode === "pinned" ? "已手动固定" : "自动：最先活跃的 Agent 优先，多个同时活跃时不抢占"}
+            </span>
+          </div>
+          <div className="channel-matrix__focus-actions">
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => focus.step(-1)}
+              aria-label="切换到上一个 Agent"
+            >
+              <ChevronLeft size={14} />
+            </button>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => focus.step(1)}
+              aria-label="切换到下一个 Agent"
+            >
+              <ChevronRight size={14} />
+            </button>
+            {focus.mode === "pinned" && (
+              <button type="button" className="btn-secondary btn-sm" onClick={focus.release}>
+                恢复自动
+              </button>
+            )}
+          </div>
+          <label className="channel-matrix__resident">
+            <input
+              type="checkbox"
+              checked={petFollowMode === "resident"}
+              onChange={(event) => setPetFollowMode(event.target.checked ? "resident" : "follow")}
+            />
+            桌宠常驻（切换 Agent 时不换形象）
+          </label>
+        </div>
+      )}
+
       {visibleAgents.length === 0 ? (
         <div className="channel-matrix__empty">暂时无法读取本机 Agent 列表。</div>
       ) : (
@@ -250,10 +343,12 @@ export default function ChannelMatrixCard() {
             const appearance = appearanceForAgent(agent.id);
             const isFollowed = activeAgentId === agent.id;
             const isDetected = agent.detected === true;
+            const alsoFollowed = (deviceFollowAgents || []).includes(agent.id);
+            const isFocus = focus.followAgentIds.length > 1 && focus.focusAgentId === agent.id;
             return (
               <article
                 key={agent.id}
-                className={`channel-row${isFollowed ? " is-active" : ""}${isDetected ? "" : " is-undetected"}`}
+                className={`channel-row${isFollowed ? " is-active" : ""}${isFocus ? " is-focus" : ""}${isDetected ? "" : " is-undetected"}`}
                 aria-current={isFollowed ? "true" : undefined}
               >
                 <div className="channel-row__channel">
@@ -262,6 +357,7 @@ export default function ChannelMatrixCard() {
                     <strong>{agent.label}</strong>
                     <span className="channel-row__status" title={agent.detail || undefined}>
                       {isDetected ? "已检测" : "未检测到客户端或 CLI"}
+                      {isFocus ? " · 设备正在显示" : ""}
                     </span>
                   </div>
                 </div>
@@ -312,6 +408,20 @@ export default function ChannelMatrixCard() {
                     >
                       跟随
                     </button>
+                  )}
+                  {!isFollowed && isDetected && (
+                    <label
+                      className="channel-row__also-follow"
+                      title="让设备同时跟随这个 Agent：它的桌宠会存入设备，活跃时自动切换"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={alsoFollowed}
+                        disabled={syncing || followBusyId !== ""}
+                        onChange={(event) => handleToggleDeviceFollow(agent, event.target.checked)}
+                      />
+                      {followBusyId === agent.id ? "存入设备…" : "同时跟随"}
+                    </label>
                   )}
                 </div>
               </article>

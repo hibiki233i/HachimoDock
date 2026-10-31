@@ -93,7 +93,9 @@ encrypted**: use trusted networks.
 parsed as a command. A client that attaches starts with an empty line buffer.
 
 **Allowed topics.** Desktop to board: `ack, bind, system/heartbeat, speech/text, session/current,
-control/screen-page, stats/update, runtime/stats, state/*, diagnostics/*, network/*`.
+agent/focus, control/screen-page, stats/update, runtime/stats, asset/activate, asset/slot-query, state/*,
+diagnostics/*, network/*`. `asset/activate` and `asset/slot-query` only switch between packs already
+stored in the appearance slots, so no asset bytes cross the LAN; every other `asset/*` topic stays USB-only.
 Anything else is answered `protocol/ack {ok:false, code:"wifi_unsupported"}`, including
 `control/command`: its `audio_bridge` variant would arm the microphone on the LAN link. Board to desktop
 broadcasts: `input/*, session/*, protocol/*, diagnostics/*, network/*, button-config-ack`; audio,
@@ -191,7 +193,7 @@ Board to PC:
       "nativeUsb": true,
       "nativeProtocol": "pet-usb-native-v1",
       "bulk": true,
-      "maxAppearanceSlots": 2,
+      "maxAppearanceSlots": 3,
       "appearanceSlotReuse": true,
       "rawAppearanceSlot1": true,
       "transport": {
@@ -282,12 +284,13 @@ Board to PC:
       "screenshot": true,
       "appearance": {
         "formats": ["p4-h264-v1", "p4-mjpeg-v1", "p4-pcm-wav-v1"],
-        "maxSlots": 2,
+        "maxSlots": 3,
+        "slotCapacityBytes": [5238784, 5238784, 5238784],
         "slotReuse": true,
         "rawSlot1": true,
         "builtinSlot": 0,
         "customSlot": 1,
-        "builtinProtected": true,
+        "builtinProtected": false,
         "mp4": false,
         "audio": true
       },
@@ -422,13 +425,13 @@ Normal boot uses `format_if_mount_failed=false`. A damaged or mismatched SPIFFS
 volume is preserved and reported as a mount failure; only an explicit factory
 recovery/erase operation may format or replace it.
 
-Appearance slot `0` is the protected factory Westie pack. All non-built-in
-appearance transfers, including customized Westie videos, audio, or quality, target replaceable slot `1` and atomically switch the
-active marker only after commit. Before `asset/begin` is acknowledged,
-firmware clears slot `1` using a fresh SPIFFS directory scan after every
-deletion; cleanup failure rejects the transfer instead of leaving skipped stale
-files to consume the next pack's capacity. This path never erases protected
-slot `0`. Each H.264 stream is limited to 2 MiB in both manifest validation and rendering
+Appearance packs live in up to three equal 5 MiB slots (see Multiple appearance slots
+below). Every slot is an ordinary replaceable slot; the factory image may preload default
+pets into them but nothing is protected. A transfer targets the slot named by `asset/begin`
+(default: slot `1`) and atomically switches the active marker only after commit. Before
+`asset/begin` is acknowledged, firmware clears the target slot using a fresh SPIFFS directory
+scan after every deletion; cleanup failure rejects the transfer instead of leaving skipped
+stale files to consume the next pack's capacity. Other slots are never erased. Each H.264 stream is limited to 2 MiB in both manifest validation and rendering
 (earlier firmware accepted up to 4 MiB in manifest validation). The manifest is validated
 as a unit: one H.264 stream above the limit fails the whole manifest, and firmware clears a
 manifest it cannot use. The desktop rejects such streams while preparing a pack, so only a
@@ -437,6 +440,35 @@ replaces it. Legacy `p4-mjpeg-v1` totals are not subject to this limit.
 When the active slot contains a valid pre-ready-marker manifest with a
 deterministic `packId`, startup promotes that same slot by writing its ready
 marker. It does not clear either slot during migration.
+
+**Multiple appearance slots.** Firmware supports up to `PET_P4_APPEARANCE_SLOT_COUNT`
+(3) raw slots, mapped to partitions `appearance0`…`appearance2` (5 MiB each; the last 5 MiB of
+flash is left unassigned for a later upgrade). A slot whose partition does not exist is
+unavailable. `capabilities.maxAppearanceSlots` and `appearance.maxSlots` report the number of
+slots that actually exist, and `appearance.slotCapacityBytes` lists each slot's usable bytes
+(`0` when absent) so the desktop budgets a pack per slot instead of assuming one size.
+`asset/begin` (serial) and the native-USB `file-begin` frame accept an optional integer `slot`.
+Without it the transfer targets the legacy custom slot `1`, so older desktops are unaffected.
+A named slot must exist and is written through the raw path only (SPIFFS staging remains slot
+`1`'s fallback); an unknown slot or a missing partition fails with `slot prepare failed` /
+`unsupported p4 asset path` before anything is erased, and a native transfer cannot change its
+slot after its first file. Videos reach the raw partition through the serial `asset/raw-chunk`
+path; the manifest, audio cues and ready markers are SPIFFS files named per slot (`s<N>_…`), so a
+complete transfer to one slot must name that slot in both. `asset/commit` activates the slot the
+transfer targeted, and `asset/slot-query` / `asset/activate` address any slot by number and
+`packId`. `PET_P4_BUILTIN_SLOT_PROTECTED` is `0`, so `builtinProtected` is `false`: there is no
+factory pack to protect and the desktop must not offer a built-in restore.
+The desktop budgets each pack against the slot it targets (`slotCapacityBytes`) and chooses that
+slot itself: the slot the appearance used last time, else the lowest empty slot, else the slot synced
+longest ago that is not on screen. While the target is rewritten it first activates another slot that
+holds a valid pack, so the board keeps showing a pet. `asset/slot-query` followed by `asset/activate`
+switches between resident packs and is also accepted over Wi-Fi.
+The factory image (`tools/build_factory_image.py`) preloads default pets, each in its own slot,
+from `appearances` in `factory-config.json` (empty in the repository) or a git-ignored
+`factory-config.local.json`; the first listed pet is the active one at first boot. With no
+pet installed, the board shows an import hint (monitor, USB cable, board and the line "还没有桌宠")
+once 2.5 seconds after boot have passed and the manifest is empty. A partition table with more
+or larger slots needs a full USB flash because it cannot change through application OTA.
 Every current manifest carries a deterministic SHA-256 `packId` over its
 non-manifest payload. `asset/slot-query` returns the active slot and the
 validated `packId` stored in each slot. If the requested pack is already in the
@@ -717,6 +749,39 @@ change:
 }
 ```
 
+## Agent focus and the joystick Agent switch
+
+The desktop may follow several Agents while the board shows one pet at a time. The Agent the board
+currently shows is the focus Agent; the desktop decides it (the earliest active Agent, or a manual
+choice) and pushes only that Agent's Sessions, so firmware without this feature keeps working.
+
+`agent/focus` (desktop to board, also accepted over Wi-Fi):
+
+```json
+{"topic":"agent/focus","payload":{"agentId":"claude-code","label":"Claude","index":2,"count":3,"hint":true}}
+```
+
+`count` is the number of followed Agents (capped at 8), `index` the focus Agent's 1-based place among
+them, `label` its display name (up to 63 bytes, cut on a character boundary by the desktop), and
+`hint:true` asks for a short on-screen label (`Claude  2/3`, 1.8 seconds, at y=60 of the logical
+canvas) after a switch. The desktop repeats the announcement every 15 seconds with `hint:false`
+because the board forgets it on reboot.
+
+**`agent_previous` / `agent_next`** are input actions. Their defaults are joystick left/right
+(`knob.rotate_ccw` / `knob.rotate_cw`); input config version 10 migrates a stored config whose
+left/right still hold the version-9 Session defaults and leaves custom mappings alone. Behaviour by page:
+
+| Page | Result |
+| --- | --- |
+| `main`, desktop connected and `count >= 2` | not handled locally: the board reports `input/event` with `action:"agent_next"`, `handledLocally:false`, `context:"main"`; the desktop steps the focus and answers with `agent/focus` |
+| `main`, otherwise | the key keeps its Session meaning and is reported as `session_next` / `session_previous` |
+| `components` | selects the previous/next component, exactly like `session_*` |
+| `app` and diagnostic pages | no local effect; the event is reported with its page in `context` and the desktop ignores it |
+
+Component packages cannot own these actions, like the other navigation actions. A desktop that never
+sends `agent/focus` therefore leaves left/right selecting Sessions, as before. Firmware older than version 10
+rejects an `input/config` that names an Agent action, so update both together.
+
 ## A/B Firmware Update
 
 The PC serializes firmware updates with other large transfers and binds every
@@ -804,8 +869,8 @@ PC to board:
       {"event":"button.encoder.short_press","action":"page_enter","value":""},
       {"event":"button.encoder.long_press","action":"disabled","value":""},
       {"event":"button.encoder.hold","action":"disabled","value":""},
-      {"event":"knob.rotate_ccw","action":"session_previous","value":""},
-      {"event":"knob.rotate_cw","action":"session_next","value":""},
+      {"event":"knob.rotate_ccw","action":"agent_previous","value":""},
+      {"event":"knob.rotate_cw","action":"agent_next","value":""},
       {"event":"joystick.up","action":"session_previous","value":""},
       {"event":"joystick.down","action":"session_next","value":""}
     ]
@@ -814,7 +879,7 @@ PC to board:
 ```
 
 Allowed actions are `disabled`, `voice_ptt`, `agent_enter`, `agent_prompt`,
-`session_next`, `session_previous`, `session_clear`, `miniapp_screen_tap`,
+`session_next`, `session_previous`, `agent_next`, `agent_previous`, `session_clear`, `miniapp_screen_tap`,
 `miniapp_screen_long_press`, `component_center`, `miniapp_action`,
 `page_toggle`, `page_enter`, `page_back`, `page_main`, and `page_app`.
 The firmware keeps this full set for stored-config and component compatibility.
@@ -834,8 +899,10 @@ press, whose hidden `.hold` transport defaults to `voice_ptt`. Joystick left
 and right deliberately retain `knob.rotate_ccw` / `knob.rotate_cw` event names,
 so old component packages continue to work without conversion. Inside the
 catalog, previous/next selects the prior/following catalog entry. On `main`, the
-same actions select Session bubbles. Neither action changes the two-dot peer
-page; SW2 does that. While `app` is open, component bindings—including SW2—retain priority.
+same actions select Session bubbles, except `agent_previous` / `agent_next`
+(joystick left/right since input config version 10) which switch the focus Agent
+when the desktop follows two or more (see below). Neither action changes the
+two-dot peer page; SW2 does that. While `app` is open, component bindings—including SW2—retain priority.
 New packages may bind `joystick.up` and `joystick.down`.
 
 `page_toggle` switches between `main` and `components`; from `app` it returns to
@@ -1272,7 +1339,7 @@ with only animated working markers redrawn per frame.
 
 设备能力 `appearance.systemCues: true` 表示 manifest 可声明 `systemCues: true` 且不携带默认 WAV；该位只是 manifest 契约，保持为 `true` 以兼容桌面端校验。**固件不再内置默认完成、错误、等待用户音效**（为 WiFi 协议栈让出约 240 KB 的 OTA 空间）：没有专属音效的形象保持静音。`families[].audioPath` 配合 `audioSource: "custom"` 的专属音效照常播放；已知旧默认 WAV 仍按内容指纹识别并跳过（不再回退到公共音效），不按文件名猜测用户音效。
 
-内置形象切换使用现有 `asset/slot-query` 与 `asset/activate`：仅对设备声明 `builtinProtected` 的内置形象请求，选择有效 slot 0，并使用设备返回的 packId 激活；不要求与 PC 内置 packId 相等。槽位无效时停止并报错，不能回退成写入自定义槽位。普通自定义包仍严格校验 packId。
+（本 fork 的固件不再声明 `builtinProtected`，没有内置形象，下述流程不可用。）内置形象切换使用现有 `asset/slot-query` 与 `asset/activate`：仅对设备声明 `builtinProtected` 的内置形象请求，选择有效 slot 0，并使用设备返回的 packId 激活；不要求与 PC 内置 packId 相等。槽位无效时停止并报错，不能回退成写入自定义槽位。普通自定义包仍严格校验 packId。
 # 原生敲击组件能力（0.7.70-p4）
 
 设备通过 `widgetInstrument: p4-instrument-v1` 声明本地敲击音源支持。受控组件使用 `instrument.source = percussion.wooden-fish`，`instrument.strike` 只由绑定按键触发；`effect_volume` 和 `ambience_volume` 为 0–100 的整数。缺少能力声明时 PC 阻止安装并提示升级，不模拟成功。组件退出淡出，录音、实时对话和媒体流优先；音频不需要新增 USB 流协议。
