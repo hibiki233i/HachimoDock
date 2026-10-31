@@ -190,9 +190,10 @@ export function petAppearanceAgentId(state, petFollowMode, residentAgentId = "")
  * `follow` mode the focus Agent's appearance is shown unless it already is, or no appearance is
  * assigned to that Agent.
  */
-export function planPetSwitch({ state, petFollowMode, residentAgentId = "", agentAppearanceMap = {}, shownAppearanceId = "" }) {
+export function planPetSwitch({ state, petFollowMode, residentAgentId = "", agentAppearanceMap = {}, shownAppearanceId = "", defaultAppearanceId = "" }) {
   const agentId = petAppearanceAgentId(state, petFollowMode, residentAgentId);
-  const appearanceId = agentId ? agentAppearanceMap?.[agentId] || "" : "";
+  // An Agent without a saved pick shows `defaultAppearanceId`, the same fallback the matrix preloads with.
+  const appearanceId = agentId ? agentAppearanceMap?.[agentId] || defaultAppearanceId : "";
   if (normalizePetFollowMode(petFollowMode) === PET_FOLLOW_MODE_RESIDENT || !appearanceId || appearanceId === shownAppearanceId) {
     return { switchNeeded: false, agentId, appearanceId: shownAppearanceId };
   }

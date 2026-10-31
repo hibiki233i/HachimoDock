@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { planPetSwitch } from "../lib/agent-focus.js";
+import { BUILTIN_TERRIER_APPEARANCE_ID } from "../lib/builtin-appearances.js";
 import { createPetFollowController } from "../lib/resident-appearance.js";
 
 export function usePetFollowSwitch({
@@ -34,6 +35,7 @@ export function usePetFollowSwitch({
   useEffect(() => {
     const plan = planPetSwitch({
       state: { focusAgentId }, petFollowMode, residentAgentId, agentAppearanceMap,
+      defaultAppearanceId: BUILTIN_TERRIER_APPEARANCE_ID,
     });
     controller.setTarget({ enabled, boardDeviceId, appearanceId: plan.switchNeeded ? plan.appearanceId : "" });
   }, [controller, enabled, boardDeviceId, focusAgentId, petFollowMode, residentAgentId, agentAppearanceMap, shownAppearanceId]);

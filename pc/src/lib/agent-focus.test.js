@@ -219,6 +219,8 @@ test("a focus change switches the pet only in follow mode and only to a differen
   assert.equal(planPetSwitch({ state: focus, petFollowMode: "resident", residentAgentId: "codex", agentAppearanceMap: map, shownAppearanceId: "pet-a" }).switchNeeded, false);
   assert.equal(planPetSwitch({ state: { ...focus, focusAgentId: "openclaw" }, petFollowMode: "follow", agentAppearanceMap: map, shownAppearanceId: "pet-a" }).switchNeeded, false, "no appearance assigned");
   assert.equal(planPetSwitch({ state: createAgentFocusState(), petFollowMode: "follow", agentAppearanceMap: map }).switchNeeded, false, "no focus yet");
+  const unmapped = planPetSwitch({ state: { ...focus, focusAgentId: "openclaw" }, petFollowMode: "follow", agentAppearanceMap: map, shownAppearanceId: "pet-a", defaultAppearanceId: "builtin" });
+  assert.deepEqual([unmapped.switchNeeded, unmapped.appearanceId], [true, "builtin"], "unmapped Agent falls back to the default pet");
 });
 
 test("with nobody active the focus starts on the preferred followed Agent, not the first in the list", () => {
