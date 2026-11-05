@@ -101,6 +101,7 @@ mod smart_home;
 mod smart_home_credentials;
 mod llm_network;
 mod generation_diagnostics;
+mod generation_http;
 #[cfg(test)]
 mod generation_probe_tests;
 mod service_credentials;
@@ -6196,12 +6197,13 @@ async fn detect_local_agents() -> Result<AgentDiscoveryResponse, String> {
 /// server returns header values containing bytes > 0xFF (e.g. non-ASCII
 /// `Content-Disposition` filenames from Volcano TOS CDN).
 #[tauri::command]
-async fn download_bytes(url: String) -> Result<Vec<u8>, String> {
+async fn download_bytes(url: String, timeout_ms: Option<u64>, max_bytes: Option<u64>) -> Result<Vec<u8>, String> {
     eprintln!("[download_bytes] GET");
     let started = std::time::Instant::now();
-    let mut diagnostic = generation_diagnostics::Record::new("download", 120_000);
+    let timeout_ms = timeout_ms.unwrap_or(120_000).clamp(1, 120_000);
+    let mut diagnostic = generation_diagnostics::Record::new("download", timeout_ms);
     let result = async {
-        let client = llm_network::download_client(Duration::from_secs(120))?;
+        let client = llm_network::download_client(Duration::from_millis(timeout_ms))?;
         diagnostic.phase = "request_wait".into();
         let response = client
             .get(&url)
@@ -6216,10 +6218,15 @@ async fn download_bytes(url: String) -> Result<Vec<u8>, String> {
                 status.as_u16()
             ));
         }
-        let bytes = response.bytes().await.map_err(|e| diagnostic.transport_error(&e))?;
+        let bytes = if let Some(limit) = max_bytes {
+            generation_http::read_image_bytes_bounded(response, &mut diagnostic,
+                limit.clamp(1, generation_http::MAX_RESPONSE_BYTES as u64) as usize).await?
+        } else {
+            response.bytes().await.map_err(|e| diagnostic.transport_error(&e))?.to_vec()
+        };
         diagnostic.phase = "complete".into();
         diagnostic.outcome = "success".into();
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }.await;
     if diagnostic.outcome == "pending" { diagnostic.outcome = "configuration_error".into(); }
     diagnostic.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -6269,7 +6276,7 @@ async fn http_request_text(
     // Never log URLs: provider/CDN queries can carry signed credentials.
     eprintln!("[http_request_text] request");
     let started = std::time::Instant::now();
-    let timeout_ms = timeout_ms.unwrap_or(120_000).max(1);
+    let timeout_ms = generation_http::request_timeout_ms(timeout_ms, diagnostic_stage.as_deref(), &method);
     let mut diagnostic = generation_diagnostics::Record::new(diagnostic_stage.as_deref().unwrap_or("other"), timeout_ms);
     let result: Result<HttpTextResponse, String> = async {
         let client = llm_network::client(Duration::from_millis(timeout_ms))?;
@@ -6290,9 +6297,7 @@ async fn http_request_text(
         let response = request.send().await.map_err(|e| diagnostic.transport_error(&e))?;
         let status = response.status();
         diagnostic.headers(&response);
-        let body = response
-            .text().await
-            .map_err(|e| diagnostic.transport_error(&e))?;
+        let body = generation_http::read_text_bounded(response, &mut diagnostic).await?;
         diagnostic.phase = "complete".into();
         if !status.is_success() { diagnostic.error_body_id(&body); }
         diagnostic.finish(started, if status.is_success() { "success" } else { "http_error" });
