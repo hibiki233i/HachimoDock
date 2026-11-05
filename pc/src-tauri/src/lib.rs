@@ -6879,15 +6879,35 @@ fn parse_firmware_version(value: &str) -> Option<Vec<u64>> {
     Some(parts)
 }
 
+/// Build revision `-rNNN` of a P4 label (`0.7.103-p4-r144`, `0.7.103-p4-r142-framework`).
+/// Labels without one count as revision 0, so a revisioned build of the same numeric
+/// core is newer than an unrevisioned one. Mirrors `pc/src/lib/firmware-version.js`.
+fn parse_firmware_revision(value: &str) -> u64 {
+    value
+        .trim()
+        .split('-')
+        .skip(1)
+        .find_map(|segment| {
+            let digits = segment.strip_prefix('r')?;
+            if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            digits.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+}
+
 fn compare_firmware_versions(left: &str, right: &str) -> Result<VersionOrdering, String> {
-    let mut left = parse_firmware_version(left)
+    let mut left_parts = parse_firmware_version(left)
         .ok_or_else(|| format!("invalid device firmware version: {left}"))?;
-    let mut right = parse_firmware_version(right)
+    let mut right_parts = parse_firmware_version(right)
         .ok_or_else(|| format!("invalid bundled firmware version: {right}"))?;
-    let width = left.len().max(right.len());
-    left.resize(width, 0);
-    right.resize(width, 0);
-    Ok(left.cmp(&right))
+    let width = left_parts.len().max(right_parts.len());
+    left_parts.resize(width, 0);
+    right_parts.resize(width, 0);
+    Ok(left_parts
+        .cmp(&right_parts)
+        .then_with(|| parse_firmware_revision(left).cmp(&parse_firmware_revision(right))))
 }
 
 fn bundled_p4_firmware_path(app_handle: &tauri::AppHandle, resource: &str) -> Result<PathBuf, String> {
@@ -13202,6 +13222,20 @@ mod tests {
             VersionOrdering::Greater
         );
         assert!(compare_firmware_versions("unknown", "0.7.29-p4").is_err());
+        assert_eq!(parse_firmware_revision("0.7.103-p4-r142-framework"), 142);
+        assert_eq!(parse_firmware_revision("0.7.34-p4"), 0);
+        assert_eq!(
+            compare_firmware_versions("0.7.103-p4-r66", "0.7.103-p4-r144").unwrap(),
+            VersionOrdering::Less
+        );
+        assert_eq!(
+            compare_firmware_versions("0.7.104-p4", "0.7.104-p4-r180").unwrap(),
+            VersionOrdering::Less
+        );
+        assert_eq!(
+            compare_firmware_versions("0.7.104-p4-r1", "0.7.103-p4-r144").unwrap(),
+            VersionOrdering::Greater
+        );
     }
 
     fn write_test_clawpkg_dir(path: &Path) {
