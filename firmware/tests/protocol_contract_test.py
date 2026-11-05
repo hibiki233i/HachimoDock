@@ -1123,10 +1123,9 @@ def test_p4_conversation_queue_is_synced_and_rendered_with_pixel_ellipsis():
     assert "restore_idle_session_view" in protocol
     assert 'snapshot_stale ? "session_snapshot_timeout"' in protocol
     assert "state->session_snapshot_last_seen_ms = now_ms" in protocol
-    assert "should_wait_for_session_card" in view
-    assert "state->session_snapshot_last_seen_ms == 0" in view
-    assert 'out->body = "休息中"' in view
-    assert "out->status = PET_P4_VIEW_STATUS_IDLE" in view
+    # Behavior lives in p4_voice_view_test.c: an active lifecycle keeps its status.
+    assert "should_wait_for_session_card" not in view
+    assert "compact_pet_status_label(out->status)" in view
     assert "cJSON_GetArraySize(active_session_ids) == 0" in protocol
     assert "&& (!display_enabled" in protocol
     assert 'copy_text(state->session_queue[0].state' not in protocol

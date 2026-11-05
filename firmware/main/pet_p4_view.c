@@ -27,6 +27,20 @@ static pet_p4_view_status_t status_from_state(const pet_p4_runtime_state_t *stat
   return PET_P4_VIEW_STATUS_IDLE;
 }
 
+/* The small main-page pet badge describes lifecycle only. Agent/session
+ * identity remains available to routing and full Session cards, never as a
+ * fallback label when a state event has no speech body. */
+static const char *compact_pet_status_label(pet_p4_view_status_t status) {
+  switch (status) {
+    case PET_P4_VIEW_STATUS_WORKING: return "工作中";
+    case PET_P4_VIEW_STATUS_WAITING: return "等待操作";
+    case PET_P4_VIEW_STATUS_DONE: return "已完成";
+    case PET_P4_VIEW_STATUS_ERROR: return "出错了";
+    case PET_P4_VIEW_STATUS_IDLE:
+    default: return "休息中";
+  }
+}
+
 static bool should_compact_bubble(const pet_p4_runtime_state_t *state) {
   if (!state) return true;
   if (text_is_empty(state->current_title) && strlen(state->current_speech) <= 36) {
@@ -36,16 +50,6 @@ static bool should_compact_bubble(const pet_p4_runtime_state_t *state) {
     return true;
   }
   return false;
-}
-
-static bool should_wait_for_session_card(const pet_p4_runtime_state_t *state) {
-  if (!state
-      || state->session_queue_count > 0
-      || state->session_snapshot_last_seen_ms == 0
-      || state->session_voice_active) {
-    return false;
-  }
-  return status_from_state(state) != PET_P4_VIEW_STATUS_IDLE;
 }
 
 static const char *conversation_hint(const char *conversation_state) {
@@ -92,14 +96,23 @@ void pet_p4_build_view_model(const pet_p4_runtime_state_t *state, pet_p4_view_mo
   out->show_voice_overlay = state && state->session_voice_active
     && state->session_queue_count == 0 && strcmp(out->page, "main") == 0;
   if (out->show_voice_overlay) return;
-  if (should_wait_for_session_card(state)) {
-    out->title = "";
-    out->body = "休息中";
-    out->status = PET_P4_VIEW_STATUS_IDLE;
-    out->show_bubble = true;
-    out->compact_bubble = true;
-    return;
-  }
   out->show_bubble = !text_is_empty(out->title) || !text_is_empty(out->body);
   out->compact_bubble = should_compact_bubble(state);
+  if (text_is_empty(out->body)) {
+    /* Terminal lifecycle metadata is already represented by its Session card.
+     * Do not synthesize another compact completion notice. Nonempty actual
+     * replies, including short replies, remain unchanged. */
+    if (out->status == PET_P4_VIEW_STATUS_DONE) {
+      out->title = "";
+      out->body = "";
+      out->show_bubble = false;
+      out->compact_bubble = true;
+      return;
+    }
+    /* Missing content is lifecycle metadata, never an Agent/session-name
+     * caption. Keep all nonempty task/speech content verbatim. */
+    out->title = "";
+    out->body = compact_pet_status_label(out->status);
+    out->compact_bubble = true;
+  }
 }
