@@ -9,7 +9,7 @@ fn normalized(s: &str) -> String {
 }
 pub fn select(e: &Extension, rows: &[Value], location: Option<&Value>) -> Result<Catalog,String> {
     let d=e.discovery.as_ref().ok_or("未声明自动目录")?;
-    let city=location.filter(|v|v.pointer(&d.country_field).and_then(Value::as_str)==Some(d.country.as_str()))
+    let city=location.filter(|v|v.pointer(&d.country_field).and_then(Value::as_str).is_some_and(|c|c.eq_ignore_ascii_case(&d.country)))
         .and_then(|v|v.pointer(&d.city_field)).and_then(Value::as_str).filter(|s|!s.is_empty()&&s.len()<=80)
         .map(|s|d.aliases.get(s).map(String::as_str).unwrap_or(s)).unwrap_or("");
     let city_key=normalized(city);
@@ -53,7 +53,7 @@ pub fn discover(e: &Extension) -> Result<Catalog,String> {
             url.query_pairs_mut().extend_pairs(&e.search.params).append_pair("limit","250");
             let national=net::scoped_json(url.as_str(),&e.permissions.network_hosts,2*1024*1024)?;
             let mut rows=national.as_array().ok_or("目录格式无效")?.clone();
-            let city=location.as_ref().filter(|v|v.pointer(&d.country_field).and_then(Value::as_str)==Some(d.country.as_str()))
+            let city=location.as_ref().filter(|v|v.pointer(&d.country_field).and_then(Value::as_str).is_some_and(|c|c.eq_ignore_ascii_case(&d.country)))
                 .and_then(|v|v.pointer(&d.city_field)).and_then(Value::as_str).unwrap_or("");
             let city=d.aliases.get(city).map(String::as_str).unwrap_or(city).trim_end_matches('市');
             if !city.is_empty() && city.len()<=80 {
