@@ -3,15 +3,8 @@ from pathlib import Path
 import re
 import subprocess
 import pytest
+from p4_render_trace_test import function
 ROOT=Path(__file__).resolve().parents[1]
-def function(source,name):
-    """Return one top-level C function, including its braces."""
-    start=re.search(r"static bool "+name+r"\(void\)\{",source).start()
-    depth=0
-    for index in range(start,len(source)):
-        depth+=(source[index]=="{")-(source[index]=="}")
-        if source[index]=="}" and depth==0:return source[start:index+1]
-    raise AssertionError(name)
 @pytest.mark.parametrize("corrupt",[False,True])
 def test_sparse_maps_expand_to_original_bytes_and_bad_hash_refuses(tmp_path,corrupt):
     text=(ROOT/"main/pet_p4_font_cn.c").read_text()

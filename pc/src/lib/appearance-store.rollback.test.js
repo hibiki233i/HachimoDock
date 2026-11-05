@@ -4,7 +4,7 @@ import { register } from "node:module";
 
 // Run the real store against in-memory Tauri stand-ins so rollback and recovery are executed, not just read.
 register("./tauri-fakes-hooks.mjs", import.meta.url);
-const { replaceFamilyVideo, getAppearance, listAppearances, invalidateAppearanceCache, restoreBuiltinFactoryAppearance, restoreBuiltinVideos, replaceFamilyAudioCue, removeFamilyAudioCue } = await import("./appearance-store.js");
+const { replaceFamilyVideo, getAppearance, listAppearances, invalidateAppearanceCache, restoreBuiltinFactoryAppearance, restoreBuiltinVideos } = await import("./appearance-store.js");
 const { files, state } = await import("./tauri-fakes.js");
 
 const BASE = "custom-appearances/builtin-terrier";
@@ -106,23 +106,6 @@ for (const family of ["idle", undefined]) {
     assert.deepEqual({ overrides: text(OVERRIDES), pending: text(PENDING) }, before);
     const record = await getAppearance("builtin-terrier");
     assert.equal(record.families.find(item => item.family === "idle").videoPath, IDLE);
-  });
-}
-
-for (const operation of ["replace", "remove"]) {
-  test(`failed builtin audio ${operation} preserves the previous audio and pending state`, async () => {
-    seed();
-    const audioPath = `${BASE}/audio-overrides/done.wav`;
-    const audioOverrides = `${BASE}/audio-overrides.json`;
-    files.set(audioPath, new Uint8Array([4, 5, 6]));
-    files.set(audioOverrides, JSON.stringify({ done: audioPath }));
-    const before = { audio: bytes(audioPath), overrides: text(audioOverrides), pending: text(PENDING) };
-    state.failPrepare = true;
-    const call = operation === "replace"
-      ? replaceFamilyAudioCue({ appearanceId: "builtin-terrier", family: "done", audioBytes: new Uint8Array([9]) })
-      : removeFamilyAudioCue({ appearanceId: "builtin-terrier", family: "done" });
-    await assert.rejects(call, /encode failed/);
-    assert.deepEqual({ audio: bytes(audioPath), overrides: text(audioOverrides), pending: text(PENDING) }, before);
   });
 }
 

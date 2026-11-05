@@ -2,3 +2,6 @@
 # CONFIG_ESP32P4_SELECTS_REV_LESS_V3 is not set
 CONFIG_ESP32P4_REV_MIN_300=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
+
+# Asserts still abort; only their file/expression strings leave the 2.5 MiB OTA image.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y

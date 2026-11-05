@@ -20,6 +20,7 @@ class ActiveSlotTest(unittest.TestCase):
 #define PET_P4_ASSET_SLOT_MARKER g_marker_path
 static const char *g_marker_path;
 static int g_asset_active_slot = -1;
+static void pet_p4_renderer_set_asset_preparation_suspended(bool suspended) { (void) suspended; }
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 """ + functions + r"""
 int main(int argc, char **argv) {

@@ -23,7 +23,7 @@ function fixture(run) {
   for(const prefix of [path.join(source,'pc'),resources])
     write(path.join(prefix,'skills/petui/SKILL.md'),'Synthetic fixture only.');
   for(const name of ['firmware.bin','firmware-v3.bin'])for(const prefix of [path.join(source,'pc/src-tauri'),resources])
-    write(path.join(prefix,'firmware/esp32-p4',name),'0.7.103-p4-test');
+    write(path.join(prefix,'firmware/esp32-p4',name),'0.7.104-p4-test');
   const verify=()=>spawnSync(process.execPath,[script,'--resources',resources,'--output',path.join(root,'report.json')],{encoding:'utf8'});
   try {run({root,resources,write,verify});} finally {fs.rmSync(root,{recursive:true,force:true});}
 }

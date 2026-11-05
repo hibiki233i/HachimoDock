@@ -320,3 +320,12 @@ test("realtime chat and component speech read the displayed pet, not the main ch
   assert.match(source, /appearance: voiceAppearance \|\| null/);
   assert.doesNotMatch(source, /componentPetVoice\(currentDisplay\.appearance/);
 });
+
+test("USB identity retains native decimal u64 and verified boot IDs without local substitution", () => {
+ const raw={connected:true,runtime:"esp-p4",boardDeviceId:"board",connectionId:"18446744073709551615",bootId:"0011223344556677"};
+ const before=normalizeUsbStatusPayload(raw);
+ assert.equal(before.connectionId,raw.connectionId);assert.equal(before.bootId,raw.bootId);
+ assert.equal(usbStatusSnapshotsEqual(before,normalizeUsbStatusPayload({...raw,connectionId:"18446744073709551614"})),false);
+ assert.equal(usbStatusSnapshotsEqual(before,normalizeUsbStatusPayload({...raw,bootId:"8899aabbccddeeff"})),false);
+ assert.equal(usbStatusSnapshotsEqual(before,normalizeUsbStatusPayload(raw)),true);
+});

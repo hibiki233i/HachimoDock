@@ -38,7 +38,7 @@ report.petuiFiles=exactTree(join(pc,'skills/petui'),join(resources,'skills/petui
 for(const name of ['firmware.bin','firmware-v3.bin']) {
   const bytes=readFileSync(join(resources,'firmware/esp32-p4',name));
   assert.equal(sha(bytes),sha(readFileSync(join(pc,'src-tauri/firmware/esp32-p4',name))));
-  assert.ok(bytes.includes(Buffer.from('0.7.103-p4')));
+  assert.ok(bytes.includes(Buffer.from('0.7.104-p4')));
   report.firmware.push({file:name,bytes:bytes.length,sha256:sha(bytes)});
 }
 for(const name of files(resources)) {

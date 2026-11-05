@@ -146,6 +146,7 @@ fn device_voice_command_never_leaves_over_wifi() {
 
     let (usb, _) = idle_connection("/dev/cu.usbmodem-test", 2);
     *manager.connection.lock().unwrap() = Some(usb);
+    manager.activate_memory_test_connection();
     manager.send("control/command", &arm).unwrap();
     manager.require_usb_link("设备语音").unwrap();
 }

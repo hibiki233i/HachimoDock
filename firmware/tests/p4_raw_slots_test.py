@@ -30,7 +30,13 @@ esp_err_t esp_partition_write(const esp_partition_t *, size_t offset, const void
 esp_err_t esp_partition_erase_range(const esp_partition_t *, size_t offset, size_t size);
 """
 
-FREERTOS_H = "#pragma once\n#define pdMS_TO_TICKS(ms) (ms)\n"
+FREERTOS_H = """#pragma once
+#define pdMS_TO_TICKS(ms) (ms)
+typedef int portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED 0
+#define portENTER_CRITICAL(mux) ((void) (mux))
+#define portEXIT_CRITICAL(mux) ((void) (mux))
+"""
 TASK_H = "#pragma once\nstatic inline void vTaskDelay(int ticks) { (void) ticks; }\n"
 
 HARNESS = r"""#include "pet_p4_raw_assets.h"

@@ -16,6 +16,9 @@ static pet_p4_view_status_t status_from_state(const pet_p4_runtime_state_t *stat
   if (strcmp(status, "error") == 0 || strcmp(life, "error") == 0) {
     return PET_P4_VIEW_STATUS_ERROR;
   }
+  if (strcmp(status, "stopped") == 0 || strcmp(life, "stopped") == 0) {
+    return PET_P4_VIEW_STATUS_STOPPED;
+  }
   if (strcmp(status, "waiting_user") == 0 || strcmp(life, "waiting_user") == 0) {
     return PET_P4_VIEW_STATUS_WAITING;
   }
@@ -36,6 +39,7 @@ static const char *compact_pet_status_label(pet_p4_view_status_t status) {
     case PET_P4_VIEW_STATUS_WAITING: return "等待操作";
     case PET_P4_VIEW_STATUS_DONE: return "已完成";
     case PET_P4_VIEW_STATUS_ERROR: return "出错了";
+    case PET_P4_VIEW_STATUS_STOPPED: return "已停止";
     case PET_P4_VIEW_STATUS_IDLE:
     default: return "休息中";
   }

@@ -12,12 +12,15 @@
  *          input configuration with versioned SW1-confirm/SW3-back and
  *          joystick-up/down Previous/Next defaults, and cached telemetry replay
  *          immediately after a mini-app is activated; conversation clearing
- *          preserves ongoing physical voice-hold feedback.
+ *          preserves ongoing physical voice-hold feedback; a DSH approval modal
+ *          turns SW1/SW3 short presses into one allow/deny decision and swallows
+ *          all other gestures until that decision is sent.
  * [Pos] ESP32-P4 physical-input runtime.
  * [Sync] If this file changes, update `firmware/.folder.md` and `protocol.md`.
  */
 
 #include "pet_p4_input.h"
+#include "pet_p4_audio.h"
 #include "pet_p4_conversation.h"
 
 #include <stdio.h>
@@ -33,11 +36,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "pet_p4_task_policy.h"
 #include "nvs.h"
 #include "soc/adc_channel.h"
 
 #include "pet_p4_audio.h"
 #include "pet_p4_input_core.h"
+#include "pet_p4_observation.h"
 #include "pet_p4_miniapp.h"
 #include "pet_p4_media.h"
 
@@ -115,47 +120,27 @@ static pet_p4_input_config_t g_config;
 static atomic_uint g_dropped_events;
 static unsigned int g_event_sequence;
 static adc_oneshot_unit_handle_t g_joystick_adc;
-static atomic_bool g_joystick_ready;
-static atomic_int g_joystick_center_x;
-static atomic_int g_joystick_center_y;
-static atomic_int g_joystick_current_x;
-static atomic_int g_joystick_current_y;
-static atomic_int g_joystick_minimum_x;
-static atomic_int g_joystick_maximum_x;
-static atomic_int g_joystick_minimum_y;
-static atomic_int g_joystick_maximum_y;
+/* The existing input task is the only model writer. Diagnostics/providers read
+ * only completed immutable observations, never these partially updated fields.
+ * Dropping a busy diagnostic publication never changes ADC/input behavior. */
+static pet_p4_input_joystick_snapshot_t g_joystick_observation_model;
+static pet_observation_t g_joystick_observation;
 
-static void update_atomic_minimum(atomic_int *value, int sample) {
-  int current = atomic_load_explicit(value, memory_order_relaxed);
-  while (sample < current
-      && !atomic_compare_exchange_weak_explicit(
-        value,
-        &current,
-        sample,
-        memory_order_relaxed,
-        memory_order_relaxed
-      )) {}
-}
-
-static void update_atomic_maximum(atomic_int *value, int sample) {
-  int current = atomic_load_explicit(value, memory_order_relaxed);
-  while (sample > current
-      && !atomic_compare_exchange_weak_explicit(
-        value,
-        &current,
-        sample,
-        memory_order_relaxed,
-        memory_order_relaxed
-      )) {}
+static void joystick_observation_begin(bool ready,int center_x,int center_y) {
+  g_joystick_observation_model=(pet_p4_input_joystick_snapshot_t){
+    .ready=ready,.center_x=center_x,.center_y=center_y,
+    .current_x=center_x,.current_y=center_y,
+    .minimum_x=center_x,.maximum_x=center_x,.minimum_y=center_y,.maximum_y=center_y};
+  (void)pet_observation_publish(&g_joystick_observation,&g_joystick_observation_model,sizeof(g_joystick_observation_model));
 }
 
 static void record_joystick_sample(int x, int y) {
-  atomic_store_explicit(&g_joystick_current_x, x, memory_order_relaxed);
-  atomic_store_explicit(&g_joystick_current_y, y, memory_order_relaxed);
-  update_atomic_minimum(&g_joystick_minimum_x, x);
-  update_atomic_maximum(&g_joystick_maximum_x, x);
-  update_atomic_minimum(&g_joystick_minimum_y, y);
-  update_atomic_maximum(&g_joystick_maximum_y, y);
+  g_joystick_observation_model.current_x=x;g_joystick_observation_model.current_y=y;
+  if(x<g_joystick_observation_model.minimum_x)g_joystick_observation_model.minimum_x=x;
+  if(x>g_joystick_observation_model.maximum_x)g_joystick_observation_model.maximum_x=x;
+  if(y<g_joystick_observation_model.minimum_y)g_joystick_observation_model.minimum_y=y;
+  if(y>g_joystick_observation_model.maximum_y)g_joystick_observation_model.maximum_y=y;
+  (void)pet_observation_publish(&g_joystick_observation,&g_joystick_observation_model,sizeof(g_joystick_observation_model));
 }
 
 static void copy_text(char *dest, size_t dest_size, const char *src) {
@@ -205,6 +190,7 @@ static bool action_is_allowed(const char *action) {
     "agent_next",
     "agent_previous",
     "session_clear",
+    "dsh_interrupt",
     "miniapp_screen_tap",
     "miniapp_screen_long_press",
     "page_toggle",
@@ -858,15 +844,7 @@ static void input_task(void *arg) {
     4
   );
   const bool joystick_calibrated = calibrate_joystick_center(&joystick_center_x, &joystick_center_y);
-  atomic_store_explicit(&g_joystick_center_x, joystick_center_x, memory_order_relaxed);
-  atomic_store_explicit(&g_joystick_center_y, joystick_center_y, memory_order_relaxed);
-  atomic_store_explicit(&g_joystick_current_x, joystick_center_x, memory_order_relaxed);
-  atomic_store_explicit(&g_joystick_current_y, joystick_center_y, memory_order_relaxed);
-  atomic_store_explicit(&g_joystick_minimum_x, joystick_center_x, memory_order_relaxed);
-  atomic_store_explicit(&g_joystick_maximum_x, joystick_center_x, memory_order_relaxed);
-  atomic_store_explicit(&g_joystick_minimum_y, joystick_center_y, memory_order_relaxed);
-  atomic_store_explicit(&g_joystick_maximum_y, joystick_center_y, memory_order_relaxed);
-  atomic_store_explicit(&g_joystick_ready, joystick_calibrated, memory_order_release);
+  joystick_observation_begin(joystick_calibrated,joystick_center_x,joystick_center_y);
   pet_p4_joystick_decoder_init(
     &joystick,
     joystick_center_x,
@@ -972,7 +950,7 @@ esp_err_t pet_p4_input_init(void) {
     g_joystick_adc = NULL;
     return ESP_ERR_NO_MEM;
   }
-  if (xTaskCreate(input_task, "pet_p4_input", 4096, NULL, 9, NULL) != pdPASS) {
+  if (xTaskCreate(input_task, "pet_p4_input", 4096, NULL, PET_P4_INPUT_TASK_PRIORITY, NULL) != pdPASS) {
     vQueueDelete(g_event_queue);
     g_event_queue = NULL;
     adc_oneshot_del_unit(g_joystick_adc);
@@ -1059,6 +1037,103 @@ static void send_input_event(
   if (line && send_line) send_line(line, ctx);
   cJSON_free(line);
   cJSON_Delete(root);
+}
+
+/* R5 DSH approval: exactly one decision per pending request, then clear. */
+static void send_approval_decision(
+  pet_p4_send_line_fn send_line,
+  void *ctx,
+  const char *request_id,
+  bool allow
+) {
+  cJSON *root = cJSON_CreateObject();
+  cJSON *payload = cJSON_CreateObject();
+  char *line;
+  if (!root || !payload) {
+    cJSON_Delete(root);
+    cJSON_Delete(payload);
+    return;
+  }
+  cJSON_AddStringToObject(root, "topic", "approval/decision");
+  cJSON_AddStringToObject(payload, "requestId", request_id ? request_id : "");
+  cJSON_AddStringToObject(payload, "decision", allow ? "allow" : "deny");
+  cJSON_AddStringToObject(payload, "source", "esp32");
+  cJSON_AddItemToObject(root, "payload", payload);
+  line = cJSON_PrintUnformatted(root);
+  if (line && send_line) send_line(line, ctx);
+  cJSON_free(line);
+  cJSON_Delete(root);
+}
+
+/* Resolve an approval decision from the configured button bindings rather than
+ * physical button IDs: the global confirm action ("page_enter") allows and the
+ * global cancel/back action ("page_back") denies. This follows the user's
+ * button configuration automatically. */
+static bool approval_decision_for_event(
+  const pet_p4_input_event_t *event,
+  bool *allow
+) {
+  char event_name[PET_P4_INPUT_EVENT_MAX];
+  const char *prefix;
+  const pet_p4_input_binding_t *binding;
+  if (!event || !allow || event->gesture != PET_P4_INPUT_GESTURE_SHORT_PRESS) {
+    return false;
+  }
+  prefix = button_event_prefix(event->control);
+  if (!prefix[0]) return false;
+  snprintf(event_name, sizeof(event_name), "%s.short_press", prefix);
+  binding = active_binding(event_name);
+  if (!binding) return false;
+  if (strcmp(binding->action, "page_enter") == 0) {
+    *allow = true;
+    return true;
+  }
+  if (strcmp(binding->action, "page_back") == 0) {
+    *allow = false;
+    return true;
+  }
+  return false;
+}
+
+/* While the DSH approval modal is up, physical input is modal too: the
+ * configured confirm/enter gesture allows, the configured cancel/back gesture
+ * denies, and every other gesture is swallowed. Holds/long presses can never
+ * decide. A short press clears the pending request before the next event is
+ * dequeued, so a duplicated press cannot produce a second decision. */
+static bool handle_approval_input(
+  pet_p4_runtime_state_t *state,
+  pet_p4_send_line_fn send_line,
+  void *ctx,
+  const pet_p4_input_event_t *event
+) {
+  char request_id[PET_P4_APPROVAL_REQUEST_ID_MAX] = {0};
+  bool allow = false;
+  if (!state || !event || !state->approval_active) return false;
+  if (event->gesture == PET_P4_INPUT_GESTURE_HOLD_END && state->session_voice_active) {
+    /* A voice hold that began before the modal must not leave capture running
+     * now that its release is swallowed by the modal. */
+    state->session_voice_active = false;
+    (void) pet_p4_audio_capture_stop();
+  }
+  if (event->gesture != PET_P4_INPUT_GESTURE_SHORT_PRESS) return true;
+  if (!approval_decision_for_event(event, &allow)) return true;
+  if (!pet_p4_state_decide_approval(
+        state,
+        event->ts_ms,
+        request_id,
+        sizeof(request_id)
+      )) {
+    /* Expired modal: the pending state was dropped without a late decision. */
+    (void) pet_p4_audio_play_event_cue("permission_expired");
+    state->last_update_ms = event->ts_ms;
+    return true;
+  }
+  send_approval_decision(send_line, ctx, request_id, allow);
+  (void) pet_p4_audio_play_event_cue(
+    allow ? "permission_approved" : "permission_denied"
+  );
+  state->last_update_ms = event->ts_ms;
+  return true;
 }
 
 static bool apply_local_action(
@@ -1148,9 +1223,12 @@ static bool apply_local_action(
   if (strcmp(binding->action, "page_enter") == 0) {
     if (strcmp(state->screen_page, "app") == 0) return false;
     if (strcmp(state->screen_page, "components") == 0) {
-      if (!pet_p4_miniapp_catalog_activate_selected()) return false;
-      pet_p4_miniapp_sync_stats(&state->stats);
-      copy_text(state->screen_page, sizeof(state->screen_page), "app");
+      pet_p4_miniapp_activation_request_t activation = pet_p4_miniapp_activation_request_selected();
+      if (activation == PET_MINIAPP_ACTIVATION_REJECTED) return false;
+      if (activation == PET_MINIAPP_ACTIVATION_READY) {
+        pet_p4_miniapp_sync_stats(&state->stats);
+        copy_text(state->screen_page, sizeof(state->screen_page), "app");
+      } else copy_text(action_override, action_override_size, "component_open_pending");
     } else return false;
     state->last_update_ms = ts_ms;
     return true;
@@ -1535,6 +1613,12 @@ void pet_p4_input_process(
   pet_p4_input_event_t event;
   if (!g_event_queue) return;
   while (xQueueReceive(g_event_queue, &event, 0) == pdTRUE) {
+    /* Preserve cancellation across several queued navigation events in one
+     * loop, including leave-and-return before the worker finishes loading. */
+    pet_p4_miniapp_activation_guard(state && !strcmp(state->screen_page, "components")
+      && !pet_p4_conversation_active(state));
+    /* The pending DSH approval owns every physical event while it is visible. */
+    if (handle_approval_input(state, send_line, ctx, &event)) continue;
     if (event.control == PET_P4_INPUT_CONTROL_JOYSTICK
         && (event.gesture == PET_P4_INPUT_GESTURE_DIRECTION||event.gesture==PET_P4_INPUT_GESTURE_REPEAT)) {
       static pet_p4_input_gate_t gate;
@@ -1542,7 +1626,7 @@ void pet_p4_input_process(
       uint64_t context=pet_p4_miniapp_input_context()|((uint64_t)page<<60);
       bool repeated=event.gesture==PET_P4_INPUT_GESTURE_REPEAT;
       /* A context change requires actual neutral, not merely another direction. */
-      if(!pet_p4_input_gate_accept(&gate,event.delta==PET_P4_JOYSTICK_CENTER,context))continue;
+      if(!pet_p4_input_gate_accept(&gate,event.delta==PET_P4_JOYSTICK_CENTER,context)){pet_p4_miniapp_side_axis(0);continue;}
       const char *event_name = "";
       const char *gesture = "";
       switch ((pet_p4_joystick_direction_t) event.delta) {
@@ -1569,6 +1653,9 @@ void pet_p4_input_process(
         default:
           break;
       }
+      bool side_input=state&&!pet_p4_conversation_active(state)&&!strcmp(state->screen_page,"app");
+      int side_direction=!strcmp(event_name,"knob.rotate_ccw")?-1:!strcmp(event_name,"knob.rotate_cw")?1:0;
+      if(side_input)pet_p4_miniapp_side_axis(event_name[0]&&active_global_priority_binding(state,event_name)?0:side_direction);
       if (!event_name[0]) continue;
       if(repeated&&state&&!strcmp(state->screen_page,"app")&&
          (!pet_p4_miniapp_input_policy(event_name,false)||active_global_priority_binding(state,event_name)))continue;
@@ -1638,6 +1725,8 @@ void pet_p4_input_process(
       process_button_event(state, send_line, ctx, &event);
     }
   }
+  pet_p4_miniapp_activation_guard(state && !strcmp(state->screen_page, "components")
+    && !pet_p4_conversation_active(state));
 }
 
 unsigned int pet_p4_input_dropped_events(void) {
@@ -1646,13 +1735,6 @@ unsigned int pet_p4_input_dropped_events(void) {
 
 void pet_p4_input_get_joystick_snapshot(pet_p4_input_joystick_snapshot_t *snapshot) {
   if (!snapshot) return;
-  snapshot->ready = atomic_load_explicit(&g_joystick_ready, memory_order_acquire);
-  snapshot->center_x = atomic_load_explicit(&g_joystick_center_x, memory_order_relaxed);
-  snapshot->center_y = atomic_load_explicit(&g_joystick_center_y, memory_order_relaxed);
-  snapshot->current_x = atomic_load_explicit(&g_joystick_current_x, memory_order_relaxed);
-  snapshot->current_y = atomic_load_explicit(&g_joystick_current_y, memory_order_relaxed);
-  snapshot->minimum_x = atomic_load_explicit(&g_joystick_minimum_x, memory_order_relaxed);
-  snapshot->maximum_x = atomic_load_explicit(&g_joystick_maximum_x, memory_order_relaxed);
-  snapshot->minimum_y = atomic_load_explicit(&g_joystick_minimum_y, memory_order_relaxed);
-  snapshot->maximum_y = atomic_load_explicit(&g_joystick_maximum_y, memory_order_relaxed);
+  if(pet_observation_capture(&g_joystick_observation,snapshot,sizeof(*snapshot))!=PET_OBSERVATION_OK)
+    *snapshot=(pet_p4_input_joystick_snapshot_t){0};
 }
