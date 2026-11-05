@@ -43,11 +43,12 @@
     "@tauri-apps/cli": "2.11.1",
     "@vitejs/plugin-react": "^4.3.1",
     "lunar-javascript": "1.7.7",
-    "vite": "^6.4.3"
+    "vite": "6.4.5"
   },
   "overrides": {
     "@babel/core": "7.29.7",
     "postcss": "8.5.25",
-    "protobufjs": "7.6.5"
+    "protobufjs": "7.6.5",
+    "source-map-js": "1.2.2"
   }
 }
