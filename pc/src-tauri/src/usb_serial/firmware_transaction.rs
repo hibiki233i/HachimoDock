@@ -77,6 +77,55 @@ pub(super) enum FirmwareCommandError {
     Rejected(String),
 }
 
+// A desktop image ceiling never enlarges an existing device's physical slot.
+// Check its current table before any stale-transfer abort or begin/erase.
+pub(super) fn ensure_device_firmware_headroom(status: &Value, image_bytes: usize) -> Result<(), String> {
+    const MIN_HEADROOM: u64 = 131_072;
+    let size = status.pointer("/nextPartition/size").and_then(Value::as_u64)
+        .filter(|v| *v > 0 && *v <= P4_FIRMWARE_MAX_IMAGE_SIZE as u64 && *v % 4096 == 0)
+        .ok_or("无法确认设备实际 OTA 分区容量；未开始更新，也未清除任何传输")?;
+    let next = status.pointer("/nextPartition/label").and_then(Value::as_str);
+    let running = status.pointer("/runningPartition/label").and_then(Value::as_str);
+    if status["supported"] != true || !matches!(next, Some("ota_0" | "ota_1"))
+        || !matches!(running, Some("ota_0" | "ota_1")) || next == running {
+        return Err("设备未提供独立的 OTA 更新槽，未开始更新".into());
+    }
+    if image_bytes == 0 || (image_bytes as u64).checked_add(MIN_HEADROOM).is_none_or(|need| need > size) {
+        return Err("设备当前 OTA 分区余量不足，须保留至少 128 KiB。普通 OTA 不会扩大分区；如需调整，请使用完整烧录。".into());
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use serde_json::json;
+    fn status(size: u64) -> Value {
+        json!({"supported":true,"runningPartition":{"label":"ota_0"},"nextPartition":{"label":"ota_1","size":size}})
+    }
+    #[test]
+    fn actual_slots_keep_the_same_headroom_boundary() {
+        for size in [0x200000usize, P4_FIRMWARE_MAX_IMAGE_SIZE] {
+            assert!(ensure_device_firmware_headroom(&status(size as u64), size - 131_072).is_ok());
+            assert!(ensure_device_firmware_headroom(&status(size as u64), size - 131_071).is_err());
+        }
+    }
+    #[test]
+    fn missing_coerced_oversize_and_same_slot_fail_closed() {
+        for size in [Value::Null, json!("2621440"), json!(-1), json!(2621440.5), json!(0x400000), json!(0x280001)] {
+            let mut s = status(0x280000);
+            s["nextPartition"]["size"] = size;
+            assert!(ensure_device_firmware_headroom(&s, 1024).is_err());
+        }
+        let mut same = status(0x280000);
+        same["nextPartition"]["label"] = "ota_0".into();
+        assert!(ensure_device_firmware_headroom(&same, 1024).is_err());
+        let mut unsupported = status(0x280000);
+        unsupported["supported"] = false.into();
+        assert!(ensure_device_firmware_headroom(&unsupported, 1024).is_err());
+        assert!(ensure_device_firmware_headroom(&status(0x280000), 0).is_err());
+    }
+}
+
 pub(super) fn firmware_corruption_fallback_size(
     current_size: usize,
     error: &FirmwareCommandError,

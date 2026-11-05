@@ -15,6 +15,7 @@ import {
 } from "../lib/session-display.js";
 import {
   buildP4DeviceSessionTransportPayload,
+  enqueueP4SessionBinding,
   p4SessionDisplayTitle,
   p4SessionActivitySignature,
 } from "../lib/p4-session-service.js";
@@ -126,6 +127,13 @@ export function useP4SessionSync({
     missingSessionNoticeRef.current = createMissingSessionNoticeGate();
   }
   const bindingQueueRef = useRef(Promise.resolve());
+  const bindingScope = useMemo(() => ({}), [enabled, boardDeviceId, agentId, usbConnected]);
+  const bindingScopeRef = useRef(bindingScope);
+  bindingScopeRef.current = bindingScope;
+  useEffect(() => {
+    bindingScopeRef.current = bindingScope;
+    return () => { if (bindingScopeRef.current === bindingScope) bindingScopeRef.current = null; };
+  }, [bindingScope]);
   const sessionId = selection.sessionId;
 
   const visibleSessions = useMemo(() => (
@@ -238,9 +246,9 @@ export function useP4SessionSync({
       ? normalizeText(selectedRoutingSession?.id)
       : sessionId;
     if (matchedNotice) pendingNoticeRef.current = null;
-    const bindingPromise = bindingQueueRef.current
-      .catch(() => undefined)
-      .then(() => invoke("set_p4_session_binding", {
+    const isCurrent = () => bindingScopeRef.current === bindingScope;
+    const bindingPromise = enqueueP4SessionBinding(bindingQueueRef.current, isCurrent,
+      () => invoke("set_p4_session_binding", {
         input: {
           boardDeviceId,
           agentId,
@@ -262,6 +270,7 @@ export function useP4SessionSync({
     bindingQueueRef.current = bindingPromise.catch(() => undefined);
     bindingPromise
       .then((result) => {
+        if (!isCurrent() || !result) return;
         const resultSessionId = normalizeText(result?.sessionId) || "auto";
         if (resultSessionId !== requestedSessionId || !matchedNotice) return;
         const location = normalizeText(result?.desktopLocation).toLowerCase();
@@ -308,6 +317,7 @@ export function useP4SessionSync({
     sessionId,
     sessionsLoaded,
     usbConnected,
+    bindingScope,
   ]);
 
   useEffect(() => {

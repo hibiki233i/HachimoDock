@@ -64,5 +64,29 @@ int main(void) {
   assert(strcmp(view.body, "休息中") == 0);
   pet_p4_build_view_model(NULL, &view);
   assert(!view.show_voice_overlay);
+
+  // An active lifecycle is never shown as idle while its Session card is pending.
+  memset(&state, 0, sizeof(state));
+  strcpy(state.screen_page, "main");
+  strcpy(state.active_agent, "codex");
+  strcpy(state.current_state, "working");
+  state.session_snapshot_last_seen_ms = 1234;
+  pet_p4_build_view_model(&state, &view);
+  assert(view.status == PET_P4_VIEW_STATUS_WORKING);
+  assert(view.show_bubble && view.compact_bubble);
+  assert(strcmp(view.body, "工作中") == 0 && strcmp(view.title, "") == 0);
+  strcpy(state.current_speech, "正在编译");
+  pet_p4_build_view_model(&state, &view);
+  assert(view.status == PET_P4_VIEW_STATUS_WORKING);
+  assert(strcmp(view.body, "正在编译") == 0);
+  strcpy(state.current_state, "error");
+  state.current_speech[0] = '\0';
+  pet_p4_build_view_model(&state, &view);
+  assert(view.status == PET_P4_VIEW_STATUS_ERROR && strcmp(view.body, "出错了") == 0);
+  // Completion without a reply belongs to its Session card, not a second notice.
+  strcpy(state.current_state, "done");
+  pet_p4_build_view_model(&state, &view);
+  assert(view.status == PET_P4_VIEW_STATUS_DONE && !view.show_bubble);
+  assert(strcmp(view.body, "") == 0);
   return 0;
 }

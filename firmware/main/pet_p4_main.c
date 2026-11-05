@@ -36,6 +36,7 @@
 #include "pet_p4_audio.h"
 #include "pet_p4_audio_frontend.h"
 #include "pet_p4_diagnostics.h"
+#include "pet_p4_font_bitmap.h"
 #include "pet_p4_input.h"
 #include "pet_p4_miniapp.h"
 #include "pet_p4_media.h"
@@ -747,6 +748,10 @@ void app_main(void) {
   xSemaphoreTake(g_transport_mutex, portMAX_DELAY);
   g_transport_ready = true;
   xSemaphoreGive(g_transport_mutex);
+  int64_t font_started = esp_timer_get_time();
+  ESP_ERROR_CHECK(pet_p4_font_bitmap_init()?ESP_OK:ESP_ERR_INVALID_STATE);
+  ESP_LOGI(TAG, "font bitmap ready packed=%u elapsed_us=%lld", (unsigned)PET_FONT_BITMAP_PACKED,
+    (long long)(esp_timer_get_time() - font_started));
   ESP_ERROR_CHECK(pet_p4_input_init());
   esp_err_t lcd_err = pet_p4_lcd_init();
   esp_err_t touch_err = lcd_err == ESP_OK ? pet_p4_touch_init() : ESP_ERR_INVALID_STATE;

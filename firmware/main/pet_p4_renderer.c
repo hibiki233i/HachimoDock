@@ -12,6 +12,10 @@
  * [Sync] If this file changes, update `firmware/.folder.md` and renderer tests.
  */
 
+/* Routine renderer success/trace logs are DEBUG only. Production builds compile
+ * at INFO, so frames never wait for serialized log output merely to announce
+ * normal rendering. WARN/ERROR and all numeric frame metrics stay unchanged. */
+
 #include "pet_p4_renderer.h"
 #include "pet_p4_frame_gate.h"
 
@@ -344,7 +348,7 @@ static void record_render_performance(
   g_metrics.max_us = sorted[PET_P4_RENDER_PERF_WINDOW - 1];
   g_metrics.window_samples = PET_P4_RENDER_PERF_WINDOW;
   portEXIT_CRITICAL(&g_metrics_lock);
-  ESP_LOGI(
+  ESP_LOGD(
     TAG,
     "P4 render perf fps=%u.%u total=%u.%ums p95=%u.%ums max=%u.%ums "
     "asset=%u.%u decode=%u.%u pack=%u.%u convert=%u.%u overlay=%u.%u rotate=%u.%u lcd=%u.%u over66=%u/%u",
@@ -444,7 +448,7 @@ static pet_p4_asset_cache_entry_t *load_asset_stream_cache(
   entry->last_used_ms = now_ms;
   snprintf(entry->fs_path, sizeof(entry->fs_path), "%s", fs_path);
   uint32_t load_ms = elapsed_us_clamped(load_started_us, esp_timer_get_time()) / 1000U;
-  ESP_LOGI(
+  ESP_LOGD(
     TAG,
     "P4 asset cache loaded slot=%u bytes=%u load=%ums path=%s",
     selected,
@@ -1552,7 +1556,7 @@ static bool scale_asset_frame_ppa(int src_w, int src_h, int src_stride) {
   esp_err_t err = ppa_do_scale_rotate_mirror(g_ppa_srm_client, &scaling);
   if (err == ESP_OK) {
     if (!g_logged_ppa_scaling) {
-      ESP_LOGI(
+      ESP_LOGD(
         TAG,
         "P4 asset scale=PPA source=%dx%d stride=%d output=%dx%d offset=%d,%d factor=%.3f",
         src_w,
@@ -2004,7 +2008,7 @@ static bool scale_h264_frame_ppa(
   g_last_h264_convert_us += elapsed_us_clamped(convert_started_us, esp_timer_get_time());
   if (err == ESP_OK) {
     if (!g_logged_h264_ppa) {
-      ESP_LOGI(
+      ESP_LOGD(
         TAG,
         "P4 H264 convert=PPA source=%dx%d output=%dx%d offset=%d,%d factor=%.3f",
         src_w,
@@ -2171,7 +2175,7 @@ static bool render_h264_asset_frame(
     );
   }
   if (!g_logged_h264_decoder) {
-    ESP_LOGI(
+    ESP_LOGD(
       TAG,
       "P4 H264 decoder=%s output=I420 visible=%dx%d storage=%dx%d bytes=%u",
       PET_P4_H264_DECODER_MODE,
@@ -2269,7 +2273,7 @@ static bool render_asset_pet_frame(const pet_p4_runtime_state_t *state, const pe
       return false;
     }
     if (!g_logged_asset || strcmp(g_rendered_family, asset.family) != 0) {
-      ESP_LOGI(TAG, "rendering P4 family=%s asset=%s", asset.family, asset.path);
+      ESP_LOGD(TAG, "rendering P4 family=%s asset=%s", asset.family, asset.path);
       snprintf(g_rendered_family, sizeof(g_rendered_family), "%s", asset.family);
       g_logged_asset = true;
     }
@@ -2342,7 +2346,7 @@ static bool render_asset_pet_frame(const pet_p4_runtime_state_t *state, const pe
     return false;
   }
   if (decoded_with_hardware && !g_logged_hardware_decoder) {
-    ESP_LOGI(
+    ESP_LOGD(
       TAG,
       "P4 JPEG decoder=hardware output=RGB565 size=%dx%d",
       decoded_width,
@@ -2358,7 +2362,7 @@ static bool render_asset_pet_frame(const pet_p4_runtime_state_t *state, const pe
   if (src_h > PET_P4_ASSET_HEIGHT) src_h = PET_P4_ASSET_HEIGHT;
   scale_asset_frame_to_display(src_w, src_h, decoded_stride);
   if (!g_logged_asset || strcmp(g_rendered_family, asset.family) != 0) {
-    ESP_LOGI(TAG, "rendering P4 family=%s asset=%s", asset.family, asset.path);
+    ESP_LOGD(TAG, "rendering P4 family=%s asset=%s", asset.family, asset.path);
     snprintf(g_rendered_family, sizeof(g_rendered_family), "%s", asset.family);
     g_logged_asset = true;
   }
@@ -3099,7 +3103,7 @@ static bool rebuild_session_overlay_cache(
   g_session_overlay_signature = signature;
   g_session_overlay_cache_valid = true;
   memset(&g_render_perf, 0, sizeof(g_render_perf));
-  ESP_LOGI(
+  ESP_LOGD(
     TAG,
     "P4 session overlay cache rebuilt sessions=%u selected=%u",
     state->session_queue_count,
@@ -5116,7 +5120,7 @@ static esp_err_t rotate_landscape_to_panel(void) {
     esp_err_t err = ppa_do_scale_rotate_mirror(g_ppa_srm_client, &rotation);
     if (err == ESP_OK) {
       if (!g_logged_ppa_rotation) {
-        ESP_LOGI(TAG, "P4 rotation=PPA angle=270 output=RGB565 panel-order=RGB size=%dx%d",
+        ESP_LOGD(TAG, "P4 rotation=PPA angle=270 output=RGB565 panel-order=RGB size=%dx%d",
           BSP_LCD_H_RES, BSP_LCD_V_RES);
         g_logged_ppa_rotation = true;
       }
@@ -5336,7 +5340,7 @@ esp_err_t pet_p4_renderer_render(
     asset_us = elapsed_us_clamped(asset_started_us, overlay_started_us);
     if (!drew_asset) {
       if (!g_logged_missing_asset) {
-        ESP_LOGI(TAG, "no usable P4 appearance frames yet; keeping bubble/status visible");
+        ESP_LOGD(TAG, "no usable P4 appearance frames yet; keeping bubble/status visible");
         g_logged_missing_asset = true;
       }
       // Only when no pet is installed at all; a pet that is merely loading or backing off keeps its frame.

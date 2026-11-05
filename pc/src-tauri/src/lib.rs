@@ -101,6 +101,7 @@ mod smart_home;
 mod smart_home_credentials;
 mod llm_network;
 mod generation_diagnostics;
+mod generation_http;
 #[cfg(test)]
 mod generation_probe_tests;
 mod service_credentials;
@@ -5990,6 +5991,41 @@ fn detect_codex() -> DetectedAgent {
     }
 }
 
+/// Decide the OpenClaw discovery state from a real CLI entry and the local
+/// status-bridge identity file.
+///
+/// `~/.status-bridge/openclaw-device.json` is created by the bundled status
+/// bridge on first launch (it is only a local MQTT device identity), so its
+/// presence must never be reported as an installed OpenClaw CLI/Gateway.
+fn openclaw_detection(
+    cli_path: Option<&str>,
+    has_status_bridge_identity: bool,
+) -> (bool, &'static str, String) {
+    match (cli_path, has_status_bridge_identity) {
+        (Some(path), true) => (
+            true,
+            "ready",
+            format!("已检测到 OpenClaw CLI 与本地状态桥身份: {}", path),
+        ),
+        (Some(path), false) => (
+            true,
+            "ready",
+            format!("已检测到 OpenClaw CLI（等待 Gateway 配置）: {}", path),
+        ),
+        (None, true) => (
+            false,
+            "not_found",
+            "仅检测到 HachimoDock 本地状态桥身份文件（客户端自动生成），未安装 OpenClaw CLI"
+                .to_string(),
+        ),
+        (None, false) => (
+            false,
+            "not_found",
+            "未检测到 OpenClaw CLI 或 Gateway".to_string(),
+        ),
+    }
+}
+
 fn detect_openclaw() -> DetectedAgent {
     let home = get_home_dir().ok();
     let cli_path = find_agent_executable(
@@ -6007,37 +6043,18 @@ fn detect_openclaw() -> DetectedAgent {
                 .to_string()
         })
         .unwrap_or_default();
-    let has_config = !config_path.is_empty() && Path::new(&config_path).exists();
+    let has_status_bridge_identity =
+        !config_path.is_empty() && Path::new(&config_path).exists();
 
-    let (detected, status, detail) = match (&cli_path, has_config) {
-        (Some(path), true) => (
-            true,
-            "ready".to_string(),
-            format!("已检测到 OpenClaw CLI 与 Gateway: {}", path),
-        ),
-        (Some(path), false) => (
-            true,
-            "ready".to_string(),
-            format!("已检测到 OpenClaw CLI（等待 Gateway 配置）: {}", path),
-        ),
-        (None, true) => (
-            true,
-            "ready".to_string(),
-            "OpenClaw Gateway 已配置（未发现 CLI 入口）".to_string(),
-        ),
-        (None, false) => (
-            false,
-            "not_found".to_string(),
-            "未检测到 OpenClaw CLI 或 Gateway".to_string(),
-        ),
-    };
+    let (detected, status, detail) =
+        openclaw_detection(cli_path.as_deref(), has_status_bridge_identity);
 
     DetectedAgent {
         id: "openclaw".to_string(),
         label: "OpenClaw".to_string(),
         detected,
         ready: status == "ready",
-        status,
+        status: status.to_string(),
         detail,
         command_path: cli_path.unwrap_or_default(),
         config_path,
@@ -6180,12 +6197,13 @@ async fn detect_local_agents() -> Result<AgentDiscoveryResponse, String> {
 /// server returns header values containing bytes > 0xFF (e.g. non-ASCII
 /// `Content-Disposition` filenames from Volcano TOS CDN).
 #[tauri::command]
-async fn download_bytes(url: String) -> Result<Vec<u8>, String> {
+async fn download_bytes(url: String, timeout_ms: Option<u64>, max_bytes: Option<u64>) -> Result<Vec<u8>, String> {
     eprintln!("[download_bytes] GET");
     let started = std::time::Instant::now();
-    let mut diagnostic = generation_diagnostics::Record::new("download", 120_000);
+    let timeout_ms = timeout_ms.unwrap_or(120_000).clamp(1, 120_000);
+    let mut diagnostic = generation_diagnostics::Record::new("download", timeout_ms);
     let result = async {
-        let client = llm_network::download_client(Duration::from_secs(120))?;
+        let client = llm_network::download_client(Duration::from_millis(timeout_ms))?;
         diagnostic.phase = "request_wait".into();
         let response = client
             .get(&url)
@@ -6200,10 +6218,15 @@ async fn download_bytes(url: String) -> Result<Vec<u8>, String> {
                 status.as_u16()
             ));
         }
-        let bytes = response.bytes().await.map_err(|e| diagnostic.transport_error(&e))?;
+        let bytes = if let Some(limit) = max_bytes {
+            generation_http::read_image_bytes_bounded(response, &mut diagnostic,
+                limit.clamp(1, generation_http::MAX_RESPONSE_BYTES as u64) as usize).await?
+        } else {
+            response.bytes().await.map_err(|e| diagnostic.transport_error(&e))?.to_vec()
+        };
         diagnostic.phase = "complete".into();
         diagnostic.outcome = "success".into();
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }.await;
     if diagnostic.outcome == "pending" { diagnostic.outcome = "configuration_error".into(); }
     diagnostic.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -6253,7 +6276,7 @@ async fn http_request_text(
     // Never log URLs: provider/CDN queries can carry signed credentials.
     eprintln!("[http_request_text] request");
     let started = std::time::Instant::now();
-    let timeout_ms = timeout_ms.unwrap_or(120_000).max(1);
+    let timeout_ms = generation_http::request_timeout_ms(timeout_ms, diagnostic_stage.as_deref(), &method);
     let mut diagnostic = generation_diagnostics::Record::new(diagnostic_stage.as_deref().unwrap_or("other"), timeout_ms);
     let result: Result<HttpTextResponse, String> = async {
         let client = llm_network::client(Duration::from_millis(timeout_ms))?;
@@ -6274,9 +6297,7 @@ async fn http_request_text(
         let response = request.send().await.map_err(|e| diagnostic.transport_error(&e))?;
         let status = response.status();
         diagnostic.headers(&response);
-        let body = response
-            .text().await
-            .map_err(|e| diagnostic.transport_error(&e))?;
+        let body = generation_http::read_text_bounded(response, &mut diagnostic).await?;
         diagnostic.phase = "complete".into();
         if !status.is_success() { diagnostic.error_body_id(&body); }
         diagnostic.finish(started, if status.is_success() { "success" } else { "http_error" });
@@ -6858,15 +6879,35 @@ fn parse_firmware_version(value: &str) -> Option<Vec<u64>> {
     Some(parts)
 }
 
+/// Build revision `-rNNN` of a P4 label (`0.7.103-p4-r144`, `0.7.103-p4-r142-framework`).
+/// Labels without one count as revision 0, so a revisioned build of the same numeric
+/// core is newer than an unrevisioned one. Mirrors `pc/src/lib/firmware-version.js`.
+fn parse_firmware_revision(value: &str) -> u64 {
+    value
+        .trim()
+        .split('-')
+        .skip(1)
+        .find_map(|segment| {
+            let digits = segment.strip_prefix('r')?;
+            if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            digits.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+}
+
 fn compare_firmware_versions(left: &str, right: &str) -> Result<VersionOrdering, String> {
-    let mut left = parse_firmware_version(left)
+    let mut left_parts = parse_firmware_version(left)
         .ok_or_else(|| format!("invalid device firmware version: {left}"))?;
-    let mut right = parse_firmware_version(right)
+    let mut right_parts = parse_firmware_version(right)
         .ok_or_else(|| format!("invalid bundled firmware version: {right}"))?;
-    let width = left.len().max(right.len());
-    left.resize(width, 0);
-    right.resize(width, 0);
-    Ok(left.cmp(&right))
+    let width = left_parts.len().max(right_parts.len());
+    left_parts.resize(width, 0);
+    right_parts.resize(width, 0);
+    Ok(left_parts
+        .cmp(&right_parts)
+        .then_with(|| parse_firmware_revision(left).cmp(&parse_firmware_revision(right))))
 }
 
 fn bundled_p4_firmware_path(app_handle: &tauri::AppHandle, resource: &str) -> Result<PathBuf, String> {
@@ -10734,6 +10775,15 @@ pub fn run() {
                 if let Some(window) = app.get_webview_window("main") { window.show()?; }
                 return Ok(());
             }
+            #[cfg(target_os="macos")]
+            if let Err(error)=desktop_window::route_macos_quit(app.handle()){
+                eprintln!("[desktop-menu] guarded Quit unavailable: {}",error);
+            }
+            // The tray is optional: shell/icon failures must not prevent the
+            // foreground app from starting. Without a tray, Close still exits.
+            if let Err(error)=desktop_window::init_tray(app.handle()){
+                eprintln!("[desktop-tray] unavailable; keeping foreground close/exit behavior: {}",error);
+            }
             desktop_window::fit(app.handle(),true);
             let bundled=app.path().resource_dir()?.join("builtin-clawpkgs");
             #[cfg(debug_assertions)]
@@ -10935,9 +10985,13 @@ pub fn run() {
         // stop the user's regular Pet Manager or its voice/USB connection.
         if cfg!(feature = "composer-diagnostic") { return; }
         match event {
-            RunEvent::WindowEvent { event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => {
-                if desktop_window::request_exit(app_handle){api.prevent_close();}
+            RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => {
+                if label=="main" && desktop_window::hide_main(app_handle){
+                    api.prevent_close();
+                }else if desktop_window::request_exit(app_handle){api.prevent_close();}
             },
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => desktop_window::show_main(app_handle),
             RunEvent::WindowEvent { event: tauri::WindowEvent::ScaleFactorChanged { .. }, .. } => desktop_window::fit(app_handle,false),
             RunEvent::ExitRequested { api, .. } => {
                 if desktop_window::request_exit(app_handle){api.prevent_exit();}
@@ -12882,6 +12936,24 @@ mod tests {
     }
 
     #[test]
+    fn openclaw_status_bridge_identity_alone_is_not_an_installed_cli() {
+        let (detected, status, detail) = openclaw_detection(None, true);
+        assert!(!detected);
+        assert_eq!(status, "not_found");
+        assert!(detail.contains("状态桥身份"));
+    }
+
+    #[test]
+    fn openclaw_cli_detection_stays_ready_with_or_without_bridge_identity() {
+        for has_status_bridge_identity in [true, false] {
+            let (detected, status, _) =
+                openclaw_detection(Some("/tmp/openclaw"), has_status_bridge_identity);
+            assert!(detected);
+            assert_eq!(status, "ready");
+        }
+    }
+
+    #[test]
     fn default_audio_cues_refresh_without_overwriting_uploaded_cues() {
         let temp = tempfile::tempdir().unwrap();
         let appearance = temp.path().join("appearance");
@@ -13150,6 +13222,20 @@ mod tests {
             VersionOrdering::Greater
         );
         assert!(compare_firmware_versions("unknown", "0.7.29-p4").is_err());
+        assert_eq!(parse_firmware_revision("0.7.103-p4-r142-framework"), 142);
+        assert_eq!(parse_firmware_revision("0.7.34-p4"), 0);
+        assert_eq!(
+            compare_firmware_versions("0.7.103-p4-r66", "0.7.103-p4-r144").unwrap(),
+            VersionOrdering::Less
+        );
+        assert_eq!(
+            compare_firmware_versions("0.7.104-p4", "0.7.104-p4-r180").unwrap(),
+            VersionOrdering::Less
+        );
+        assert_eq!(
+            compare_firmware_versions("0.7.104-p4-r1", "0.7.103-p4-r144").unwrap(),
+            VersionOrdering::Greater
+        );
     }
 
     fn write_test_clawpkg_dir(path: &Path) {

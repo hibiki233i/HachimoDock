@@ -627,6 +627,12 @@ impl Drop for SerialReaderPause<'_> {
     }
 }
 
+// Only these exact status reads are added. Do not generalize this to */query
+// or action-bearing control topics.
+fn serial_frame_is_bounded(topic: &str, live_frame: bool) -> bool {
+    live_frame || matches!(topic, "system/heartbeat" | "diagnostics/query")
+}
+
 fn flush_serial_writer<W: Write + ?Sized>(writer: &mut W) -> std::io::Result<()> {
     // Serial writes are unbuffered in user space. macOS tcdrain has no bounded
     // timeout; use the peer's protocol ACK as the delivery barrier instead.
@@ -991,8 +997,8 @@ fn probe_serial_port(
                 }
                 next_handshake_at = Instant::now() + SERIAL_PROBE_HANDSHAKE_RETRY_INTERVAL;
             }
-            let line = match read_serial_line_lossy(&mut reader, &mut line_buffer) {
-                Ok(Some(line)) => line,
+            let frame = match read_serial_frame(&mut reader, &mut line_buffer) {
+                Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
                 Err(error) => {
@@ -1000,8 +1006,8 @@ fn probe_serial_port(
                     break;
                 }
             };
-            let Some(mut message) = parse_serial_message(&line) else {
-                log_raw_serial_line(&line);
+            let Some(mut message) = parse_serial_frame(&frame) else {
+                log_raw_serial_line(&frame.text);
                 continue;
             };
             if message.topic != "hello" {
@@ -1011,12 +1017,7 @@ fn probe_serial_port(
                 failures.push(format!("{baud} baud rejected hello: {error}"));
                 continue;
             }
-            return Ok(ProbedSerialPort {
-                writer,
-                reader: reader.into_inner(),
-                baud,
-                hello: message,
-            });
+            return Ok(ProbedSerialPort::from_verified_reader(writer, reader, baud, message));
         }
         failures.push(format!("{baud} baud: no valid protocol hello"));
         if cfg!(windows) {
@@ -1356,10 +1357,30 @@ pub struct UsbSerialManager {
     device_response_waiters: Arc<Mutex<Vec<DeviceResponseWaiter>>>,
 }
 
+// Text is retained for bounded diagnostics, but lossy decoding must NEVER turn
+// corrupted bytes inside a JSON string into an accepted protocol payload.
+struct SerialFrame {
+    text: String,
+    valid_utf8: bool,
+}
+
+fn parse_serial_frame(frame: &SerialFrame) -> Option<SerialMessage> {
+    if !frame.valid_utf8 { return None; }
+    parse_serial_message(&frame.text)
+}
+
+#[cfg(test)]
 fn read_serial_line_lossy<R: BufRead>(
     reader: &mut R,
     buffer: &mut Vec<u8>,
 ) -> std::io::Result<Option<String>> {
+    Ok(read_serial_frame(reader, buffer)?.map(|frame| frame.text))
+}
+
+fn read_serial_frame<R: BufRead>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<Option<SerialFrame>> {
     // Keep incomplete frames across I/O timeouts, including during probing.
     // Bound both memory and work per call so noise cannot stall the probe loop.
     const MAX_SERIAL_LINE_BYTES: usize = 256 * 1024;
@@ -1392,9 +1413,12 @@ fn read_serial_line_lossy<R: BufRead>(
     while matches!(buffer.last(), Some(b'\n' | b'\r')) {
         buffer.pop();
     }
-    let line = String::from_utf8_lossy(buffer).into_owned();
+    let (text, valid_utf8) = match std::str::from_utf8(buffer) {
+        Ok(text) => (text.to_owned(), true),
+        Err(_) => (String::from_utf8_lossy(buffer).into_owned(), false),
+    };
     buffer.clear();
-    Ok(Some(line))
+    Ok(Some(SerialFrame { text, valid_utf8 }))
 }
 
 fn log_raw_serial_line(line: &str) {
@@ -1670,7 +1694,7 @@ impl UsbSerialManager {
     /// a powered-off peer never closes its TCP socket, so silence is the disconnect signal.
     fn spawn_reader<R, F>(
         &self,
-        reader_port: R,
+        reader_port: BufReader<R>,
         connection_id: u64,
         cancel_reader: Arc<AtomicBool>,
         capture_active: Arc<AtomicBool>,
@@ -1692,7 +1716,8 @@ impl UsbSerialManager {
         let serial_body_write_active = Arc::clone(&self.serial_body_write_active);
 
         thread::spawn(move || {
-            let mut reader = BufReader::new(reader_port);
+            // Keep the probe's BufReader: bytes prefetched after hello live in it.
+            let mut reader = reader_port;
             let mut line_buffer = Vec::with_capacity(32 * 1024);
             let mut read_failure=None;
             let mut last_hello_ack = None;
@@ -1705,8 +1730,8 @@ impl UsbSerialManager {
                     thread::sleep(Duration::from_millis(1));
                     continue;
                 }
-                let line = match read_serial_line_lossy(&mut reader, &mut line_buffer) {
-                    Ok(Some(line)) => line,
+                let frame = match read_serial_frame(&mut reader, &mut line_buffer) {
+                    Ok(Some(frame)) => frame,
                     Ok(None) => { read_failure=Some(("read_eof","end_of_stream",None)); break; },
                     Err(e) if matches!(e.kind(),std::io::ErrorKind::TimedOut|std::io::ErrorKind::Interrupted|std::io::ErrorKind::WouldBlock) => {
                         if cancel_reader.load(Ordering::SeqCst) {
@@ -1727,14 +1752,14 @@ impl UsbSerialManager {
                 };
 
                 last_rx = Instant::now();
-                if line.trim().is_empty() {
+                if frame.text.trim().is_empty() {
                     continue;
                 }
 
-                let mut msg = match parse_serial_message(&line) {
+                let mut msg = match parse_serial_frame(&frame) {
                     Some(message) => message,
                     None => {
-                        log_raw_serial_line(&line);
+                        log_raw_serial_line(&frame.text);
                         continue;
                     }
                 };
@@ -1896,7 +1921,7 @@ impl UsbSerialManager {
         }
         on_message(hello.topic, hello.payload);
         self.spawn_reader(
-            reader,
+            BufReader::new(reader),
             connection_id,
             cancel_reader,
             capture_active,
@@ -2085,13 +2110,16 @@ impl UsbSerialManager {
         // even after media itself stopped using flush()/tcdrain().
         let live_frame = audio_frame || topic == "widget/data" || topic == "app/snapshot"
             || (!bulk_frame && conn.capture_active.load(Ordering::Acquire));
+        // Heartbeats and read-only diagnostics keep RX running and recover only
+        // their unwritten suffix: a busy device is not a dead handle.
+        let bounded_frame = serial_frame_is_bounded(topic, live_frame);
         let write_result = {
-            let _pause = (!live_frame).then(|| SerialReaderPause::new(&self.serial_body_write_active));
+            let _pause = (!bounded_frame).then(|| SerialReaderPause::new(&self.serial_body_write_active));
             (|| {
-                if live_frame {
+                if bounded_frame {
                     let started=Instant::now();
                     let result=write_serial_live_frame(conn.writer.as_mut(), bytes,
-                        paced_slice_bytes.unwrap_or(bytes.len()), P4_CH343_SERIAL_WRITE_GAP);
+                        paced_slice_bytes.unwrap_or(bytes.len()), live_audio_pacing::serial_frame_gap(topic, P4_CH343_SERIAL_WRITE_GAP));
                     let report=match &result {Ok(report)=>report,Err(error)=>&error.report};
                     if result.is_err() || report.retries > 0 {
                         let stage=match topic {
@@ -2489,6 +2517,8 @@ impl UsbSerialManager {
         let chip_range = firmware_chip_range(&firmware)?;
         let chip_target = self.firmware_chip_target(&expected_board_device_id)?;
         validate_firmware_chip(chip_range, chip_target)?;
+        let actual_ota_status = self.query_firmware_status(&expected_board_device_id, firmware_connection_id)?;
+        firmware_transaction::ensure_device_firmware_headroom(&actual_ota_status, firmware.len())?;
         self.recover_stale_firmware_transfer(&expected_board_device_id, firmware_connection_id)?;
         let preferred_chunk_size =
             preferred_firmware_chunk_size(status.protocol_schema, &status.capabilities);
@@ -8089,6 +8119,62 @@ mod tests {
         assert!(usb_serial_device_prefers_high_speed(
             &macos_driver_name_only
         ));
+    }
+
+    #[test]
+    fn corrupted_utf8_inside_json_is_never_accepted_as_a_protocol_frame() {
+        let mut input = b"{\"topic\":\"session/select\",\"payload\":{\"id\":\"a".to_vec();
+        input.push(0xFF);
+        input.extend_from_slice(b"b\"}}\n{\"topic\":\"next\",\"payload\":{\"value\":\"\xE4\xB8\xAD\"}}\n");
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+        let mut buffer = Vec::new();
+        let damaged = read_serial_frame(&mut reader, &mut buffer).unwrap().unwrap();
+        assert!(!damaged.valid_utf8);
+        assert!(parse_serial_message(&damaged.text).is_some(), "lossy text alone would parse");
+        assert!(parse_serial_frame(&damaged).is_none());
+        let following = read_serial_frame(&mut reader, &mut buffer).unwrap().unwrap();
+        assert_eq!(parse_serial_frame(&following).unwrap().payload["value"], "中");
+    }
+
+    #[test]
+    fn only_exact_status_reads_join_the_bounded_write_path() {
+        assert!(serial_frame_is_bounded("system/heartbeat", false));
+        assert!(serial_frame_is_bounded("diagnostics/query", false));
+        assert!(serial_frame_is_bounded("anything", true));
+        for topic in ["asset/begin", "firmware/chunk", "input/config_query", "diagnostics/clear"] {
+            assert!(!serial_frame_is_bounded(topic, false), "{topic}");
+        }
+    }
+
+    #[test]
+    fn serial_probe_handoff_retains_prefetched_frames() {
+        let hello = b"{\"topic\":\"hello\",\"payload\":{}}\n";
+        let next = b"{\"topic\":\"debug/identity\",\"payload\":{\"requestId\":\"local-proof\"}}\n";
+        let final_line = b"{\"topic\":\"audio/status\",\"payload\":{\"active\":false}}\n";
+        let input = [hello.as_slice(), next.as_slice(), final_line.as_slice()].concat();
+        // Reproduce the old handoff with exactly the same production line reader.
+        let mut old = BufReader::new(std::io::Cursor::new(&input));
+        let mut line = Vec::new();
+        assert_eq!(parse_serial_message(&read_serial_line_lossy(&mut old, &mut line).unwrap().unwrap()).unwrap().topic, "hello");
+        assert!(!old.buffer().is_empty());
+        let mut discarded = BufReader::new(old.into_inner());
+        assert!(read_serial_line_lossy(&mut discarded, &mut line).unwrap().is_none());
+        // Includes a partially prefetched next frame, several complete frames,
+        // and buffers too small to prefetch. No scanning/salvaging/replay added.
+        for capacity in [1, 7, 32, 64, 512, 8192] {
+            let mut reader = BufReader::with_capacity(capacity, std::io::Cursor::new(&input));
+            let first = read_serial_line_lossy(&mut reader, &mut line).unwrap().unwrap();
+            let message = parse_serial_message(&first).unwrap();
+            let prefetched = reader.buffer().to_vec();
+            let mut connected = ProbedSerialPort::from_verified_reader(Vec::<u8>::new(), reader, 4_000_000, message);
+            assert_eq!(connected.reader.buffer(), prefetched);
+            assert_eq!(connected.hello.topic, "hello");
+            assert_eq!(connected.baud, 4_000_000);
+            for expected in [next.as_slice(), final_line.as_slice()] {
+                assert_eq!(read_serial_line_lossy(&mut connected.reader, &mut line).unwrap().unwrap().as_bytes(), &expected[..expected.len()-1]);
+            }
+            assert!(read_serial_line_lossy(&mut connected.reader, &mut line).unwrap().is_none());
+        }
     }
 
     #[test]

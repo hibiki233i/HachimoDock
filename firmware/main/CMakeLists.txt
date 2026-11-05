@@ -16,6 +16,7 @@ idf_component_register(
     "pet_p4_conversation.c"
     "pet_p4_diagnostics.c"
     "pet_p4_font_cn.c"
+    "pet_p4_font_bitmap.c"
     "pet_p4_game.c"
     "pet_p4_input.c"
     "pet_p4_input_core.c"
@@ -87,6 +88,22 @@ endforeach()
 foreach(art center_background.jpg center_thumbs.deflate)
   target_add_binary_data(${COMPONENT_LIB} "${CMAKE_CURRENT_LIST_DIR}/../assets/component-center/${art}" BINARY)
 endforeach()
+target_add_binary_data(${COMPONENT_LIB} "${CMAKE_CURRENT_LIST_DIR}/../assets/fonts/pet_cn_16.deflate" BINARY)
+target_add_binary_data(${COMPONENT_LIB} "${CMAKE_CURRENT_LIST_DIR}/../assets/fonts/pet_cn_metrics.deflate" BINARY)
+execute_process(
+  COMMAND "${PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/../tools/compress_font_metrics.py" "--check"
+  RESULT_VARIABLE PET_FONT_METRICS_STATUS
+)
+if(NOT PET_FONT_METRICS_STATUS EQUAL 0)
+  message(FATAL_ERROR "Stale lossless font metric asset")
+endif()
+execute_process(
+  COMMAND "${PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/../tools/compress_font_asset.py" "--check"
+  RESULT_VARIABLE PET_FONT_PACK_STATUS
+)
+if(NOT PET_FONT_PACK_STATUS EQUAL 0)
+  message(FATAL_ERROR "Lossless font asset is stale; run tools/compress_font_asset.py")
+endif()
 execute_process(
   COMMAND "${PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/../tools/compress_instrument_assets.py" "--check"
   RESULT_VARIABLE PET_INSTRUMENT_PACK_STATUS
