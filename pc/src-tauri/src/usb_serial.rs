@@ -1011,12 +1011,7 @@ fn probe_serial_port(
                 failures.push(format!("{baud} baud rejected hello: {error}"));
                 continue;
             }
-            return Ok(ProbedSerialPort {
-                writer,
-                reader: reader.into_inner(),
-                baud,
-                hello: message,
-            });
+            return Ok(ProbedSerialPort::from_verified_reader(writer, reader, baud, message));
         }
         failures.push(format!("{baud} baud: no valid protocol hello"));
         if cfg!(windows) {
@@ -1670,7 +1665,7 @@ impl UsbSerialManager {
     /// a powered-off peer never closes its TCP socket, so silence is the disconnect signal.
     fn spawn_reader<R, F>(
         &self,
-        reader_port: R,
+        reader_port: BufReader<R>,
         connection_id: u64,
         cancel_reader: Arc<AtomicBool>,
         capture_active: Arc<AtomicBool>,
@@ -1692,7 +1687,8 @@ impl UsbSerialManager {
         let serial_body_write_active = Arc::clone(&self.serial_body_write_active);
 
         thread::spawn(move || {
-            let mut reader = BufReader::new(reader_port);
+            // Keep the probe's BufReader: bytes prefetched after hello live in it.
+            let mut reader = reader_port;
             let mut line_buffer = Vec::with_capacity(32 * 1024);
             let mut read_failure=None;
             let mut last_hello_ack = None;
@@ -1896,7 +1892,7 @@ impl UsbSerialManager {
         }
         on_message(hello.topic, hello.payload);
         self.spawn_reader(
-            reader,
+            BufReader::new(reader),
             connection_id,
             cancel_reader,
             capture_active,
@@ -2091,7 +2087,7 @@ impl UsbSerialManager {
                 if live_frame {
                     let started=Instant::now();
                     let result=write_serial_live_frame(conn.writer.as_mut(), bytes,
-                        paced_slice_bytes.unwrap_or(bytes.len()), P4_CH343_SERIAL_WRITE_GAP);
+                        paced_slice_bytes.unwrap_or(bytes.len()), live_audio_pacing::serial_frame_gap(topic, P4_CH343_SERIAL_WRITE_GAP));
                     let report=match &result {Ok(report)=>report,Err(error)=>&error.report};
                     if result.is_err() || report.retries > 0 {
                         let stage=match topic {
@@ -2489,6 +2485,8 @@ impl UsbSerialManager {
         let chip_range = firmware_chip_range(&firmware)?;
         let chip_target = self.firmware_chip_target(&expected_board_device_id)?;
         validate_firmware_chip(chip_range, chip_target)?;
+        let actual_ota_status = self.query_firmware_status(&expected_board_device_id, firmware_connection_id)?;
+        firmware_transaction::ensure_device_firmware_headroom(&actual_ota_status, firmware.len())?;
         self.recover_stale_firmware_transfer(&expected_board_device_id, firmware_connection_id)?;
         let preferred_chunk_size =
             preferred_firmware_chunk_size(status.protocol_schema, &status.capabilities);
@@ -8089,6 +8087,37 @@ mod tests {
         assert!(usb_serial_device_prefers_high_speed(
             &macos_driver_name_only
         ));
+    }
+
+    #[test]
+    fn serial_probe_handoff_retains_prefetched_frames() {
+        let hello = b"{\"topic\":\"hello\",\"payload\":{}}\n";
+        let next = b"{\"topic\":\"debug/identity\",\"payload\":{\"requestId\":\"local-proof\"}}\n";
+        let final_line = b"{\"topic\":\"audio/status\",\"payload\":{\"active\":false}}\n";
+        let input = [hello.as_slice(), next.as_slice(), final_line.as_slice()].concat();
+        // Reproduce the old handoff with exactly the same production line reader.
+        let mut old = BufReader::new(std::io::Cursor::new(&input));
+        let mut line = Vec::new();
+        assert_eq!(parse_serial_message(&read_serial_line_lossy(&mut old, &mut line).unwrap().unwrap()).unwrap().topic, "hello");
+        assert!(!old.buffer().is_empty());
+        let mut discarded = BufReader::new(old.into_inner());
+        assert!(read_serial_line_lossy(&mut discarded, &mut line).unwrap().is_none());
+        // Includes a partially prefetched next frame, several complete frames,
+        // and buffers too small to prefetch. No scanning/salvaging/replay added.
+        for capacity in [1, 7, 32, 64, 512, 8192] {
+            let mut reader = BufReader::with_capacity(capacity, std::io::Cursor::new(&input));
+            let first = read_serial_line_lossy(&mut reader, &mut line).unwrap().unwrap();
+            let message = parse_serial_message(&first).unwrap();
+            let prefetched = reader.buffer().to_vec();
+            let mut connected = ProbedSerialPort::from_verified_reader(Vec::<u8>::new(), reader, 4_000_000, message);
+            assert_eq!(connected.reader.buffer(), prefetched);
+            assert_eq!(connected.hello.topic, "hello");
+            assert_eq!(connected.baud, 4_000_000);
+            for expected in [next.as_slice(), final_line.as_slice()] {
+                assert_eq!(read_serial_line_lossy(&mut connected.reader, &mut line).unwrap().unwrap().as_bytes(), &expected[..expected.len()-1]);
+            }
+            assert!(read_serial_line_lossy(&mut connected.reader, &mut line).unwrap().is_none());
+        }
     }
 
     #[test]
