@@ -19,9 +19,13 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { prepareBuiltInP4Ready } from "./prepare-p4-ready-assets.mjs";
 import { cleanSkillBytecode } from "./clean-skill-bytecode.mjs";
+import { prepareVoiceRuntime } from "./voice-runtime-resources.mjs";
+import { copyNodeRuntimeLicense, verifyDesktopLicenseInventory } from "./dependency-license-resources.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDir, "../..");
+// Fail before any resource write if the public dependency grant inventory is incomplete or stale.
+verifyDesktopLicenseInventory(repositoryRoot);
 const tauriRoot = join(repositoryRoot, "pc", "src-tauri");
 const bridgeRuntimePackage = join(
   tauriRoot,
@@ -34,6 +38,7 @@ const bundledP4FirmwareDir = join(tauriRoot, "firmware", "esp32-p4");
 const p4ProjectCmake = join(repositoryRoot, "firmware", "CMakeLists.txt");
 const auditedFfmpegBinarySha256 = {
   "macos-arm64": "e340c148c720888a528e7bd2e7867da3b4bea91d1f6e508c9526111257ee0468",
+  "macos-x64": "8817b8186324bcfac4c18070ba7c1981cf05b1de2b722ed0514fa6dfce4e9bf0",
   "windows-x64": "1cefca14ea713d5d7e7a1b948299142831185487f5efb14914d049ba9090d95f",
 };
 
@@ -348,7 +353,7 @@ function readFirmwareBuildId(firmware, version) {
   return readNullTerminatedUtf8(firmware.subarray(offset, offset + 128));
 }
 
-function validateBundledP4Firmware(target, firmwareName, expectedMin, expectedMax) {
+function validateBundledP4Firmware(target, firmwareName, expectedMin, expectedMax, pinnedVersion = "") {
   const bundledP4Firmware = join(bundledP4FirmwareDir, firmwareName);
   if (!existsSync(bundledP4Firmware)) {
     throw new Error(`缺少 PC 内置 P4 固件：${bundledP4Firmware}`);
@@ -370,7 +375,7 @@ function validateBundledP4Firmware(target, firmwareName, expectedMin, expectedMa
   const projectName = readNullTerminatedUtf8(firmware.subarray(descriptorOffset + 48, descriptorOffset + 80));
   const cmake = readFileSync(p4ProjectCmake, "utf8");
   const sourceVersion = cmake.match(/set\(PROJECT_VER\s+"([^"]+)"\)/)?.[1] || "";
-  const expectedVersion = sourceVersion;
+  const expectedVersion = pinnedVersion || sourceVersion;
   if (projectName !== "pet_manager_p4_runtime") {
     throw new Error(`PC 内置固件 projectName 异常：${projectName || "(empty)"}`);
   }
@@ -396,22 +401,7 @@ function ensureBridgeDependencies() {
   if (Object.keys(manifest.dependencies || {}).every((name) =>
     existsSync(join(bridgeRuntimePackage, "node_modules", name, "package.json")))) return;
 
-  const npmArgs = ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"];
-  const npmExecPath = process.env.npm_execpath;
-  const result = npmExecPath
-    ? spawnSync(process.execPath, [npmExecPath, ...npmArgs], {
-        cwd: bridgeRuntimePackage,
-        stdio: "inherit",
-      })
-    : spawnSync("npm", npmArgs, {
-        cwd: bridgeRuntimePackage,
-        stdio: "inherit",
-        shell: process.platform === "win32",
-      });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`bridge 生产依赖安装失败，npm 退出码 ${result.status}`);
-  }
+  throw new Error("缺少 bridge 生产依赖；打包准备不会安装依赖，请恢复已审核的本地锁定运行资源");
 }
 
 const target = requestedTarget(process.argv.slice(2), process.platform);
@@ -420,10 +410,14 @@ if (builtinsCheck.status !== 0) throw new Error('Built-in local-delights resourc
 // Python validation may leave bytecode containing absolute build-machine paths.
 cleanSkillBytecode(join(repositoryRoot, "pc", "skills", "petui"));
 const targetArch = requestedArch(target, process.platform, process.arch);
+// Validate historical non-P4 voice resources only when explicitly supplied; P4 uses native ASR.
+const voiceRuntime = prepareVoiceRuntime({tauriRoot,target,arch:targetArch});
+if(voiceRuntime.enabled)console.log("Explicit legacy voice bundle requires --config src-tauri/tauri.voice-legacy.conf.json");
 const runtimeName = target === "windows" ? "node.exe" : "node";
 const targetRuntime = join(generatedRuntime, runtimeName);
-const p4Firmware = validateBundledP4Firmware(target, "firmware.bin", 1, 199);
-validateBundledP4Firmware(target, "firmware-v3.bin", 300, 399);
+// Only v3 is built, so the v1 image stays at its last release as a validation resource.
+validateBundledP4Firmware(target, "firmware.bin", 1, 199, "0.7.104-p4");
+const p4Firmware = validateBundledP4Firmware(target, "firmware-v3.bin", 300, 399);
 let sourceRuntime = process.env.PET_MANAGER_NODE_BIN
   ? resolve(process.env.PET_MANAGER_NODE_BIN)
   : process.execPath;
@@ -461,6 +455,8 @@ if (resolve(sourceRuntime) !== resolve(targetRuntime)) {
 }
 if (target !== "windows") chmodSync(targetRuntime, 0o755);
 
+copyNodeRuntimeLicense(targetRuntime, join(repositoryRoot, "licenses"), generatedRuntime);
+
 const ffmpegRuntimeName = ensureBundledFfmpeg(target, targetArch);
 
 const buildHostFfmpeg = process.env.PET_MANAGER_BUILD_FFMPEG_BIN || "ffmpeg";
@@ -472,5 +468,5 @@ const p4Ready = prepareBuiltInP4Ready({
 });
 
 console.log(
-  `desktop resources ready: ${target}-${targetArch}, generated-runtime/${runtimeName}, generated-runtime/${ffmpegRuntimeName} (LGPL-only system H.264), p4-ready/${p4Ready.profile} (${p4Ready.bytes} bytes), firmware/${p4Firmware.buildId} (${p4Firmware.bytes} bytes, sha256 ${p4Firmware.sha256})`,
+  `desktop resources ready: ${target}-${targetArch}, legacy-voice=${voiceRuntime.enabled ? voiceRuntime.manifestSha256 : "not-included (P4 native ASR)"}, generated-runtime/${runtimeName}, generated-runtime/${ffmpegRuntimeName} (LGPL-only system H.264), p4-ready/${p4Ready.profile} (${p4Ready.bytes} bytes), firmware/${p4Firmware.buildId} (${p4Firmware.bytes} bytes, sha256 ${p4Firmware.sha256})`,
 );

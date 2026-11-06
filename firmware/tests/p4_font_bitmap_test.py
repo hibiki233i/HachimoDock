@@ -6,12 +6,8 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import sys
-
-import pytest
 ROOT = Path(__file__).resolve().parents[1]
-LVGL = ROOT / 'managed_components/lvgl__lvgl'
 
-@pytest.mark.skipif(not LVGL.is_dir(), reason='LVGL headers come from a firmware build')
 def test_all_original_glyph_bytes_and_reproducible_pack():
     script = ROOT / 'tools/compress_font_asset.py'
     spec = importlib.util.spec_from_file_location('font_pack', script)

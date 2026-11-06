@@ -14,7 +14,7 @@ use std::time::Duration;
 // decoded 4 KiB receiver with a 32 KiB JSON line buffer. Keep three bytes below
 // that decoded ceiling so full Base64 chunks have no padding. Schema-5 boards
 // have the same receiver budget but may spuriously clear a live transaction;
-// the desktop restarts that bounded transaction instead of slowing every chunk.
+// the desktop stops rather than guessing whether that transaction survived.
 // Older receivers retain the sub-4-KiB wire line below. Every size is drained
 // through short physical serial writes.
 pub(super) const P4_FIRMWARE_FAST_CHUNK_SIZE: usize = 4_092;
@@ -23,7 +23,6 @@ pub(super) const P4_FIRMWARE_FALLBACK_CHUNK_SIZE: usize = 1_020;
 pub(super) const P4_FIRMWARE_SAFE_CHUNK_SIZE: usize = 510;
 pub(super) const P4_FIRMWARE_FAST_PROTOCOL_SCHEMA: u32 = 6;
 pub(super) const P4_FIRMWARE_IDLE_CLOCK_BUG_SCHEMA: u32 = 5;
-pub(super) const P4_FIRMWARE_IDLE_CLOCK_RECOVERY_ATTEMPTS: usize = 20;
 pub(super) const P4_FIRMWARE_CORRUPTION_RETRIES_BEFORE_FALLBACK: usize = 3;
 pub(super) const P4_FIRMWARE_RECOVERY_SUCCESS_STREAK: usize = 32;
 pub(super) const P4_FIRMWARE_MAX_IMAGE_SIZE: usize = 0x280000;
@@ -34,9 +33,7 @@ pub(super) const P4_FIRMWARE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const P4_FIRMWARE_CHUNK_ACK_TIMEOUT: Duration = Duration::from_millis(150);
 pub(super) const P4_FIRMWARE_COMMIT_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 pub(super) const P4_FIRMWARE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(90);
-pub(super) const P4_FIRMWARE_BEGIN_MAX_ATTEMPTS: usize = 3;
 pub(super) const P4_FIRMWARE_CHUNK_MAX_ATTEMPTS: usize = 20;
-pub(super) const P4_FIRMWARE_COMMIT_MAX_ATTEMPTS: usize = 3;
 pub(super) const P4_FIRMWARE_PROJECT_NAME: &str = "pet_manager_p4_runtime";
 pub(super) const ESP_IMAGE_HEADER_SIZE: usize = 24;
 pub(super) const ESP_IMAGE_SEGMENT_HEADER_SIZE: usize = 8;
@@ -79,51 +76,57 @@ pub(super) enum FirmwareCommandError {
 
 // A desktop image ceiling never enlarges an existing device's physical slot.
 // Check its current table before any stale-transfer abort or begin/erase.
-pub(super) fn ensure_device_firmware_headroom(status: &Value, image_bytes: usize) -> Result<(), String> {
-    const MIN_HEADROOM: u64 = 131_072;
-    let size = status.pointer("/nextPartition/size").and_then(Value::as_u64)
-        .filter(|v| *v > 0 && *v <= P4_FIRMWARE_MAX_IMAGE_SIZE as u64 && *v % 4096 == 0)
+pub(super) fn ensure_device_firmware_headroom(status:&Value,image_bytes:usize)->Result<(),String> {
+    const MIN_HEADROOM:u64=131_072;
+    let size=status.pointer("/nextPartition/size").and_then(Value::as_u64)
+        .filter(|v|*v>0 && *v<=P4_FIRMWARE_MAX_IMAGE_SIZE as u64 && *v%4096==0)
         .ok_or("无法确认设备实际 OTA 分区容量；未开始更新，也未清除任何传输")?;
-    let next = status.pointer("/nextPartition/label").and_then(Value::as_str);
-    let running = status.pointer("/runningPartition/label").and_then(Value::as_str);
-    if status["supported"] != true || !matches!(next, Some("ota_0" | "ota_1"))
-        || !matches!(running, Some("ota_0" | "ota_1")) || next == running {
+    let next=status.pointer("/nextPartition/label").and_then(Value::as_str);
+    let running=status.pointer("/runningPartition/label").and_then(Value::as_str);
+    if status["supported"]!=true || !matches!(next,Some("ota_0"|"ota_1")) || !matches!(running,Some("ota_0"|"ota_1")) || next==running {
         return Err("设备未提供独立的 OTA 更新槽，未开始更新".into());
     }
-    if image_bytes == 0 || (image_bytes as u64).checked_add(MIN_HEADROOM).is_none_or(|need| need > size) {
-        return Err("设备当前 OTA 分区余量不足，须保留至少 128 KiB。普通 OTA 不会扩大分区；如需调整，请使用完整烧录。".into());
+    if image_bytes==0 || (image_bytes as u64).checked_add(MIN_HEADROOM).is_none_or(|need|need>size) {
+        return Err("设备当前 OTA 分区余量不足，须保留至少 128 KiB。普通 OTA 不会扩大分区；如需调整，请使用完整 USB 初始化流程（会清空设备资源）。此次未开始更新。".into());
     }
     Ok(())
 }
-#[cfg(test)]
-mod capacity_tests {
-    use super::*;
-    use serde_json::json;
-    fn status(size: u64) -> Value {
-        json!({"supported":true,"runningPartition":{"label":"ota_0"},"nextPartition":{"label":"ota_1","size":size}})
+#[cfg(test)]mod capacity_tests {
+    use super::*;use serde_json::json;
+    fn status(size:u64)->Value {json!({"supported":true,"runningPartition":{"label":"ota_0"},"nextPartition":{"label":"ota_1","size":size}})}
+    #[test]fn the_physical_slot_keeps_the_headroom_boundary(){
+        let size=0x280000;assert!(ensure_device_firmware_headroom(&status(size),size as usize-131072).is_ok());assert!(ensure_device_firmware_headroom(&status(size),size as usize-131071).is_err());
+        assert!(ensure_device_firmware_headroom(&status(0x280000),0x290000).is_err());
     }
-    #[test]
-    fn actual_slots_keep_the_same_headroom_boundary() {
-        for size in [0x200000usize, P4_FIRMWARE_MAX_IMAGE_SIZE] {
-            assert!(ensure_device_firmware_headroom(&status(size as u64), size - 131_072).is_ok());
-            assert!(ensure_device_firmware_headroom(&status(size as u64), size - 131_071).is_err());
-        }
+    #[test]fn a_slot_larger_than_the_reviewed_table_fails_closed(){
+        assert!(ensure_device_firmware_headroom(&status(0x300000),1024).is_err());
     }
-    #[test]
-    fn missing_coerced_oversize_and_same_slot_fail_closed() {
-        for size in [Value::Null, json!("2621440"), json!(-1), json!(2621440.5), json!(0x400000), json!(0x280001)] {
-            let mut s = status(0x280000);
-            s["nextPartition"]["size"] = size;
-            assert!(ensure_device_firmware_headroom(&s, 1024).is_err());
-        }
-        let mut same = status(0x280000);
-        same["nextPartition"]["label"] = "ota_0".into();
-        assert!(ensure_device_firmware_headroom(&same, 1024).is_err());
-        let mut unsupported = status(0x280000);
-        unsupported["supported"] = false.into();
-        assert!(ensure_device_firmware_headroom(&unsupported, 1024).is_err());
-        assert!(ensure_device_firmware_headroom(&status(0x280000), 0).is_err());
+    #[test]fn missing_coerced_oversize_and_same_slot_fail_closed(){
+        for size in [Value::Null,json!("3145728"),json!(-1),json!(3145728.5),json!(0x400000)] {let mut s=status(0x280000);s["nextPartition"]["size"]=size;assert!(ensure_device_firmware_headroom(&s,1024).is_err());}
+        let mut s=status(0x280000);s["nextPartition"]["label"]="ota_0".into();assert!(ensure_device_firmware_headroom(&s,1024).is_err());
+        assert!(ensure_device_firmware_headroom(&status(0x280000),0).is_err());
     }
+}
+
+// A free-text rejection is not proof that the requested bytes were un-applied.
+// The current firmware emits this exact shape before esp_ota_write and before
+// advancing its progress. Missing/contradictory fields must remain Unknown.
+pub(super) fn firmware_base64_rejection_unapplied(
+    ack: &Value, request: &Value, expected_next: u64, expected_bytes: u64,
+) -> bool {
+    let Some(sequence) = expected_next.checked_sub(1) else { return false; };
+    let Some(size) = request["decodedSize"].as_u64().filter(|v| *v > 0) else { return false; };
+    let Some(offset) = expected_bytes.checked_sub(size) else { return false; };
+    ack["ok"].as_bool() == Some(false)
+        && ack["error"].as_str() == Some("firmware chunk base64 mismatch")
+        && ack["phase"] == "chunk"
+        && request["transferId"].as_str().is_some_and(|id| !id.is_empty() && ack["transferId"].as_str() == Some(id))
+        && request["seq"].as_u64() == Some(sequence)
+        && ack["seq"].as_u64() == Some(sequence)
+        && ack["nextSequence"].as_u64() == Some(sequence)
+        && ack["receivedBytes"].as_u64() == Some(offset)
+        && ack["chunkBytes"].as_u64() == Some(0)
+        && ack["duplicate"].as_bool() == Some(false)
 }
 
 pub(super) fn firmware_corruption_fallback_size(
@@ -133,7 +136,7 @@ pub(super) fn firmware_corruption_fallback_size(
     if !matches!(
         error,
         FirmwareCommandError::Rejected(message)
-            if message.contains("firmware chunk base64 mismatch")
+            if message == "firmware chunk base64 mismatch"
     ) {
         return None;
     }
@@ -177,23 +180,13 @@ pub(super) fn initial_firmware_chunk_size(protocol_schema: u32, preferred_size: 
 
 pub(super) fn firmware_chunk_error_is_retryable(error: &FirmwareCommandError) -> bool {
     match error {
-        FirmwareCommandError::Timeout { .. } => true,
+        // Timeout is an unknown write outcome, never permission to replay.
+        FirmwareCommandError::Timeout { .. } => false,
         FirmwareCommandError::Rejected(message) => {
-            message.contains("firmware chunk base64 mismatch")
+            message == "firmware chunk base64 mismatch"
         }
         FirmwareCommandError::Send(_) => false,
     }
-}
-
-pub(super) fn should_restart_firmware_transaction(
-    protocol_schema: u32,
-    error: &str,
-    transaction_attempt: usize,
-    max_transaction_attempts: usize,
-) -> bool {
-    protocol_schema == P4_FIRMWARE_IDLE_CLOCK_BUG_SCHEMA
-        && error.contains("firmware transferId mismatch")
-        && transaction_attempt < max_transaction_attempts
 }
 
 pub(super) fn firmware_recovery_chunk_size(
@@ -384,5 +377,34 @@ pub(super) fn evaluate_firmware_validation(
         other => Err(format!(
             "firmware {expected_version} restarted with invalid imageState={other}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod ack_rejection_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn only_complete_unadvanced_base64_rejection_proves_not_applied() {
+        let request=json!({"transferId":"tx","seq":2,"decodedSize":16});
+        let ack=json!({"transferId":"tx","phase":"chunk","ok":false,"error":"firmware chunk base64 mismatch",
+            "seq":2,"nextSequence":2,"receivedBytes":32,"chunkBytes":0,"duplicate":false});
+        assert!(firmware_base64_rejection_unapplied(&ack,&request,3,48));
+        for (key,value) in [("ok",json!(null)),("ok",json!("false")),("seq",json!(1)),
+            ("nextSequence",json!(3)),("receivedBytes",json!(48)),("chunkBytes",json!(16)),
+            ("duplicate",json!(true)),("duplicate",json!(null)),("transferId",json!("other")),
+            ("error",json!("prefix firmware chunk base64 mismatch")),("phase",json!("commit"))] {
+            let mut bad=ack.clone();bad[key]=value;
+            assert!(!firmware_base64_rejection_unapplied(&bad,&request,3,48),"{key}: {bad}");
+        }
+        for key in ["ok","seq","nextSequence","receivedBytes","chunkBytes","duplicate","transferId","phase","error"] {
+            let mut bad=ack.clone();bad.as_object_mut().unwrap().remove(key);
+            assert!(!firmware_base64_rejection_unapplied(&bad,&request,3,48),"missing {key}");
+        }
+        assert!(!firmware_base64_rejection_unapplied(&ack,&request,0,48));
+        assert!(!firmware_base64_rejection_unapplied(&ack,&request,3,15));
+        let near=FirmwareCommandError::Rejected("prefix firmware chunk base64 mismatch".into());
+        assert!(!firmware_chunk_error_is_retryable(&near));
+        assert!(firmware_corruption_fallback_size(P4_FIRMWARE_FAST_CHUNK_SIZE,&near).is_none());
     }
 }

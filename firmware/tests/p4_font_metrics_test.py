@@ -5,10 +5,7 @@ import importlib.util
 import subprocess
 import sys
 import zlib
-
-import pytest
 ROOT=Path(__file__).resolve().parents[1]
-LVGL=ROOT/'managed_components/lvgl__lvgl'
 
 
 def load(name,file):
@@ -16,7 +13,6 @@ def load(name,file):
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 
 
-@pytest.mark.skipif(not LVGL.is_dir(),reason='LVGL headers come from a firmware build')
 def test_all_original_metric_records_and_actual_lvgl_descriptors():
     pack=load('metric_records','compress_font_metrics.py');raw=pack.metrics_bytes()
     assert len(raw)==169664 and hashlib.sha256(raw).hexdigest()=='63e69048a92d090d59cd7466ff6554e98055dba83bd9da69205099a600a9bb49'
@@ -32,7 +28,6 @@ def test_all_original_metric_records_and_actual_lvgl_descriptors():
     assert '.glyph_dsc = PET_FONT_GLYPH_METRICS' in text and '#define glyph_dsc ' not in text
 
 
-@pytest.mark.skipif(not LVGL.is_dir(),reason='LVGL headers come from a firmware build')
 def test_actual_combined_init_reconstructs_all_fields_and_latches_failures(tmp_path):
     (tmp_path/'esp_attr.h').write_text('#pragma once\n#define EXT_RAM_BSS_ATTR\n')
     (tmp_path/'miniz.h').write_text(r'''
@@ -121,13 +116,13 @@ int main(int argc,char**argv){
             subprocess.run([str(exe),str(mode),str(tmp_path/'bitmap.bin'),str(tmp_path/'metrics.bin')],check=True,timeout=10)
 
 
-@pytest.mark.skipif(not LVGL.is_dir(),reason='LVGL headers come from a firmware build')
 def test_metadata_parent_and_boot_only_boundary(tmp_path):
     import configparser
     config=configparser.ConfigParser(interpolation=None);config.read(ROOT/'platformio.ini')
-    # The fork's 2.5 MiB OTA slots need packed fonts in every production image.
-    flags=config['env:esp32_p4_evboard']['build_flags']
-    assert 'PET_FONT_BITMAP_PACKED=1' in flags and 'PET_FONT_METRICS_PACKED=1' in flags
+    for section in config.sections():
+        flags=config[section].get('build_flags','')
+        if section=='env:esp32_p4_glyph_rows_parent':assert 'PET_FONT_METRICS_PACKED=1' in flags
+        else:assert 'PET_FONT_METRICS_PACKED=1' not in flags
     # CMake and PlatformIO own separate embedding graphs. Both declarations
     # are required; a host incbin test cannot prove the SCons .S was generated.
     embedded=[section for section in config.sections() if 'board_build.embed_files' in config[section]]

@@ -72,6 +72,13 @@ fn system(host: &str) -> Answers {
     })).as_ref().map_err(Clone::clone)?;
     resolver.request(host,Duration::from_secs(3))
 }
+/// Bounded system DNS only. This does not add DoH fallback, host permissions,
+/// proxy use or implicit address acceptance to pc-fetch. Its caller must check
+/// every answer against its existing public-IP policy before pinning it.
+pub(crate) fn system_addresses(host:&str,port:u16)->Result<Vec<SocketAddr>,String>{
+    system(host).map(|ips|ips.into_iter().map(|ip|SocketAddr::new(ip,port)).collect())
+}
+
 fn decode(host: &str, body: &[u8]) -> Result<(Vec<IpAddr>, u64), String> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| "安全域名解析响应无效")?;
@@ -118,7 +125,6 @@ fn secure(host: &str) -> Result<(Vec<IpAddr>, u64), String> {
     // A private answer is a hard rejection, never a reason to try another server.
     for (resolver, ip, path) in [
         ("dns.alidns.com", [223, 5, 5, 5], "/resolve"),
-        ("cloudflare-dns.com", [1, 1, 1, 1], "/dns-query"),
     ] {
         if let Ok(body) = secure_body(host, resolver, ip, path) {
             return decode(host, &body);

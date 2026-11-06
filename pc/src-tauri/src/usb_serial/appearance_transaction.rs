@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,8 @@ const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV1A64_PRIME: u64 = 0x00000100000001b3;
 pub(super) const P4_BUILTIN_APPEARANCE_SLOT: u32 = 0;
 pub(super) const P4_RAW_APPEARANCE_SLOT: u32 = 1;
+/// Mirrors firmware `PET_P4_APPEARANCE_SLOT_COUNT`. The shared C query vectors pin the two.
+pub(super) const P4_APPEARANCE_SLOT_COUNT: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub(super) struct AppearanceAssetEntry {
@@ -206,6 +208,27 @@ pub(super) fn parse_p4_appearance_slot_state(
         })
         .collect();
     Ok(P4AppearanceSlotState { active_slot, slots })
+}
+
+/// Rows of a quiescent slot proof as `(slot, valid, row)`. Firmware reports every slot, empty
+/// ones included, so a short, long, repeated or out-of-range list proves nothing.
+pub(super) fn p4_slot_proof_rows(ack: &Value) -> Option<Vec<(u32, bool, &Value)>> {
+    let rows = ack
+        .get("slots")?
+        .as_array()
+        .filter(|rows| rows.len() == P4_APPEARANCE_SLOT_COUNT as usize)?;
+    let mut seen = HashSet::new();
+    rows.iter()
+        .map(|row| {
+            let slot = row
+                .get("slot")?
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|slot| *slot < P4_APPEARANCE_SLOT_COUNT)?;
+            let valid = row.get("valid")?.as_bool()?;
+            seen.insert(slot).then_some((slot, valid, row))
+        })
+        .collect()
 }
 
 /// Raw video capacities per slot (`appearance.slotCapacityBytes`, 0 = no such partition).

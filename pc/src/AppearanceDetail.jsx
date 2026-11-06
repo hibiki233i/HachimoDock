@@ -1,8 +1,8 @@
 /**
  * [Input] An appearanceId persisted by `lib/appearance-store.js` plus centralized API-settings navigation.
  * [Output] Preview-first wide appearance workspace, unified sticky current-state inspector, full-width state rail, contextual details drawer,
- *          configurable per-family WAV and built-in video overrides, refreshed prepared-pack statistics without resetting draft quality inputs,
- *          device quality/rebuild controls, and direct per-state MP4 replacement,
+ *          global WAV cue controls shared by every appearance, built-in video overrides, refreshed prepared-pack statistics without resetting draft quality inputs,
+ *          device quality/rebuild controls, persisted video generation parameters and direct per-state MP4 replacement,
  *          Ark-background single-state image+prompt regeneration with read-only provider credential readiness, inline progress, cancellable exact-board USB appearance transfer, and full known-state rail.
  * [Pos] component node in pc/src
  * [Sync] If this file changes, update this header and `pc/src/.folder.md`.
@@ -18,23 +18,19 @@ import {
   Loader,
   Upload,
   UploadCloud,
-  Volume2,
   ImageUp,
   X,
 } from "lucide-react";
 import {
   deleteAppearance,
   getAppearance,
-  readAudioAsBlobUrl,
-  removeFamilyAudioCue,
-  replaceFamilyAudioCue,
   replaceFamilyVideo,
   readAppearanceSourceImage,
   inspectSavedAppearance, rebuildSavedAppearance, restoreBuiltinVideos, restoreBuiltinFactoryAppearance,
 } from "./lib/appearance-store.js";
 import { parseBitrateSettings, createAppearanceOperationGate } from "./lib/appearance-overrides.js";
+import GlobalAudioCuesPanel from "./GlobalAudioCuesPanel.jsx";
 import AppearancePreview from "./AppearancePreview.jsx";
-import { compressWavFileForBoard } from "./lib/audio-cue.js";
 import { mediaFromFamily, mediaFromSourceImage, mediaFromSourcePreview } from "./lib/appearance-preview.js";
 import { FAMILIES } from "./lib/avatar-pipeline/families.js";
 import { runSingleFamilyVideo } from "./lib/avatar-pipeline/run.js";
@@ -56,8 +52,6 @@ import { AvatarWizardStep1, AvatarWizardStep2 } from "./CustomAvatarWizard.jsx";
 import { APPEARANCE_SYNC_CANCELLED_MESSAGE } from "./lib/desktop-pet-assignment.js";
 import Button from "./shell/Button.jsx";
 
-const AUDIO_SYNC_DIRTY_PREFIX = "pet-manager.appearance-audio-dirty.";
-
 function appearanceSourceLabel(record) {
   if (record.type === "builtin") return "内置形象";
   if (record.type === "codex-import") return "codex pet";
@@ -66,22 +60,6 @@ function appearanceSourceLabel(record) {
 
 function hasTauriRuntime() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
-}
-
-function dirtyStorageKey(appearanceId) {
-  return `${AUDIO_SYNC_DIRTY_PREFIX}${appearanceId}`;
-}
-
-function readAudioSyncDirty(appearanceId) {
-  if (!appearanceId || typeof window === "undefined" || !window.localStorage) return false;
-  return window.localStorage.getItem(dirtyStorageKey(appearanceId)) === "1";
-}
-
-function writeAudioSyncDirty(appearanceId, dirty) {
-  if (!appearanceId || typeof window === "undefined" || !window.localStorage) return;
-  const key = dirtyStorageKey(appearanceId);
-  if (dirty) window.localStorage.setItem(key, "1");
-  else window.localStorage.removeItem(key);
 }
 
 function isImageFile(file) {
@@ -176,14 +154,8 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   }, [appearanceId]);
   const [error, setError] = useState("");
   const [activeFamily, setActiveFamily] = useState("");
-  const [audioUrl, setAudioUrl] = useState("");
-  const [audioErr, setAudioErr] = useState("");
-  const [audioState, setAudioState] = useState("idle");
   const [stateVideoState, setStateVideoState] = useState("idle");
   const [stateVideoMessage, setStateVideoMessage] = useState("");
-  const [audioSyncDirty, setAudioSyncDirty] = useState(() => readAudioSyncDirty(appearanceId));
-  const [audioSyncState, setAudioSyncState] = useState("idle"); // idle | syncing | success | cancelled | error
-  const [audioSyncMessage, setAudioSyncMessage] = useState("");
   const [appearanceCancelPending, setAppearanceCancelPending] = useState(false);
   const [deleteState, setDeleteState] = useState("idle"); // idle | confirm | deleting
   const [deleteError, setDeleteError] = useState("");
@@ -193,10 +165,10 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   const [singleStateStatus, setSingleStateStatus] = useState("idle"); // idle | generating | success | error | syncing | synced | cancelled
   const singleSubmitting = useRef(false);
   const operationGate = useRef(createAppearanceOperationGate());
-  const operationBusy = deleteState === "deleting" || rebuilding || singleStateStatus === "generating" || singleStateStatus === "syncing" || stateVideoState === "saving" || audioState === "saving" || audioSyncState === "syncing";
+  const operationBusy = deleteState === "deleting" || rebuilding || singleStateStatus === "generating" || singleStateStatus === "syncing" || stateVideoState === "saving";
   const beginOperation = () => !operationBusy && operationGate.current.begin();
   const endOperation = () => operationGate.current.end();
-  useExitProtection(rebuilding ? "设备素材仍在生成" : singleStateStatus === "generating" ? "形象动作仍在生成" : audioSyncState === "syncing" || singleStateStatus === "syncing" ? "形象资源仍在同步" : stateVideoState === "saving" ? "形象视频仍在保存" : "");
+  useExitProtection(rebuilding ? "设备素材仍在生成" : singleStateStatus === "generating" ? "形象动作仍在生成" : singleStateStatus === "syncing" ? "形象资源仍在同步" : stateVideoState === "saving" ? "形象视频仍在保存" : "");
   const [singleStateMessage, setSingleStateMessage] = useState("");
   const [singleStateProgress, setSingleStateProgress] = useState(null);
   const [singleStateDialogOpen, setSingleStateDialogOpen] = useState(false);
@@ -251,13 +223,6 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   const generatedFamilies = useMemo(
     () => stateFamilyRecords.filter((family) => family.ok),
     [stateFamilyRecords],
-  );
-
-  const audioFamilyNames = useMemo(
-    () => generatedFamilies
-      .filter((family) => family.audioPath || family.audioSrc)
-      .map((family) => family.family),
-    [generatedFamilies],
   );
 
   useEffect(() => {
@@ -329,13 +294,6 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
     };
   }, [singleStateImageFile]);
 
-  const markAudioSyncDirty = useCallback((message) => {
-    writeAudioSyncDirty(appearanceId, true);
-    setAudioSyncDirty(true);
-    setAudioSyncState("idle");
-    setAudioSyncMessage(message || "音效已保存到客户端，需要通过板端音效 OTA 通道下发到设备后才会生效。");
-  }, [appearanceId]);
-
   const reload = useCallback(async () => {
     setError("");
     try {
@@ -355,51 +313,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
   useEffect(() => {
     setDeleteState("idle");
     setDeleteError("");
-    setAudioSyncDirty(readAudioSyncDirty(appearanceId));
-    setAudioSyncState("idle");
-    setAudioSyncMessage("");
   }, [appearanceId]);
-
-  useEffect(() => {
-    if (!record || !activeFamily) {
-      setAudioUrl("");
-      return undefined;
-    }
-
-    let cancelled = false;
-    let createdObjectUrl = "";
-
-    (async () => {
-      setAudioErr("");
-      setAudioUrl("");
-      const family = record.families.find((item) => item.family === activeFamily);
-      if (!family || !family.ok) return;
-
-      if (family.audioSrc) {
-        setAudioUrl(family.audioSrc);
-        return;
-      }
-
-      if (!family.audioPath) return;
-
-      try {
-        const url = await readAudioAsBlobUrl(family.audioPath);
-        if (cancelled) {
-          URL.revokeObjectURL(url);
-        } else {
-          createdObjectUrl = url;
-          setAudioUrl(url);
-        }
-      } catch (loadError) {
-        if (!cancelled) setAudioErr(loadError?.message || String(loadError));
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      if (createdObjectUrl) URL.revokeObjectURL(createdObjectUrl);
-    };
-  }, [record, activeFamily]);
 
   const handleDelete = useCallback(async () => {
     if (!record || operationBusy) return;
@@ -421,55 +335,6 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       endOperation();
     }
   }, [deleteState, record, onBack, operationBusy]);
-
-  const handleAudioFileChange = useCallback(async (event) => {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file || !record || !activeFamily || operationBusy) return;
-    if (!file.name.toLowerCase().endsWith(".wav") && !/audio\/(x-)?wav/i.test(file.type || "")) {
-      setAudioErr("请上传 WAV 格式文件");
-      return;
-    }
-    if (!beginOperation()) return;
-    setAudioState("saving");
-    setAudioErr("");
-    try {
-      const audioBytes = await compressWavFileForBoard(file);
-      const nextRecord = await replaceFamilyAudioCue({
-        appearanceId: record.id,
-        family: activeFamily,
-        audioBytes,
-      });
-      setRecord(nextRecord);
-      await refreshPreparedPack();
-      markAudioSyncDirty(`已更新 ${activeFamily} 的提示音，请通过音效通道下发到设备。`);
-    } catch (saveFailure) {
-      console.error(saveFailure);
-      setAudioErr(saveFailure?.message || String(saveFailure));
-    } finally {
-      setAudioState("idle");
-      endOperation();
-    }
-  }, [activeFamily, audioState, markAudioSyncDirty, record, operationBusy, refreshPreparedPack]);
-
-  const handleRemoveAudioCue = useCallback(async () => {
-    if (!record || !activeFamily || operationBusy) return;
-    if (!beginOperation()) return;
-    setAudioState("saving");
-    setAudioErr("");
-    try {
-      const nextRecord = await removeFamilyAudioCue({ appearanceId: record.id, family: activeFamily });
-      setRecord(nextRecord);
-      await refreshPreparedPack();
-      markAudioSyncDirty(`已移除 ${activeFamily} 的提示音，请通过音效通道下发到设备。`);
-    } catch (removeFailure) {
-      console.error(removeFailure);
-      setAudioErr(removeFailure?.message || String(removeFailure));
-    } finally {
-      setAudioState("idle");
-      endOperation();
-    }
-  }, [activeFamily, audioState, markAudioSyncDirty, record, operationBusy, refreshPreparedPack]);
 
   const handleStateVideoFileChange = useCallback(async (event) => {
     const file = event.target.files?.[0];
@@ -507,43 +372,6 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       setStateVideoMessage(replaceFailure?.message || String(replaceFailure));
     } finally { endOperation(); }
   }, [activeFamily, activeRecord?.prompt, record, stateVideoState, operationBusy, refreshPreparedPack]);
-
-  const handleSyncAudioCues = useCallback(async () => {
-    if (!record || operationBusy) return;
-    if (!hasTauriRuntime()) {
-      setAudioSyncState("error");
-      setAudioSyncMessage("当前不是桌面客户端运行环境，无法通过板端音效 OTA 通道下发。");
-      return;
-    }
-
-    if (!beginOperation()) return;
-    setAudioSyncState("syncing");
-    setAudioSyncMessage("正在通过板端音效 OTA 通道下发 WAV...");
-    try {
-      const result = await invoke("usb_sync_appearance", {
-        appearanceId: record.id,
-        boardDeviceId,
-      });
-      if (!result?.ok) {
-        throw new Error(result?.error || "设备未确认提示音下发");
-      }
-      writeAudioSyncDirty(record.id, false);
-      setAudioSyncDirty(false);
-      setAudioSyncState("success");
-      setAudioSyncMessage(
-        `音效已下发到设备（${result.fileCount || 0} 个素材，${result.byteCount || 0} bytes）。`,
-      );
-    } catch (syncFailure) {
-      console.error(syncFailure);
-      const message = syncFailure?.message || String(syncFailure);
-      const cancelled = message.includes(APPEARANCE_SYNC_CANCELLED_MESSAGE);
-      setAudioSyncState(cancelled ? "cancelled" : "error");
-      setAudioSyncMessage(cancelled ? "形象素材传输已中断，设备继续保留原素材。" : message);
-    } finally {
-      setAppearanceCancelPending(false);
-      endOperation();
-    }
-  }, [audioSyncState, boardDeviceId, record, operationBusy]);
 
   const singleStateGenerationReadyIssue = useMemo(() => {
     if (providerId === "kling") {
@@ -806,14 +634,11 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       console.error(cancelFailure);
       setAppearanceCancelPending(false);
       const message = cancelFailure?.message || String(cancelFailure);
-      if (audioSyncState === "syncing") {
-        setAudioSyncMessage(`无法中断传输：${message}`);
-      }
       if (singleStateStatus === "syncing") {
         setSingleStateMessage(`无法中断传输：${message}`);
       }
     }
-  }, [appearanceCancelPending, audioSyncState, singleStateStatus]);
+  }, [appearanceCancelPending, singleStateStatus]);
 
   const handleRestoreVideos = async (family) => {
     if (operationBusy) return;
@@ -835,7 +660,6 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
     try {
       setRecord(await restoreBuiltinFactoryAppearance());
       setPack(null); setQuality("standard"); setScaler("smooth"); setBitrates({});
-      writeAudioSyncDirty(appearanceId, false); setAudioSyncDirty(false);
       setSingleStateStatus("success"); setStateVideoState("success");
       setStateVideoMessage("客户端已恢复工厂形象，请替换到板端。");
     } catch (failure) { setStateVideoState("error"); setStateVideoMessage(String(failure)); }
@@ -888,12 +712,10 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
       mediaFromSourceImage(record)
     : null;
   const isBuiltin = record.type === "builtin";
-  const canEditAudio = activeRecord?.ok;
-  const audioInputId = `audio-cue-${record.id}-${activeFamily || "none"}`;
   const stateVideoInputId = `state-video-${record.id}-${activeFamily || "none"}`;
   const singleStateBusy = singleStateStatus === "generating" || singleStateStatus === "syncing" || rebuilding;
   const usbAppearanceSyncing =
-    audioSyncState === "syncing" || singleStateStatus === "syncing";
+    singleStateStatus === "syncing";
   const stateVideoBusy = stateVideoState === "saving";
   const canUploadStateVideo = Boolean(activeRecord) && !operationBusy;
   const canRegenerateState = Boolean(activeRecord) && !operationBusy;
@@ -933,18 +755,7 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
               <X size={14} />
               中断传输
             </Button>
-          ) : audioSyncDirty && (
-            <Button
-              className="detail-audio-sync-btn"
-              variant="primary"
-              onClick={handleSyncAudioCues}
-              disabled={operationBusy}
-              title="通过板端音效 OTA 通道下发当前 WAV"
-            >
-              <UploadCloud size={14} />
-              下发音效
-            </Button>
-          )}
+          ) : null}
           {!isBuiltin && (
             <button
               className="btn-ghost danger"
@@ -1146,87 +957,9 @@ export default function AppearanceDetail({ appearanceId, boardDeviceId = "", onB
               </div>
             </section>
           )}
+          <GlobalAudioCuesPanel boardDeviceId={boardDeviceId} currentFamily={activeFamily}/>
+
           {activeRecord?.ok && (
-            <section className="detail-side-section detail-side-section--audio">
-              <div className="detail-audio-config">
-                <div className="detail-audio-config__header">
-                  <span>
-                    <Volume2 size={15} />
-                    状态提示音
-                  </span>
-                  <span className="muted small">{activeRecord.family}</span>
-                </div>
-                {audioUrl ? (
-                  <audio className="detail-audio-config__player" src={audioUrl} controls />
-                ) : (
-                  <div className="muted small">
-                    当前状态 {activeRecord.family} 还没有提示音。
-                    {audioFamilyNames.length > 0
-                      ? ` 已有提示音: ${audioFamilyNames.join(" / ")}。请选择对应状态试听，或为当前状态上传 WAV。`
-                      : ""}
-                  </div>
-                )}
-                {audioErr && (
-                  <div className="message-banner message-banner--error">
-                    <AlertCircle size={14} /> {audioErr}
-                  </div>
-                )}
-                {(audioSyncDirty || audioSyncMessage) && (
-                  <div
-                    className={`message-banner detail-audio-sync-message ${
-                      audioSyncState === "error"
-                        ? "message-banner--error"
-                        : audioSyncState === "success"
-                          ? "message-banner--success"
-                          : "message-banner--warning"
-                    }`}
-                  >
-                    {audioSyncState === "syncing" ? <Loader size={14} className="spin" /> : <UploadCloud size={14} />}
-                    {audioSyncMessage || "音效已保存到客户端，需要通过板端音效 OTA 通道下发到设备后才会生效。"}
-                  </div>
-                )}
-                <div className="detail-audio-config__actions">
-                  <input
-                    id={audioInputId}
-                    className="detail-audio-config__input"
-                    type="file"
-                    accept="audio/wav,audio/x-wav,.wav"
-                    onChange={handleAudioFileChange}
-                    disabled={!canEditAudio || operationBusy}
-                  />
-                  <label
-                    className={`btn-ghost${canEditAudio ? "" : " is-disabled"}`}
-                    htmlFor={canEditAudio ? audioInputId : undefined}
-                  >
-                    {audioState === "saving" ? <Loader size={14} className="spin" /> : <Upload size={14} />}
-                    上传 WAV
-                  </label>
-                  {audioUrl && canEditAudio && !activeRecord.audioDefault && (
-                    <button
-                      className="btn-ghost danger"
-                      type="button"
-                      onClick={handleRemoveAudioCue}
-                      disabled={operationBusy}
-                    >
-                      <Trash2 size={14} />
-                      移除提示音
-                    </button>
-                  )}
-                </div>
-                {isBuiltin && (
-                  <div className="muted small">
-                    未上传时使用默认提示音；上传后会优先使用你的配置。
-                  </div>
-                )}
-                {!isBuiltin && activeRecord.audioDefault && (
-                  <div className="muted small">
-                    未上传时使用默认提示音；上传后会优先使用你的配置。
-                  </div>
-                )}
-              </div>
-            </section>
-          )}
-          {activeRecord && (
             <section className="detail-side-section detail-side-section--regenerate">
               <div className="detail-state-regenerate-entry">
                 <div className="detail-state-regenerate-entry__header">

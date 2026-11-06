@@ -33,6 +33,11 @@ export async function readTextFile(p) {
   return typeof f === "string" ? f : new TextDecoder().decode(f);
 }
 export async function remove(p) { files.delete(norm(p)); }
+export async function rename(from, to) {
+  if (!files.has(norm(from))) throw new Error(`missing: ${from}`);
+  files.set(norm(to), files.get(norm(from)));
+  files.delete(norm(from));
+}
 function checkWrite(p) {
   if (state.failWritePath === norm(p)) {
     state.failWritePath = "";

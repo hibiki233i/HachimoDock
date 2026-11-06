@@ -1,16 +1,25 @@
 #include "pet_p4_system_cues.h"
+#include "pet_p4_cue_packed.h"
 #include <string.h>
 
-/* The firmware embeds no default status sounds: they cost ~240 KB of the OTA slot, which the Wi-Fi
- * stack needs. Family names and the legacy-default fingerprints stay, so an old default WAV left in
- * an appearance slot is still recognized and skipped, while per-appearance custom audio plays. */
+/* The fork's 2.5 MiB OTA slot also carries Wi-Fi, so its shipped env builds with this
+ * off and the linker drops the packed PCM. Per-appearance custom audio still plays. */
+#ifndef PET_P4_EMBED_SYSTEM_CUES
+#define PET_P4_EMBED_SYSTEM_CUES 1
+#endif
+
+/* Waiting/error canonical WAVs are identical. They share one immutable decoded
+ * PCM entry without merging lifecycle identities or legacy override checks. */
 
 static uint32_t le32(const uint8_t *p) {
   return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
 bool pet_p4_system_cue_family(const char *family) {
-  return family && (!strcmp(family,"done") || !strcmp(family,"error") || !strcmp(family,"waiting_user"));
+  return family && (!strcmp(family,"done") || !strcmp(family,"error")
+    || !strcmp(family,"waiting_user") || !strcmp(family,"permission_request")
+    || !strcmp(family,"permission_approved") || !strcmp(family,"permission_denied")
+    || !strcmp(family,"permission_expired") || !strcmp(family,"session_terminated"));
 }
 
 /* Only known shipped defaults migrate. Unknown WAVs remain appearance overrides. */
@@ -46,8 +55,28 @@ bool pet_p4_cue_parse_wav(const uint8_t *wav, size_t size, const uint8_t **pcm, 
 }
 
 bool pet_p4_system_cue_pcm(const char *family, const uint8_t **pcm, size_t *size) {
+#if !PET_P4_EMBED_SYSTEM_CUES
   (void) family;
   if (pcm) *pcm = NULL;
   if (size) *size = 0;
   return false;
+#else
+  if (!pet_p4_system_cue_family(family)) return false;
+  unsigned index = 6; /* error and waiting_user are the same decoded PCM. */
+  if (!strcmp(family,"permission_request")) index = 0;
+  else if (!strcmp(family,"permission_approved")) index = 1;
+  else if (!strcmp(family,"permission_denied")) index = 2;
+  else if (!strcmp(family,"permission_expired")) index = 3;
+  else if (!strcmp(family,"session_terminated")) index = 4;
+  else if (!strcmp(family,"done")) index = 5;
+  return pet_p4_cue_packed_pcm(index,pcm,size);
+#endif
+}
+
+bool pet_p4_system_cues_init(void) {
+#if PET_P4_EMBED_SYSTEM_CUES
+  return pet_p4_cue_packed_init();
+#else
+  return true;
+#endif
 }

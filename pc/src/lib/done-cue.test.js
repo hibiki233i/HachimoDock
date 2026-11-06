@@ -11,15 +11,17 @@ test("completion audio has exactly four triple-beep groups and matches bundled P
   assert.equal(manifest.systemCues, true);
   assert.ok(manifest.families.every((family) => !family.audioPath));
   const cmake = readFileSync(new URL("../../../firmware/main/CMakeLists.txt", import.meta.url), "utf8");
-  // The firmware no longer embeds the default sounds (OTA space goes to the Wi-Fi stack); the
-  // desktop keeps generating and shipping them, and packs still declare systemCues.
+  assert.ok(cmake.includes('"pet_p4_cue_packed.c"'));
+  assert.ok(cmake.includes('tools/compress_system_cues.py" "--check"'));
   assert.ok(!cmake.includes("foreach(cue done error)"));
-  assert.ok(!cmake.includes("terrier-clips"));
+  assert.ok(cmake.includes("PET_WAIT_CUE_SHA"));
   assert.deepEqual(
     readFileSync(new URL("../../public/terrier-clips/error.wav", import.meta.url)),
     readFileSync(new URL("../../public/terrier-clips/waiting_user.wav", import.meta.url)),
     "deduplicated waiting cue must stay byte-identical to error cue",
   );
+  const cue = readFileSync(new URL("../../../firmware/main/pet_p4_system_cues.c", import.meta.url), "utf8");
+  assert.match(cue, /return pet_p4_cue_packed_pcm\(index,pcm,size\)/);
   assert.equal(wav.readUInt32LE(24), 16000);
   assert.equal(wav.readUInt16LE(22), 1);
   assert.equal(wav.readUInt16LE(34), 16);

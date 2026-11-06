@@ -36,6 +36,13 @@ pub fn composer_gate() -> Result<MutexGuard<'static, ()>, String> {
     ensure_composer_admission(&COMPOSER_BUSY)?;
     Ok(gate)
 }
+pub fn try_composer_gate() -> Result<MutexGuard<'static, ()>, String> {
+    let gate = COMPOSER_GATE.get_or_init(|| Mutex::new(())).try_lock()
+        .map_err(|_| "桌面输入通道正在处理，请稍后重新按住说话".to_string())?;
+    ensure_composer_admission(&COMPOSER_BUSY)?;
+    Ok(gate)
+}
+
 // Own a desktop writer from startup reservation through a real release ACK.
 // A failed release quarantines process-local admission; no timer/cancel/closed
 // bit clears it. Existing app restart is the explicit recovery boundary.
