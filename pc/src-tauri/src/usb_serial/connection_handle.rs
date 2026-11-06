@@ -100,16 +100,27 @@ fn open_serial_pair(port_name: &str, baud: u32) -> SerialPortPairResult {
     Ok((Box::new(port), Box::new(reader)))
 }
 
+// The OS raises DTR and RTS on open, which is the idle state of the ESP
+// auto-reset pair. DTR must stay put here: dropping it alone pulls EN low.
+#[cfg(not(windows))]
+fn serial_port_builder(port_name: &str, baud: u32) -> serialport::SerialPortBuilder {
+    serialport::new(port_name, baud).timeout(SERIAL_IO_TIMEOUT).preserve_dtr_on_open()
+}
+
+// Runtime discovery is not a flashing/reset operation. RTS goes first because
+// DTR-then-RTS reboots the board; best effort keeps CDC drivers without
+// modem-line ioctls compatible.
+pub(super) fn release_control_lines(port: &mut dyn serialport::SerialPort) {
+    let _ = port.write_request_to_send(false);
+    let _ = port.write_data_terminal_ready(false);
+}
+
 #[cfg(not(windows))]
 fn open_serial_pair(port_name: &str, baud: u32) -> SerialPortPairResult {
-    let mut port = serialport::new(port_name, baud)
-        .timeout(SERIAL_IO_TIMEOUT)
-        .dtr_on_open(false)
+    let mut port = serial_port_builder(port_name, baud)
         .open()
         .map_err(|error| error.to_string())?;
-    // Runtime discovery is not a flashing/reset operation. Best effort keeps
-    // CDC drivers without modem-line ioctls compatible; do this before clone.
-    let _ = port.write_request_to_send(false);
+    release_control_lines(port.as_mut());
     let reader = port.try_clone().map_err(|error| error.to_string())?;
     Ok((port, reader))
 }
@@ -132,4 +143,69 @@ pub(super) fn open_serial_pair_with_retry(port_name: &str, baud: u32) -> SerialP
     Err(format!(
         "failed to open {port_name} at {baud} baud: {last_open_error}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, StopBits};
+    use std::io;
+
+    #[derive(Default)]
+    struct LineRecorder { writes: Vec<&'static str> }
+    impl Read for LineRecorder {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { Ok(0) }
+    }
+    impl Write for LineRecorder {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { Ok(bytes.len()) }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    impl SerialPort for LineRecorder {
+        fn name(&self) -> Option<String> { None }
+        fn baud_rate(&self) -> serialport::Result<u32> { Ok(0) }
+        fn data_bits(&self) -> serialport::Result<DataBits> { Ok(DataBits::Eight) }
+        fn flow_control(&self) -> serialport::Result<FlowControl> { Ok(FlowControl::None) }
+        fn parity(&self) -> serialport::Result<Parity> { Ok(Parity::None) }
+        fn stop_bits(&self) -> serialport::Result<StopBits> { Ok(StopBits::One) }
+        fn timeout(&self) -> Duration { Duration::ZERO }
+        fn set_baud_rate(&mut self, _: u32) -> serialport::Result<()> { Ok(()) }
+        fn set_data_bits(&mut self, _: DataBits) -> serialport::Result<()> { Ok(()) }
+        fn set_flow_control(&mut self, _: FlowControl) -> serialport::Result<()> { Ok(()) }
+        fn set_parity(&mut self, _: Parity) -> serialport::Result<()> { Ok(()) }
+        fn set_stop_bits(&mut self, _: StopBits) -> serialport::Result<()> { Ok(()) }
+        fn set_timeout(&mut self, _: Duration) -> serialport::Result<()> { Ok(()) }
+        fn write_request_to_send(&mut self, level: bool) -> serialport::Result<()> {
+            assert!(!level);
+            self.writes.push("rts");
+            Ok(())
+        }
+        fn write_data_terminal_ready(&mut self, level: bool) -> serialport::Result<()> {
+            assert!(!level);
+            self.writes.push("dtr");
+            Ok(())
+        }
+        fn read_clear_to_send(&mut self) -> serialport::Result<bool> { Ok(false) }
+        fn read_data_set_ready(&mut self) -> serialport::Result<bool> { Ok(false) }
+        fn read_ring_indicator(&mut self) -> serialport::Result<bool> { Ok(false) }
+        fn read_carrier_detect(&mut self) -> serialport::Result<bool> { Ok(false) }
+        fn bytes_to_read(&self) -> serialport::Result<u32> { Ok(0) }
+        fn bytes_to_write(&self) -> serialport::Result<u32> { Ok(0) }
+        fn clear(&self, _: ClearBuffer) -> serialport::Result<()> { Ok(()) }
+        fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> { unimplemented!() }
+        fn set_break(&self) -> serialport::Result<()> { Ok(()) }
+        fn clear_break(&self) -> serialport::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn control_lines_drop_rts_before_dtr() {
+        let mut port = LineRecorder::default();
+        release_control_lines(&mut port);
+        assert_eq!(port.writes, ["rts", "dtr"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn opening_a_port_leaves_dtr_alone() {
+        assert!(format!("{:?}", serial_port_builder("port", 4_000_000)).contains("dtr_on_open: None"));
+    }
 }
