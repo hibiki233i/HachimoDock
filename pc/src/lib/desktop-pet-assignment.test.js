@@ -5,9 +5,11 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { AGENT_APPEARANCE_MAP_STORAGE_KEY, ENABLED_AGENTS_STORAGE_KEY } from "./agent-appearance-config.js";
 import {
   ACTIVE_APPEARANCE_KEY,
+  isObservedActiveAppearance,
   APPEARANCE_CHANGE_USB_REQUIRED_MESSAGE,
   APPEARANCE_CONFIRMATION_REQUIRED_MESSAGE,
   APPEARANCE_SYNC_CANCELLED_MESSAGE,
@@ -138,6 +140,29 @@ test("exact quiescent proof permits only this new intent's single ordinary sync"
     ["appearanceId", "boardDeviceId"]);
 });
 
+for (const [name, delta] of [
+  ["the last device slot", { activeSlot: 2 }],
+  ["an active slot with no valid pack", { activePackId: null }],
+  ["no active slot", { activeSlot: null, activePackId: null }],
+]) {
+  test("quiescent proof of " + name + " permits one new sync", async t => {
+    const f = fixture(t, { observe: { ...PROOF, ...delta } });
+    await f.run();
+    assert.equal(f.count("usb_reconcile_appearance_unknown"), 1);
+    assert.equal(f.count("usb_sync_appearance"), 1);
+  });
+}
+
+test("observed slot range matches the rows the firmware query emits", () => {
+  const vectors = JSON.parse(readFileSync(new URL(
+    "../../src-tauri/test-fixtures/appearance-query-envelope-v1.json", import.meta.url), "utf8")).vectors;
+  const { slots } = vectors.find(vector => vector.name === "idle").ack;
+  for (const { slot } of slots) {
+    assert.equal(isObservedActiveAppearance({ activeSlot: slot, activePackId: "pack" }), true);
+  }
+  assert.equal(isObservedActiveAppearance({ activeSlot: slots.length, activePackId: "pack" }), false);
+});
+
 test("read-only reconciliation distinguishes no pending from an observed old unknown", async t => {
   const f = fixture(t);
   assert.deepEqual(await reconcileDesktopPetAppearance({ invoke: f.invoke, boardDeviceId: BOARD }),
@@ -261,7 +286,10 @@ for (const [name, delta] of [
   ["known old result", { oldResult: "success" }],
   ["mutation was sent", { mutationSent: true }],
   ["no fresh user intent required", { requiresFreshUserIntent: false }],
-  ["invalid active slot", { activeSlot: 2 }],
+  ["active slot past the device", { activeSlot: 3 }],
+  ["missing active slot", { activeSlot: undefined }],
+  ["pack without an active slot", { activeSlot: null }],
+  ["missing pack identity", { activePackId: undefined }],
   ["empty pack identity", { activePackId: "" }],
   ["invalid pack identity", { activePackId: "bad\nidentity" }],
 ]) {

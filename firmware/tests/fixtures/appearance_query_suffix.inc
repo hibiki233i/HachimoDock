@@ -41,16 +41,22 @@ int main(int argc,char**argv){
  else if(!strcmp(which,"partial")){cJSON_DeleteItemFromObjectCaseSensitive(q,"observationSchema");invalid=true;}
  else if(!strcmp(which,"schema")){cJSON_ReplaceItemInObjectCaseSensitive(q,"observationSchema",cJSON_CreateString("unknown-schema"));invalid=true;}
  else if(!strcmp(which,"legacy")){cJSON_Delete(q);q=cJSON_Parse("{\"transferId\":\"observe-synthetic\"}");legacy=true;}
- else if(!strcmp(which,"idle")){
+ else if(!strncmp(which,"idle",4)){
   g_appearance_session.operation_active=false;forbid_storage=false;idle=true;
   assert(!mprotect(private_tracking,4096,PROT_READ|PROT_WRITE));private_tracking->active=false;
-  for(int i=0;i<2;i++){char path[32];snprintf(path,sizeof(path),"slot-%d.synthetic",i);FILE*f=fopen(path,"wb");assert(f);for(int j=0;j<64;j++)assert(fputc('a'+i,f)!=EOF);assert(!fclose(f));}
+  /* Every slot answers: an empty one is a valid=false row, never a missing row. */
+  const int last=PET_P4_ASSET_SLOT_COUNT-1;bool last_filled=false;
+  if(!strcmp(which,"idle-active-last")){g_asset_active_slot=last;last_filled=true;}
+  else if(!strcmp(which,"idle-active-empty"))g_asset_active_slot=last;
+  else if(!strcmp(which,"idle-no-active"))g_asset_active_slot=-1;
+  else assert(!strcmp(which,"idle"));
+  for(int i=0;i<PET_P4_ASSET_SLOT_COUNT;i++){char path[32];snprintf(path,sizeof(path),"slot-%d.synthetic",i);FILE*f=fopen(path,"wb");assert(f);if(i<last||last_filled)for(int j=0;j<64;j++)assert(fputc('a'+i,f)!=EOF);assert(!fclose(f));}
  }
  pet_appearance_session_t before=g_appearance_session;
  send_asset_slot_query_ack(&state,q,capture,&state,id);
  assert(held&&!memcmp(&before,&g_appearance_session,sizeof(before)));
  if(!idle){assert(!disk_reads&&!snapshots);if(!storage_busy&&!storage_unavailable)assert(!broker_calls);}
- else {assert(disk_reads==2&&snapshots==2&&broker_calls==2);expect_bool("ok",true);expect_bool("quiescent",true);assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(captured,"slots"))==2);}
+ else {assert(disk_reads==PET_P4_ASSET_SLOT_COUNT&&snapshots==2&&broker_calls==2);expect_bool("ok",true);expect_bool("quiescent",true);assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(captured,"slots"))==PET_P4_ASSET_SLOT_COUNT);}
  if(refuse_callback||!strncmp(which,"oom-",4)){assert(!sends&&!captured);}
  else if(invalid||legacy){assert(sends==1);expect_bool("ok",false);assert(!cJSON_GetObjectItemCaseSensitive(captured,"observationSchema")&&!cJSON_GetObjectItemCaseSensitive(captured,"errorCode"));}
  else if(!idle)expect_not_proof(g_appearance_session.recovery_blocked,id,nonce);

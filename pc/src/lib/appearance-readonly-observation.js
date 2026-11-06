@@ -1,5 +1,5 @@
 /** Explicit menu observation only; never sync/follow/activate/reset or clear RawQ. */
-import { createDesktopPetIntentId } from "./desktop-pet-assignment.js";
+import { createDesktopPetIntentId, isObservedActiveAppearance } from "./desktop-pet-assignment.js";
 
 export function appearanceObservationError(error) {
   const code = typeof error === "string" ? error : error?.message || "";
@@ -30,8 +30,7 @@ export async function observeAppearanceFromMenu({ invoke, boardDeviceId, isCurre
   }
   if (!noPending && (result?.status !== "observed_current_state_quiescent"
     || result.oldResult !== "unknown" || result.mutationSent !== false || result.requiresFreshUserIntent !== true
-    || ![0, 1].includes(result.activeSlot) || typeof result.activePackId !== "string"
-    || !result.activePackId || result.activePackId.length > 64 || /[^\x21-\x7e]/.test(result.activePackId))) {
+    || !isObservedActiveAppearance(result))) {
     throw new Error("appearance_recovery_not_quiescent_or_unproven");
   }
   return {

@@ -23,7 +23,19 @@ export const APPEARANCE_SYNC_CANCELLED_MESSAGE = "形象素材传输已中断";
 export const APPEARANCE_CONFIRMATION_REQUIRED_MESSAGE =
   "暂时无法确认本次切换结果，请核对设备当前状态；请勿重复提交。";
 export const APPEARANCE_NOT_SUBMITTED_MESSAGE = "本次切换尚未提交，请检查连接后再试。";
+// Mirrors firmware PET_P4_APPEARANCE_SLOT_COUNT.
+const P4_APPEARANCE_SLOT_COUNT = 3;
 export const FOLLOW_ASSIGNMENT_BUSY_MESSAGE = "已有形象或跟随切换正在处理，请等待本次结果，不要重复提交。";
+
+// Null means the device is idle with no valid active pack; a new sync repairs that.
+export function isObservedActiveAppearance({ activeSlot, activePackId }) {
+  const slotValid = activeSlot === null
+    ? activePackId === null
+    : Number.isInteger(activeSlot) && activeSlot >= 0 && activeSlot < P4_APPEARANCE_SLOT_COUNT;
+  const packValid = activePackId === null || (typeof activePackId === "string"
+    && !!activePackId && activePackId.length <= 64 && !/[^\x21-\x7e]/.test(activePackId));
+  return slotValid && packValid;
+}
 
 export function appearanceConfirmationRequired(notSubmitted = false) {
   const error = new Error(notSubmitted ? APPEARANCE_NOT_SUBMITTED_MESSAGE : APPEARANCE_CONFIRMATION_REQUIRED_MESSAGE);
@@ -100,8 +112,7 @@ export async function reconcileDesktopPetAppearance({ invoke, boardDeviceId, isC
   }
   if (!isCurrent() || result?.status !== "observed_current_state_quiescent"
     || result.oldResult !== "unknown" || result.mutationSent !== false || result.requiresFreshUserIntent !== true
-    || ![0, 1].includes(result.activeSlot) || typeof result.activePackId !== "string"
-    || !result.activePackId || result.activePackId.length > 64 || /[^\x21-\x7e]/.test(result.activePackId)) {
+    || !isObservedActiveAppearance(result)) {
     throw appearanceConfirmationRequired();
   }
   return { observed: true, noPending: false, message: "设备已就绪。" };

@@ -467,3 +467,95 @@ fn phase3_one_quarantined_device_does_not_block_a_verified_different_raw_device(
     assert_eq!(disk["pending"].as_array().unwrap().len(),1);assert_eq!(disk["pending"][0]["board"],BOARD);
     assert_eq!(disk["quarantines"].as_array().unwrap().len(),1);assert_eq!(disk["quarantines"][0]["board"],BOARD);
 }
+
+// The device side is the shared vector the production C query emits, so this
+// proves the desktop against what the firmware really sends.
+struct SlotQueryWriter {pending:Vec<u8>,waiters:Arc<Mutex<Vec<AssetAckWaiter>>>,ack:Value,topics:Arc<Mutex<Vec<String>>>}
+impl Write for SlotQueryWriter {
+    fn write(&mut self,bytes:&[u8])->io::Result<usize>{
+        self.pending.extend_from_slice(bytes);
+        while let Some(end)=self.pending.iter().position(|b|*b==b'\n') {
+            let line=self.pending.drain(..=end).collect::<Vec<_>>();
+            let start=line.iter().position(|b|*b==b'{').unwrap();
+            let request:Value=serde_json::from_slice(&line[start..]).unwrap();
+            self.topics.lock().unwrap().push(request["topic"].as_str().unwrap().to_owned());
+            if request["topic"]=="asset/slot-query" {
+                let mut ack=self.ack.clone();
+                ack["transferId"]=request["payload"]["transferId"].clone();ack["queryNonce"]=request["payload"]["queryNonce"].clone();
+                ack["boardDeviceId"]=json!(BOARD);ack["bootId"]=json!("0123456789abcdef");
+                resolve_asset_ack(&self.waiters,"asset/ack",&ack);
+            }
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self)->io::Result<()>{Ok(())}
+}
+fn c_query_ack(name:&str)->Value{
+    let data:Value=serde_json::from_str(include_str!("../../test-fixtures/appearance-query-envelope-v1.json")).unwrap();
+    data["vectors"].as_array().unwrap().iter().find(|v|v["name"]==name).unwrap()["ack"].clone()
+}
+fn slot_query_manager(directory:&std::path::Path,ack:Value)->(UsbSerialManager,Arc<Mutex<Vec<String>>>){
+    let mut manager=UsbSerialManager::new();let topics=Arc::new(Mutex::new(vec![]));
+    manager.appearance_journal=Arc::new(appearance_safety::Journal::open(directory).unwrap());
+    let mut c=connection(&manager,BOARD,1,Mode::Ack,Arc::new(Mutex::new(vec![])),Arc::new(AtomicUsize::new(0)));
+    c.writer=Box::new(SlotQueryWriter{pending:vec![],waiters:manager.asset_ack_waiters.clone(),ack,topics:topics.clone()});
+    c.capabilities=json!({"debugBootId":"0123456789abcdef","globalAudioCues":"p4-global-audio-cues-v1",
+        "appearance":{"quiescentQuery":appearance_recovery::SCHEMA}});
+    *manager.connection.lock().unwrap()=Some(c);
+    {let _owner=manager.inbound_owner.lock().unwrap();manager.inbound_owner.publish(1);}(manager,topics)
+}
+fn leave_unknown_activation(directory:&std::path::Path){
+    let (mut manager,_,_)=manager(Mode::Close);manager.appearance_journal=Arc::new(appearance_safety::Journal::open(directory).unwrap());
+    assert!(manager.with_appearance_attempt(BOARD,||manager.send_asset_command_and_wait_timeout("asset/activate",&json!({"transferId":"owned"}),"owned","activate",None,None,Duration::from_millis(10))).is_err());
+}
+fn pending_count(directory:&std::path::Path)->usize{
+    let state:Value=serde_json::from_slice(&std::fs::read(directory.join("pending-v1.json")).unwrap()).unwrap();state["pending"].as_array().unwrap().len()
+}
+#[test]
+fn real_c_slot_proofs_release_an_unknown_mutation_for_one_fresh_attempt(){
+    for name in ["idle","idle-active-last","idle-active-empty","idle-no-active"] {
+        let directory=tempfile::tempdir().unwrap();leave_unknown_activation(directory.path());
+        assert_eq!(pending_count(directory.path()),1,"{name}");
+        {
+            let (manager,topics)=slot_query_manager(directory.path(),c_query_ack(name));let ran=AtomicBool::new(false);
+            let result:Result<(),String>={let guard=manager.asset_transfer_guard.lock().unwrap();
+                manager.with_appearance_user_intent(BOARD,&guard,||{ran.store(true,Ordering::SeqCst);Ok(())})};
+            assert_eq!(result,Ok(()),"{name}");assert!(ran.load(Ordering::SeqCst),"{name}");
+            assert_eq!(*topics.lock().unwrap(),["asset/slot-query"],"{name}: observation stays read-only");
+        }
+        assert_eq!(pending_count(directory.path()),0,"{name}");
+        // The archived proof must survive the next launch's journal validation.
+        appearance_safety::Journal::open(directory.path()).unwrap_or_else(|error|panic!("{name}: {error}"));
+    }
+}
+#[test]
+fn incomplete_slot_proof_keeps_the_unknown_latch_without_writing(){
+    let mut short=c_query_ack("idle");short["slots"].as_array_mut().unwrap().pop();
+    let directory=tempfile::tempdir().unwrap();leave_unknown_activation(directory.path());
+    let (manager,topics)=slot_query_manager(directory.path(),short);let ran=AtomicBool::new(false);
+    let result:Result<(),String>={let guard=manager.asset_transfer_guard.lock().unwrap();
+        manager.with_appearance_user_intent(BOARD,&guard,||{ran.store(true,Ordering::SeqCst);Ok(())})};
+    assert_eq!(result.unwrap_err(),"appearance_recovery_not_quiescent_or_unproven");
+    assert!(!ran.load(Ordering::SeqCst));assert_eq!(pending_count(directory.path()),1);
+    assert_eq!(*topics.lock().unwrap(),["asset/slot-query"]);
+}
+#[test]
+fn audio_only_proof_accepts_every_device_slot_and_needs_an_active_pack(){
+    let run=|ack:Value|{
+        let directory=tempfile::tempdir().unwrap();let data=tempfile::tempdir().unwrap();
+        let (manager,topics)=slot_query_manager(directory.path(),ack);
+        let result=manager.sync_appearance_audio_only_p4(data.path(),data.path(),BOARD,false,|_,_,_,_|{});
+        assert_eq!(*topics.lock().unwrap(),["asset/slot-query"]);result.unwrap_err()
+    };
+    // Past the proof, the empty test data directory is the first refusal.
+    for name in ["idle","idle-active-last"] {
+        let error=run(c_query_ack(name));
+        assert!(error.contains("regular local source"),"{name}: {error}");
+    }
+    let mut short=c_query_ack("idle");short["slots"].as_array_mut().unwrap().pop();
+    assert!(run(short).contains("audio-only slot proof unavailable"));
+    for name in ["idle-active-empty","idle-no-active"] {
+        let error=run(c_query_ack(name));
+        assert!(error.contains("audio-only current slot unavailable"),"{name}: {error}");
+    }
+}

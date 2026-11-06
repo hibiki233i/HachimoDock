@@ -114,10 +114,11 @@ use appearance_transaction::{
     asset_checksum_hex, build_asset_file_commit_payload, compute_p4_pack_id,
     choose_p4_target_slot, digest_appearance_assets, p4_pack_id_from_assets, p4_transfer_fallback_slot,
     p4_builtin_slot, parse_p4_slot_capacities, P4SlotAssignments, P4_RAW_APPEARANCE_SLOT as P4_LEGACY_CUSTOM_SLOT,
-    parse_p4_appearance_slot_state,
+    p4_slot_proof_rows, parse_p4_appearance_slot_state,
     plan_appearance_sync_from_digests,
     AppearanceAssetDigest, AppearanceAssetEntry, AppearanceFullSyncMode,
     AppearanceSyncPlan, AssetRemoteStat, P4AppearanceSlotState, P4CachedPackActivation,
+    P4_APPEARANCE_SLOT_COUNT,
 };
 #[cfg(test)]
 use appearance_transaction::{
@@ -1353,16 +1354,11 @@ impl UsbSerialManager {
                 "nativeWorkerPending","protocolWorkerPending","storageWorkerPending","firmwareOtaActive","rebootPending"] {
                 if state[key].as_bool()!=Some(false) { return Err("audio-only device is not quiescent".into()); }
             }
-            let rows=state["slots"].as_array().filter(|rows|rows.len()==2).ok_or("audio-only slot proof unavailable")?;
-            let mut seen=HashSet::new();
-            for row in rows {
-                let n=row["slot"].as_u64().filter(|n|*n<=1).ok_or("audio-only invalid slot proof")?;
-                if !seen.insert(n)||row["valid"].as_bool().is_none() {return Err("audio-only invalid slot proof".into());}
-            }
+            p4_slot_proof_rows(&state).ok_or("audio-only slot proof unavailable")?;
             let slots = parse_p4_appearance_slot_state(&state)?;
             let active = slots.active_slot.and_then(|slot| slots.slots.iter().find(|s| s.slot==slot)).ok_or("audio-only current slot unavailable")?;
             // The active slot is readonly transport authority, not cue storage identity.
-            let slot=slots.active_slot.filter(|n| *n<=1).ok_or("audio-only current slot unavailable")?;
+            let slot=active.slot;
             if active.pack_id.len()!=64 || !active.pack_id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
                 return Err("audio-only current identity unavailable".into());
             }
@@ -13051,8 +13047,8 @@ manager.activate_memory_test_connection();
             .query_diagnostics(&manager.status().board_device_id)
             .expect("query P4 storage diagnostics");
         eprintln!("[p4-slot-hil] storage={}", diagnostics["storage"]);
-        assert!(state.active_slot.is_none() || state.active_slot.is_some_and(|slot| slot <= 1));
-        assert!(state.slots.iter().all(|slot| slot.slot <= 1));
+        assert!(state.active_slot.is_none() || state.active_slot.is_some_and(|slot| slot < P4_APPEARANCE_SLOT_COUNT));
+        assert!(state.slots.iter().all(|slot| slot.slot < P4_APPEARANCE_SLOT_COUNT));
         manager.disconnect();
     }
 

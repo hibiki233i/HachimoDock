@@ -30,7 +30,7 @@ def query_binary(tmp_path_factory):
  (b/"invocation.json").write_text(json.dumps({"argv":argv,"cwd":str(b),"sourceSHA256":hashlib.sha256((MAIN/"pet_p4_protocol.c").read_bytes()).hexdigest()},indent=2))
  r=subprocess.run(argv,cwd=b,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=60);(b/"compile.log").write_text(r.stdout);assert r.returncode==0,r.stdout
  return b/"query"
-CASES=["operation","owner","transfer","storage","unknown","unknown-operation","distinct-tokens","board","boot","nonce","id","duplicate","partial","schema","legacy","identity-snapshot","idle","callback-refusal","storage-unavailable","bad-transfer","missing-transfer","duplicate-board","duplicate-boot","duplicate-schema","duplicate-transfer"]+[f"oom-{n}" for n in range(30)]
+CASES=["operation","owner","transfer","storage","unknown","unknown-operation","distinct-tokens","board","boot","nonce","id","duplicate","partial","schema","legacy","identity-snapshot","idle","idle-active-last","idle-active-empty","idle-no-active","callback-refusal","storage-unavailable","bad-transfer","missing-transfer","duplicate-board","duplicate-boot","duplicate-schema","duplicate-transfer"]+[f"oom-{n}" for n in range(30)]
 @pytest.mark.parametrize("case",CASES)
 def test_real_query_binding_classification_and_no_busy_storage(query_binary,tmp_path,case):
  argv=[str(query_binary),case];env={"HOME":str(tmp_path),"TMPDIR":str(tmp_path),"PATH":"/usr/bin:/bin","ASAN_OPTIONS":"detect_leaks=0"}

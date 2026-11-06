@@ -23,7 +23,7 @@ def test_slot_query_io_and_tx_release_state_lock_with_exact_owner(tmp_path):
 #include "pet_p4_resources.h"
 #include "pet_p4_appearance_session.h"
 #define PET_P4_PACK_ID_MAX 65
-#define PET_P4_ASSET_SLOT_COUNT 2
+#define PET_P4_ASSET_SLOT_COUNT PET_P4_APPEARANCE_SLOT_COUNT
 #define APPEARANCE_OBSERVATION_SCHEMA "p4-appearance-quiescent-v1"
 typedef void(*pet_p4_send_line_fn)(const char*,void*);
 typedef struct {pet_p4_asset_catalog_t asset_catalog;char board_device_id[64];bool asset_transfer_active;unsigned asset_revision;}pet_p4_runtime_state_t;
@@ -72,7 +72,7 @@ static void tx(const char *line,void *ctx){
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(p,"transferId")->valuestring,"same-transfer"));
  if(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(p,"ok"))){
   sends++;assert(!change_slot);assert(cJSON_GetObjectItemCaseSensitive(p,"activeSlot")->valueint==0);
-  cJSON *slots=cJSON_GetObjectItemCaseSensitive(p,"slots");assert(cJSON_GetArraySize(slots)==2);
+  cJSON *slots=cJSON_GetObjectItemCaseSensitive(p,"slots");assert(cJSON_GetArraySize(slots)==PET_P4_ASSET_SLOT_COUNT);
   assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(slots,0),"valid")));
   assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(slots,1),"valid")));
  }else{rejected++;assert(cJSON_IsString(cJSON_GetObjectItemCaseSensitive(p,"error")));}
@@ -101,15 +101,15 @@ int main(void){
  assert(!pet_p4_protocol_asset_query_io_configure(asset_query_io_begin,asset_query_io_end,NULL));
  cJSON *request=cJSON_Parse("{\"transferId\":\"same-transfer\"}");assert(request);
  send_asset_slot_query_ack(&state,request,tx,(void*)123,"same-transfer");
- assert(held&&reads==2&&sends==1&&unlocked==2&&locked==2&&!state.asset_transfer_active);no_resources_leaked();
+ assert(held&&reads==PET_P4_ASSET_SLOT_COUNT&&sends==1&&unlocked==2&&locked==2&&!state.asset_transfer_active);no_resources_leaked();
  // Actual task/command ownership rejects IO borrowing, without a bogus ACK.
  task=8;send_asset_slot_query_ack(&state,request,tx,(void*)123,"same-transfer");
  task=7;g_protocol_storage_command_entered=false;send_asset_slot_query_ack(&state,request,tx,(void*)123,"same-transfer");
- assert(held&&!rejected&&reads==2&&sends==1&&unlocked==2&&locked==2);no_resources_leaked();
+ assert(held&&!rejected&&reads==PET_P4_ASSET_SLOT_COUNT&&sends==1&&unlocked==2&&locked==2);no_resources_leaked();
  g_protocol_storage_command_entered=true;
  // A changed slot while unlocked invalidates publication; no stale success.
  change_slot=true;send_asset_slot_query_ack(&state,request,tx,(void*)123,"same-transfer");
- assert(held&&rejected==1&&sends==1&&reads==4);change_slot=false;g_asset_active_slot=0;no_resources_leaked();
+ assert(held&&rejected==1&&sends==1&&reads==2*PET_P4_ASSET_SLOT_COUNT);change_slot=false;g_asset_active_slot=0;no_resources_leaked();
  cJSON_Delete(request);
  // Payload/array OOM closes BOTH IO borrows and releases actual STORAGE_WORK.
  for(unsigned fail=1;fail<=2;fail++){

@@ -331,7 +331,7 @@ impl Session<'_>{
 }
 fn slot(snapshot:&Value,id:u64)->Result<Value,String>{
     let a=snapshot["slots"]["slots"].as_array().ok_or("slot array missing")?;
-    need(a.len()==2&&a.iter().filter(|v|v["slot"]==id).count()==1,"exact two unique slots required")?;
+    need(a.len()==P4_APPEARANCE_SLOT_COUNT as usize&&a.iter().filter(|v|v["slot"]==id).count()==1,"one row per device slot required")?;
     a.iter().find(|v|v["slot"]==id).cloned().ok_or("slot absent".into())
 }
 fn gate(d:&Value,p:&Plan)->Result<(),String>{

@@ -531,6 +531,8 @@ R172 候选的 `renderLifetime.sameFramePhases.contentStagesInclusive` 增加 bu
 
 现代 `asset/slot-query` 的 observationSchema、queryNonce、expectedBoardDeviceId、expectedBootId、transferId 必须逐项唯一、类型正确且与当前设备匹配。忙碌回复使用 `ok=false, proof=false, quiescent=false`，保留 queryNonce/boardDeviceId/bootId，并给出 errorCode=`appearance_query_busy`；这是身份绑定的“尚无证明”，不含 slots，不表示安全静默。操作结果未知优先给出 `appearance_query_outcome_unknown`，不得当成可重试的忙碌、升级提示或清理授权。PC 仅对前者在同一连接代次内做有界只读等待，完整正向静默证明前不归档旧未知操作、不重放写入。
 
+完整静默证明的 `slots` 按设备槽位逐行列出（当前 3 行），空槽为 `valid=false` 且不含 `packId`，没有活动槽时省略 `activeSlot`。PC 校验行数、槽号范围与唯一性；缺少 `activeSlot` 或活动槽 `valid=false` 仍是有效的静默证明，表示设备当前没有有效形象，由用户新发起的同步修复。独立音效更新必须绑定有效的活动形象，这两种情况下不会发送写入。
+
 0.7.100-p4：新增 `widgetMediaQueueMax=128` 与 `widgetMediaLifecycle=p4-media-lifecycle-v1`。媒体队列超过 20 项时，key 至多 80 UTF-8 字节、标题至多 90 字节；上限 128，刷新按 key 保留选中项，不修改音频会话。`media/event` 新增 `operation=visibility`，包含 `source/boot/epoch/visible`；进入或离开递增 epoch，可见时每 2 秒发送心跳。宿主只有资源包声明自动播放、当前可见且新的进入事件时才准备播放，停止/离开取消未开始的播放；目录刷新不重新触发播放。能力与配置为通用媒体机制，不绑定特定组件 ID。
 
 0.7.83-p4 媒体重入：从组件中心重新进入当前已验证的媒体组件只恢复界面，不重写目录或失效图片缓存，避免后台音频因同步 Flash 操作欠载。切到其他组件、安装更新及游戏重开仍走原有加载/校验路径；媒体会话与全局退出语义不变。

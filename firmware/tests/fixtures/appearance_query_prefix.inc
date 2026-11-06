@@ -12,7 +12,7 @@
 #include "pet_p4_raw_assets.h"
 #include "pet_p4_appearance_session.h"
 #define APPEARANCE_OBSERVATION_SCHEMA "p4-appearance-quiescent-v1"
-#define PET_P4_ASSET_SLOT_COUNT 2
+#define PET_P4_ASSET_SLOT_COUNT PET_P4_APPEARANCE_SLOT_COUNT
 #define PET_P4_PACK_ID_MAX 65
 #define PET_P4_MUTATION_ACK_DEFERRED 0
 #define PET_RESOURCE_STORAGE_WORK 1

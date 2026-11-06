@@ -17,8 +17,10 @@ pub(super) struct Observation {
     pub(super) board: String,
     pub(super) generation: u64,
     pub(super) boot: String,
-    pub(super) active_slot: u32,
-    pub(super) active_pack_id: String,
+    // No slot is protected, so an interrupted first sync or in-place rewrite can
+    // leave the device idle with no valid active pack. Only a new sync repairs it.
+    pub(super) active_slot: Option<u32>,
+    pub(super) active_pack_id: Option<String>,
     pub(super) native_io_epoch: u32,
     pub(super) serialized: bool,
     pub(super) quiescent: bool,
@@ -29,9 +31,10 @@ impl Observation {
         self.schema == SCHEMA && appearance_safety::valid_transfer_id(&self.query_nonce)
             && !self.board.is_empty() && self.board.len() <= 128 && !self.board.chars().any(char::is_control)
             && self.generation != 0 && !self.boot.is_empty() && self.boot.len() <= 128
-            && !self.boot.chars().any(char::is_control) && self.active_slot <= 1
-            && !self.active_pack_id.is_empty() && self.active_pack_id.len() <= 64
-            && self.active_pack_id.bytes().all(|b| b.is_ascii_graphic())
+            && !self.boot.chars().any(char::is_control)
+            && self.active_slot.map_or(self.active_pack_id.is_none(), |slot| slot < P4_APPEARANCE_SLOT_COUNT)
+            && self.active_pack_id.as_ref().map_or(true, |pack| !pack.is_empty() && pack.len() <= 64
+                && pack.bytes().all(|b| b.is_ascii_graphic()))
             && self.native_io_epoch != u32::MAX
             && self.serialized && self.quiescent && self.busy_flags.len() == BUSY_FIELDS.len()
             && BUSY_FIELDS.iter().all(|key| self.busy_flags.get(*key) == Some(&false))
@@ -74,21 +77,19 @@ fn parse_observation(ack: &serde_json::Value, nonce: &str, board: &str, generati
     {
         busy_flags.insert(key.to_owned(), ack.get(key).and_then(serde_json::Value::as_bool).ok_or(UNPROVEN)?);
     }
-    let active = ack["activeSlot"].as_u64().filter(|n| *n <= 1).ok_or(UNPROVEN)? as u32;
-    let slots = ack["slots"].as_array().filter(|rows| rows.len() == 2).ok_or(UNPROVEN)?;
-    let mut seen = HashSet::new();
+    // Firmware omits the key when no slot is active; a present value must be exact.
+    let active = match ack.get("activeSlot") {
+        None => None,
+        Some(slot) => Some(slot.as_u64().filter(|n| *n < u64::from(P4_APPEARANCE_SLOT_COUNT)).ok_or(UNPROVEN)? as u32),
+    };
     let mut pack = None;
-    for slot in slots {
-        let number = slot["slot"].as_u64().filter(|n| *n <= 1).ok_or(UNPROVEN)? as u32;
-        if !seen.insert(number) { return Err(UNPROVEN.into()); }
-        let valid = slot["valid"].as_bool().ok_or(UNPROVEN)?;
-        if number == active {
-            if !valid { return Err(UNPROVEN.into()); }
-            pack = Some(slot["packId"].as_str().ok_or(UNPROVEN)?.to_owned());
-        }
+    for (number, valid, row) in p4_slot_proof_rows(ack).ok_or(UNPROVEN)? {
+        if Some(number) != active { continue; }
+        if valid { pack = Some(row["packId"].as_str().ok_or(UNPROVEN)?.to_owned()); }
+        else if row.get("packId").is_some() { return Err(UNPROVEN.into()); }
     }
     let observation = Observation { schema: SCHEMA.into(), query_nonce: nonce.into(), board: board.into(),
-        generation, boot: boot.into(), active_slot: active, active_pack_id: pack.ok_or(UNPROVEN)?,
+        generation, boot: boot.into(), active_slot: active, active_pack_id: pack,
         native_io_epoch: ack["nativeIoEpoch"].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(UNPROVEN)?,
         serialized: true, quiescent,
         busy_flags };
@@ -235,8 +236,8 @@ mod appearance_query_contract_tests {
                 "ok" => {
                     let proof = parsed.unwrap_or_else(|error| panic!("{name}: {error}"));
                     assert!(proof.valid(), "{name}");
-                    assert_eq!(proof.active_slot, 0, "{name}");
-                    assert_eq!(proof.active_pack_id, "a".repeat(64), "{name}");
+                    assert_eq!(proof.active_slot, vector["expectActiveSlot"].as_u64().map(|n| n as u32), "{name}");
+                    assert_eq!(proof.active_pack_id.as_deref(), vector["expectActivePackId"].as_str(), "{name}");
                 }
                 expected => {
                     // No NACK, busy or malformed response can return an
