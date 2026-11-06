@@ -7813,11 +7813,15 @@ fn build_agent_focus_payload(agent_id: &str, label: &str, index: u32, count: u32
 
 /// Tell the board which Agent it shows and how many are followed. With two or more, joystick
 /// left/right switch Agents; `hint` asks for the short on-screen label after a switch. `agent/focus`
-/// is accepted over Wi-Fi as well. A board other than the connected one is ignored.
+/// is accepted over Wi-Fi as well. A board other than the connected one is ignored. The followed
+/// Agents are authorized first, so the label never appears before that Agent's content can follow.
 #[tauri::command]
 async fn usb_send_agent_focus(
     usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
     board_device_id: String,
+    expected_connection_id: String,
+    expected_boot_id: String,
+    follow_agent_ids: Vec<String>,
     agent_id: String,
     label: String,
     index: u32,
@@ -7828,6 +7832,7 @@ async fn usb_send_agent_focus(
     if !status.connected || status.board_device_id != board_device_id {
         return Ok(());
     }
+    usb_manager.enroll_follow_agents(&board_device_id, &expected_connection_id, &expected_boot_id, &follow_agent_ids)?;
     usb_manager.send_to_board(
         &board_device_id,
         "agent/focus",

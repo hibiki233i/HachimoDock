@@ -1130,6 +1130,8 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     enabled: isP4Runtime && Boolean(usb.connected),
     invoke,
     boardDeviceId: p4TargetBoardDeviceId,
+    connectionId: usb.connectionId,
+    bootId: usb.bootId || usb.capabilities?.debugBootId || "",
     followAgentIds,
     focusAgentId: selectedAgentId,
     agentOptions,

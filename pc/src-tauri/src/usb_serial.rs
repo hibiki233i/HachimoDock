@@ -1731,6 +1731,7 @@ pub struct UsbSerialManager {
     // Exact-generation validated HELLO retained across a busy writer lock.
     pending_hello: Arc<Mutex<Option<(u64, serde_json::Value)>>>,
     follow_scope: Arc<Mutex<Option<UsbFollowScope>>>,
+    follow_enrollment: Arc<Mutex<Option<UsbFollowEnrollment>>>,
     desktop_device_id: Arc<Mutex<String>>,
     connect_guard: Arc<Mutex<()>>,
     // Logical physical-frame reservation. Raw-ready may release connection/gate
@@ -1762,8 +1763,17 @@ struct UsbFollowScope {
     generation: u64,
     board: String,
     agent: String,
-    session: Option<String>,
+    // Agents followed alongside `agent`, announced on this same connection.
+    enrolled: HashSet<String>,
+    // The session each Agent last published; its other sessions are stale.
+    sessions: HashMap<String, String>,
     submitted: bool,
+}
+// Kept apart from the scope because the desktop can announce before the first binding.
+struct UsbFollowEnrollment {
+    generation: u64,
+    board: String,
+    agents: HashSet<String>,
 }
 impl UsbFollowScope {
     fn allows(&self, topic: &str, payload: &serde_json::Value) -> bool {
@@ -1774,14 +1784,12 @@ impl UsbFollowScope {
         } else if topic == "speech/text" {
             payload["source"].as_str().or_else(|| payload["agentId"].as_str())
         } else { return true; };
-        if !self.submitted || source.and_then(crate::normalize_agent_id).as_deref() != Some(self.agent.as_str()) {
+        let Some(source) = source.and_then(crate::normalize_agent_id) else { return false; };
+        if !self.submitted || (source != self.agent && !self.enrolled.contains(&source)) {
             return false;
         }
         if topic == "session/current" { return true; }
-        if let Some(session) = self.session.as_deref() {
-            return payload["sessionId"].as_str() == Some(session);
-        }
-        true
+        self.sessions.get(&source).is_none_or(|session| payload["sessionId"].as_str() == Some(session))
     }
 }
 
@@ -2152,6 +2160,7 @@ impl UsbSerialManager {
             status_snapshot: Arc::new(Mutex::new(disconnected_usb_status())),
             pending_hello: Arc::new(Mutex::new(None)),
             follow_scope: Arc::new(Mutex::new(None)),
+            follow_enrollment: Arc::new(Mutex::new(None)),
             desktop_device_id: Arc::new(Mutex::new(String::new())),
             connect_guard: Arc::new(Mutex::new(())),
             wire_guard: Arc::new(Mutex::new(())),
@@ -3075,17 +3084,45 @@ impl UsbSerialManager {
             .is_none_or(|scope| scope.allows("session/current", &serde_json::json!({"agentId":agent})))
     }
 
+    fn follow_connection_current(
+        &self, conn: &UsbConnection, board: &str, expected_connection: &str, expected_boot: &str,
+    ) -> bool {
+        conn.connected && !conn.cancel_reader.load(Ordering::Acquire)
+            && self.inbound_owner.is_current(conn.connection_id)
+            && conn.board_device_id == board
+            && (expected_connection.is_empty() || expected_connection == conn.connection_id.to_string())
+            && (expected_boot.is_empty() || conn.capabilities["debugBootId"].as_str() == Some(expected_boot))
+    }
+
+    // The explicit binding names one primary Agent. The user can follow more
+    // alongside it, so they are authorized here rather than rebound. This is
+    // tied to one connection: a queued announcement cannot open a later one.
+    pub(crate) fn enroll_follow_agents(
+        &self, board: &str, expected_connection: &str, expected_boot: &str, agents: &[String],
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().map_err(|_| "session connection unavailable")?;
+        let conn = connection.as_mut().ok_or("Not connected")?;
+        self.refresh_pending_hello(conn);
+        if expected_connection.is_empty()
+            || !self.follow_connection_current(conn, board, expected_connection, expected_boot)
+        { return Err("USB follow scope changed; agents not enrolled".into()); }
+        let agents: HashSet<String> = agents.iter().filter_map(|agent| crate::normalize_agent_id(agent)).collect();
+        let mut scope = self.follow_scope.lock().map_err(|_| "follow scope unavailable")?;
+        if let Some(scope) = scope.as_mut().filter(|s| s.generation == conn.connection_id && s.board == board) {
+            scope.enrolled = agents.clone();
+        }
+        *self.follow_enrollment.lock().map_err(|_| "follow scope unavailable")? =
+            Some(UsbFollowEnrollment { generation: conn.connection_id, board: board.to_owned(), agents });
+        Ok(())
+    }
+
     pub(crate) fn check_session_follow_target(
         &self, board: &str, agent: &str, expected_connection: &str, expected_boot: &str,
     ) -> Result<u64, String> {
         let mut connection = self.connection.lock().map_err(|_| "session connection unavailable")?;
         let conn = connection.as_mut().ok_or("Not connected")?;
         self.refresh_pending_hello(conn);
-        if !conn.connected || conn.cancel_reader.load(Ordering::Acquire)
-            || !self.inbound_owner.is_current(conn.connection_id)
-            || conn.board_device_id != board
-            || (!expected_connection.is_empty() && expected_connection != conn.connection_id.to_string())
-            || (!expected_boot.is_empty() && conn.capabilities["debugBootId"].as_str() != Some(expected_boot))
+        if !self.follow_connection_current(conn, board, expected_connection, expected_boot)
         { return Err("USB session scope changed; binding not committed".into()); }
         let scope = self.follow_scope.lock().map_err(|_| "follow scope unavailable")?;
         if scope.as_ref().filter(|scope| scope.generation == conn.connection_id && scope.board == board)
@@ -3238,8 +3275,11 @@ impl UsbSerialManager {
             if let Some(agent) = &next_follow {
                 // A failed/unknown binding write leaves status forwarding closed;
                 // only a new explicit binding submission can reopen it.
+                let enrolled = self.follow_enrollment.lock().map_err(|_| "follow scope unavailable")?.as_ref()
+                    .filter(|e| e.generation == conn.connection_id && e.board == conn.board_device_id)
+                    .map(|e| e.agents.clone()).unwrap_or_default();
                 *scope = Some(UsbFollowScope { generation: conn.connection_id, board: conn.board_device_id.clone(),
-                    agent: agent.clone(), session: None, submitted: false });
+                    agent: agent.clone(), enrolled, sessions: HashMap::new(), submitted: false });
             } else if scope.as_ref().is_some_and(|s| !s.allows(topic, payload)) {
                 return Err("stale follow agent/session; state not submitted".into());
             }
@@ -3406,7 +3446,12 @@ impl UsbSerialManager {
             if let Some(scope) = scope.as_mut().filter(|s| s.generation == conn.connection_id && s.board == conn.board_device_id) {
                 if next_follow.is_some() { scope.submitted = true; }
                 if topic == "session/current" {
-                    scope.session = payload["sessionId"].as_str().filter(|id| !id.is_empty() && *id != "auto").map(str::to_owned);
+                    if let Some(agent) = payload["agentId"].as_str().and_then(crate::normalize_agent_id) {
+                        match payload["sessionId"].as_str().filter(|id| !id.is_empty() && *id != "auto") {
+                            Some(session) => { scope.sessions.insert(agent, session.to_owned()); }
+                            None => { scope.sessions.remove(&agent); }
+                        }
+                    }
                 }
             }
         }
@@ -8737,7 +8782,8 @@ manager.activate_memory_test_connection();
 manager.activate_memory_test_connection();
         { let _lease = manager.inbound_owner.lock().unwrap(); manager.inbound_owner.publish(1); }
         *manager.follow_scope.lock().unwrap() = Some(UsbFollowScope {
-            generation: 1, board: "p4-test".into(), agent: "codex".into(), session: None, submitted: true,
+            generation: 1, board: "p4-test".into(), agent: "codex".into(),
+            enrolled: HashSet::new(), sessions: HashMap::new(), submitted: true,
         });
         assert!(manager.check_session_follow_target("p4-test", "workbuddy", "1", "0123456789abcdef").is_err());
         assert!(!manager.session_follow_target_is_current("p4-test", "1", "workbuddy"));

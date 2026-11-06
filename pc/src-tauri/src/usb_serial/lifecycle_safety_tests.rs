@@ -559,3 +559,85 @@ fn audio_only_proof_accepts_every_device_slot_and_needs_an_active_pack(){
         assert!(error.contains("audio-only current slot unavailable"),"{name}: {error}");
     }
 }
+
+const BOOT:&str="0123456789abcdef";
+struct TopicWriter {pending:Vec<u8>,topics:Arc<Mutex<Vec<String>>>}
+impl Write for TopicWriter {
+    fn write(&mut self,bytes:&[u8])->io::Result<usize>{
+        self.pending.extend_from_slice(bytes);
+        while let Some(end)=self.pending.iter().position(|b|*b==b'\n') {
+            let line=self.pending.drain(..=end).collect::<Vec<_>>();
+            let start=line.iter().position(|b|*b==b'{').unwrap();
+            let request:Value=serde_json::from_slice(&line[start..]).unwrap();
+            self.topics.lock().unwrap().push(request["topic"].as_str().unwrap().to_owned());
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self)->io::Result<()>{Ok(())}
+}
+fn follow_connection(manager:&UsbSerialManager,generation:u64)->Arc<Mutex<Vec<String>>>{
+    let topics=Arc::new(Mutex::new(vec![]));
+    let mut c=connection(manager,BOARD,generation,Mode::Ack,Arc::new(Mutex::new(vec![])),Arc::new(AtomicUsize::new(0)));
+    c.writer=Box::new(TopicWriter{pending:vec![],topics:topics.clone()});
+    {let _owner=manager.inbound_owner.lock().unwrap();*manager.connection.lock().unwrap()=Some(c);manager.inbound_owner.publish(generation);}
+    topics
+}
+fn bind_primary(manager:&UsbSerialManager,generation:u64,agent:&str){
+    manager.send_follow_change_for_connection(BOARD,generation,"control/remote-cli-binding",
+        &json!({"enabled":true,"targetSource":agent,"targetDeviceId":"desktop"})).unwrap();
+}
+fn followed(agents:&[&str])->Vec<String>{agents.iter().map(|agent|agent.to_string()).collect()}
+#[test]
+fn enrolled_agent_content_reaches_the_device_and_outsiders_stay_stale(){
+    let manager=UsbSerialManager::new();let topics=follow_connection(&manager,1);bind_primary(&manager,1,"codex");
+    assert!(manager.check_session_follow_target(BOARD,"claude-code","1",BOOT).is_err());
+    assert!(!manager.session_follow_target_is_current(BOARD,"1","claude-code"));
+    manager.enroll_follow_agents(BOARD,"1",BOOT,&followed(&["codex","claude-code"])).unwrap();
+    assert_eq!(manager.check_session_follow_target(BOARD,"claude-code","1",BOOT),Ok(1));
+    assert!(manager.session_follow_target_is_current(BOARD,"1","claude-code"));
+    for (topic,payload) in [("state/claude-code",json!({"state":"working"})),("state/active",json!({"source":"claude-code"})),
+        ("session/current",json!({"agentId":"claude-code","sessionId":"claude-session"})),
+        ("speech/text",json!({"source":"claude-code","sessionId":"claude-session","text":"hi"}))] {
+        manager.send(topic,&payload).unwrap_or_else(|error|panic!("{topic}: {error}"));
+    }
+    assert_eq!(manager.check_session_follow_target(BOARD,"codex","1",BOOT),Ok(1));
+    assert!(manager.check_session_follow_target(BOARD,"workbuddy","1",BOOT).is_err());
+    let sent=topics.lock().unwrap().len();
+    assert!(manager.send("state/workbuddy",&json!({"state":"working"})).is_err());
+    assert_eq!(topics.lock().unwrap().len(),sent,"an outsider never reaches the wire");
+}
+#[test]
+fn stale_announcements_cannot_enroll_an_agent(){
+    let manager=UsbSerialManager::new();let _topics=follow_connection(&manager,1);bind_primary(&manager,1,"codex");
+    let agents=followed(&["codex","claude-code"]);
+    for (board,connection,boot) in [(BOARD,"2",BOOT),(BOARD,"",BOOT),(BOARD,"1","ffffffffffffffff"),("other-board","1",BOOT)] {
+        assert!(manager.enroll_follow_agents(board,connection,boot,&agents).is_err(),"{board} {connection} {boot}");
+        assert!(manager.check_session_follow_target(BOARD,"claude-code","1",BOOT).is_err());
+    }
+}
+#[test]
+fn enrollment_survives_rebinding_but_never_a_new_connection(){
+    let manager=UsbSerialManager::new();let _topics=follow_connection(&manager,1);
+    // The desktop can announce before the first binding of a connection.
+    manager.enroll_follow_agents(BOARD,"1",BOOT,&followed(&["codex","claude-code"])).unwrap();
+    bind_primary(&manager,1,"codex");
+    assert_eq!(manager.check_session_follow_target(BOARD,"claude-code","1",BOOT),Ok(1));
+    bind_primary(&manager,1,"codex");
+    assert_eq!(manager.check_session_follow_target(BOARD,"claude-code","1",BOOT),Ok(1));
+    let _topics=follow_connection(&manager,2);bind_primary(&manager,2,"codex");
+    assert!(manager.check_session_follow_target(BOARD,"claude-code","2",BOOT).is_err());
+    assert_eq!(manager.check_session_follow_target(BOARD,"codex","2",BOOT),Ok(2));
+}
+#[test]
+fn each_followed_agent_keeps_its_own_session_binding(){
+    let manager=UsbSerialManager::new();let _topics=follow_connection(&manager,1);bind_primary(&manager,1,"codex");
+    manager.enroll_follow_agents(BOARD,"1",BOOT,&followed(&["codex","claude-code"])).unwrap();
+    manager.send("session/current",&json!({"agentId":"codex","sessionId":"codex-session"})).unwrap();
+    manager.send("session/current",&json!({"agentId":"claude-code","sessionId":"claude-session"})).unwrap();
+    manager.send("state/codex",&json!({"sessionId":"codex-session"})).unwrap();
+    manager.send("state/claude-code",&json!({"sessionId":"claude-session"})).unwrap();
+    assert!(manager.send("state/codex",&json!({"sessionId":"old-codex-session"})).is_err());
+    assert!(manager.send("state/claude-code",&json!({"sessionId":"codex-session"})).is_err());
+    manager.send("session/current",&json!({"agentId":"claude-code","sessionId":"auto"})).unwrap();
+    manager.send("state/claude-code",&json!({"sessionId":"any-session"})).unwrap();
+}

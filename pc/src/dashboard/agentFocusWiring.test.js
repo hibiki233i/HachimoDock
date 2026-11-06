@@ -68,6 +68,10 @@ test("joystick Agent keys step the focus and the board is told what it shows", (
   assert.match(dashboard, /useAgentFocusAnnouncer\(\{[\s\S]*focusAgentId: selectedAgentId/);
   assert.match(switchEvents, /agentSwitchDirection\(event\?\.payload, boardDeviceId\)/);
   assert.match(announcer, /invoke\("usb_send_agent_focus"/);
+  assert.match(dashboard, /useAgentFocusAnnouncer\(\{[\s\S]*connectionId: usb\.connectionId[\s\S]*bootId: usb\.bootId/);
+  assert.match(announcer, /expectedConnectionId: connectionId[\s\S]*expectedBootId: bootId[\s\S]*followAgentIds/);
+  assert.match(announcer, /\[enabled, boardDeviceId, connectionId, bootId, focusAgentId, followKey\]/);
+  assert.match(rust, /usb_manager\.enroll_follow_agents\([\s\S]*"agent\/focus"/);
   assert.match(announcer, /const switched = lastRef\.current\.board === boardDeviceId/);
   assert.match(rust, /async fn usb_send_agent_focus\(/);
   assert.match(rust, /^\s+usb_send_agent_focus,$/m);
