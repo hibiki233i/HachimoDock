@@ -33,7 +33,8 @@ jobs:
       - run: npm run build:web
         working-directory: pc
   firmware-host:
-    runs-on: ubuntu-latest
+    # The WASM toolchain below ships with this image; ubuntu-latest varies per repository.
+    runs-on: ubuntu-26.04
     env:
       CLANG: clang-20
     steps:

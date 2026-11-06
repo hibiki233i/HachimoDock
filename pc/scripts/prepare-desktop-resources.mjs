@@ -353,7 +353,7 @@ function readFirmwareBuildId(firmware, version) {
   return readNullTerminatedUtf8(firmware.subarray(offset, offset + 128));
 }
 
-function validateBundledP4Firmware(target, firmwareName, expectedMin, expectedMax) {
+function validateBundledP4Firmware(target, firmwareName, expectedMin, expectedMax, pinnedVersion = "") {
   const bundledP4Firmware = join(bundledP4FirmwareDir, firmwareName);
   if (!existsSync(bundledP4Firmware)) {
     throw new Error(`缺少 PC 内置 P4 固件：${bundledP4Firmware}`);
@@ -375,7 +375,7 @@ function validateBundledP4Firmware(target, firmwareName, expectedMin, expectedMa
   const projectName = readNullTerminatedUtf8(firmware.subarray(descriptorOffset + 48, descriptorOffset + 80));
   const cmake = readFileSync(p4ProjectCmake, "utf8");
   const sourceVersion = cmake.match(/set\(PROJECT_VER\s+"([^"]+)"\)/)?.[1] || "";
-  const expectedVersion = sourceVersion;
+  const expectedVersion = pinnedVersion || sourceVersion;
   if (projectName !== "pet_manager_p4_runtime") {
     throw new Error(`PC 内置固件 projectName 异常：${projectName || "(empty)"}`);
   }
@@ -415,8 +415,9 @@ const voiceRuntime = prepareVoiceRuntime({tauriRoot,target,arch:targetArch});
 if(voiceRuntime.enabled)console.log("Explicit legacy voice bundle requires --config src-tauri/tauri.voice-legacy.conf.json");
 const runtimeName = target === "windows" ? "node.exe" : "node";
 const targetRuntime = join(generatedRuntime, runtimeName);
-const p4Firmware = validateBundledP4Firmware(target, "firmware.bin", 1, 199);
-validateBundledP4Firmware(target, "firmware-v3.bin", 300, 399);
+// Only v3 is built, so the v1 image stays at its last release as a validation resource.
+validateBundledP4Firmware(target, "firmware.bin", 1, 199, "0.7.104-p4");
+const p4Firmware = validateBundledP4Firmware(target, "firmware-v3.bin", 300, 399);
 let sourceRuntime = process.env.PET_MANAGER_NODE_BIN
   ? resolve(process.env.PET_MANAGER_NODE_BIN)
   : process.execPath;
