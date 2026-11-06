@@ -621,7 +621,8 @@ encrypted**: use trusted networks.
 
 **Line limit.** A Wi-Fi line may hold at most 16,383 bytes. A longer line is answered once with
 `protocol/error {ok:false, error:"line_too_long"}` and discarded through its newline: its tail is never
-parsed as a command. A client that attaches starts with an empty line buffer.
+parsed as a command. A client that attaches starts with an empty line buffer. The desktop applies
+the same limit to handshake lines, the longest of which is the Wi-Fi `hello`.
 
 **Allowed topics.** Desktop to board: `ack, bind, system/heartbeat, speech/text, session/current,
 agent/focus, control/screen-page, stats/update, runtime/stats, asset/activate, asset/slot-query, state/*,
