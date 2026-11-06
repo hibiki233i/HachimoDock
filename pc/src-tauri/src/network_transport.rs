@@ -31,7 +31,9 @@ pub const USB_PRIORITY_MESSAGE: &str =
 
 const SECRET_BYTES: usize = 32;
 const NONCE_BYTES: usize = 16;
-const HANDSHAKE_LINE_MAX: usize = 8192;
+// The protocol's Wi-Fi line limit. The board's hello is the longest handshake line and grows
+// with its capabilities, so this must never sit below what the wire allows.
+const HANDSHAKE_LINE_MAX: usize = 16_383;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const REGISTRY_FILE: &str = "network-devices.json";
@@ -701,6 +703,11 @@ mod tests {
 
     /// Minimal board: the same HMAC contract the firmware implements.
     fn spawn_board(board: &'static str, secret: String, hello_board: &'static str) -> (SocketAddr, thread::JoinHandle<Vec<String>>) {
+        spawn_board_with_hello_line(board, secret, hello_board, 0)
+    }
+
+    /// `line_bytes` pads the hello to that exact wire length; 0 keeps it minimal.
+    fn spawn_board_with_hello_line(board: &'static str, secret: String, hello_board: &'static str, line_bytes: usize) -> (SocketAddr, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
@@ -719,9 +726,12 @@ mod tests {
             write_json_line(&mut stream, "net/auth_ok", json!({"proof": server_proof(&secret, board, device_nonce, &client_nonce)})).unwrap();
             let Ok((_, bind)) = read_topic(&mut stream, deadline, &["bind"]) else { return seen };
             seen.push(format!("bind:{}", payload_str(&bind, "desktopDeviceId")));
-            write_json_line(&mut stream, "hello", json!({"boardDeviceId": hello_board, "runtime": "esp-p4"})).unwrap();
+            let mut hello = json!({"boardDeviceId": hello_board, "runtime": "esp-p4", "pad": ""});
+            let bare = json!({"topic": "hello", "payload": hello}).to_string().len();
+            hello["pad"] = json!("x".repeat(line_bytes.saturating_sub(bare)));
+            let _ = write_json_line(&mut stream, "hello", hello);
             // Bytes sent right after the handshake must survive for the buffered reader.
-            stream.write_all(b"{\"topic\":\"input/event\",\"payload\":{}}\n").unwrap();
+            let _ = stream.write_all(b"{\"topic\":\"input/event\",\"payload\":{}}\n");
             thread::sleep(Duration::from_millis(200));
             seen
         });
@@ -742,6 +752,23 @@ mod tests {
         }
         assert!(rest.contains("input/event"));
         assert_eq!(board.join().unwrap(), vec!["net/auth", "bind:desk-1"]);
+    }
+
+    #[test]
+    fn handshake_accepts_a_hello_up_to_the_protocol_line_limit() {
+        let secret = generate_secret();
+        let (addr, board) = spawn_board_with_hello_line("p4-aa", secret.clone(), "p4-aa", 16_383);
+        let link = connect_authenticated(addr, &secret, "desk-1", "p4-aa").unwrap();
+        assert_eq!(link.hello["boardDeviceId"], "p4-aa");
+        assert_eq!(board.join().unwrap(), vec!["net/auth", "bind:desk-1"]);
+    }
+
+    #[test]
+    fn handshake_refuses_a_line_beyond_the_protocol_limit() {
+        let secret = generate_secret();
+        let (addr, _board) = spawn_board_with_hello_line("p4-aa", secret.clone(), "p4-aa", 16_384);
+        let error = connect_authenticated(addr, &secret, "desk-1", "p4-aa").err().unwrap();
+        assert_eq!(error, "WiFi 握手消息过长");
     }
 
     #[test]
