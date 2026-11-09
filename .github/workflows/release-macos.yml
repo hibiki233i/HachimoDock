@@ -1,0 +1,95 @@
+name: macOS release
+# release/** branches build an installable App as a workflow artifact.
+# A v* tag also creates a draft GitHub release; publishing it stays a manual step.
+on:
+  push:
+    branches: ['release/**']
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  NODE_RUNTIME_VERSION: '26.7.0'
+  # FFmpeg, its license files and its source are not in git. This release carries the reviewed set.
+  RUNTIME_SOURCE_RELEASE: v0.1.169
+  RUNTIME_SOURCE_DMG: HachimiDock_0.1.169_macOS-arm64.dmg
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: pc/package-lock.json
+      - name: Tag matches the client version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(node -p "require('./pc/src-tauri/tauri.conf.json').version")
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Fetch the official Node runtime
+        # prepare-desktop-resources.mjs also rejects any binary outside its license-reviewed hash list.
+        run: |
+          name="node-v$NODE_RUNTIME_VERSION-darwin-arm64"
+          dir="$RUNNER_TEMP/node-runtime"
+          mkdir -p "$dir"
+          cd "$dir"
+          curl -fsSLO "https://nodejs.org/dist/v$NODE_RUNTIME_VERSION/$name.tar.gz"
+          curl -fsSLO "https://nodejs.org/dist/v$NODE_RUNTIME_VERSION/SHASUMS256.txt"
+          grep " $name.tar.gz\$" SHASUMS256.txt | shasum -a 256 -c -
+          tar xzf "$name.tar.gz" "$name/bin/node"
+          echo "PET_MANAGER_NODE_BIN=$dir/$name/bin/node" >> "$GITHUB_ENV"
+      - name: Fetch the reviewed FFmpeg set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dir="$RUNNER_TEMP/ffmpeg-runtime"
+          mkdir -p "$dir"
+          cd "$dir"
+          gh release download "$RUNTIME_SOURCE_RELEASE" -R "$GITHUB_REPOSITORY" -p "$RUNTIME_SOURCE_DMG" -p SHA256SUMS.txt
+          grep " $RUNTIME_SOURCE_DMG\$" SHA256SUMS.txt | shasum -a 256 -c -
+          hdiutil attach -nobrowse -readonly "$RUNTIME_SOURCE_DMG" -mountpoint "$dir/mnt"
+          tools="$dir/mnt/HachimiDock.app/Contents/Resources/tools"
+          cp "$tools/ffmpeg" "$tools/ffmpeg.README" "$tools/ffmpeg.LICENSE" "$tools/source/ffmpeg-8.1.2.tar.xz" "$dir/"
+          hdiutil detach "$dir/mnt"
+          {
+            echo "PET_MANAGER_FFMPEG_BIN=$dir/ffmpeg"
+            echo "PET_MANAGER_FFMPEG_README=$dir/ffmpeg.README"
+            echo "PET_MANAGER_FFMPEG_LICENSE=$dir/ffmpeg.LICENSE"
+            echo "PET_MANAGER_FFMPEG_SOURCE_ARCHIVE=$dir/ffmpeg-8.1.2.tar.xz"
+          } >> "$GITHUB_ENV"
+      - run: npm ci
+        working-directory: pc
+      - run: npm ci --omit=dev --ignore-scripts
+        working-directory: pc/src-tauri/bridge/packages/clawd-backend-service
+      - run: npm run build:mac:local
+        working-directory: pc
+      - name: Collect the installer
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          mv pc/src-tauri/target/release/bundle/dmg/*.dmg "$RUNNER_TEMP/out/"
+          cd "$RUNNER_TEMP/out"
+          shasum -a 256 *.dmg | tee SHA256SUMS.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hachimidock-macos-arm64
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          compression-level: 0
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hachimidock-macos-arm64
+          path: out
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/* -R "$GITHUB_REPOSITORY" --draft --verify-tag --title "HachimiDock ${GITHUB_REF_NAME#v}"
