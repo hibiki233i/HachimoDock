@@ -403,6 +403,21 @@ static esp_err_t apply_station_config(void) {
   return err;
 }
 
+/* The board only answers: clients reach it by sending first. In modem sleep the AP buffers that
+ * downlink until the radio wakes for it, and a radio that stops waking leaves a client's SYN
+ * waiting for the board's next transmit, past the client's connect timeout. The board runs on USB
+ * power, so it stays awake. A coprocessor that refuses behaves as before and Wi-Fi still starts.
+ * Do not read the mode back: this host's esp_wifi_get_ps dereferences a NULL response when the
+ * coprocessor stays silent, as the C6 here does for RPCs it lacks; esp_wifi_set_ps does not. */
+static void keep_radio_awake(void) {
+  esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "radio power save off");
+  } else {
+    ESP_LOGW(TAG, "radio power save stays on: %s", esp_err_to_name(err));
+  }
+}
+
 static esp_err_t stack_bring_up(void) {
   esp_err_t err = ESP_FAIL;
   for (int attempt = 0; attempt < PET_P4_NET_HOSTED_ATTEMPTS; ++attempt) {
@@ -433,6 +448,7 @@ static esp_err_t stack_bring_up(void) {
   if (err != ESP_OK) return err;
   err = esp_wifi_start();
   if (err != ESP_OK) return err;
+  keep_radio_awake();
   esp_hosted_coprocessor_fwver_t version = {0};
   if (esp_hosted_get_coprocessor_fwversion(&version) == 0) {
     lock();
