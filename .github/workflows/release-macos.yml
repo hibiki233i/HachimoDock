@@ -9,7 +9,9 @@ on:
 permissions:
   contents: read
 env:
-  NODE_RUNTIME_VERSION: '26.7.0'
+  # The reviewed macOS arm64 hash and license text in dependency-license-resources.mjs are this official
+  # build's, even though that list and license file are labeled 26.7.0.
+  NODE_RUNTIME_VERSION: '22.22.0'
   # FFmpeg, its license files and its source are not in git. This release carries the reviewed set.
   RUNTIME_SOURCE_RELEASE: v0.1.169
   RUNTIME_SOURCE_DMG: HachimiDock_0.1.169_macOS-arm64.dmg
