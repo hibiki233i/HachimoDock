@@ -35,7 +35,7 @@ for(const id of config.components.ids) {
 assert.equal(report.components.length,config.components.ids.length);
 assert.deepEqual(report.components.slice(-3).map(x=>x.id),['decision-capsule','answer-book','hope-train']);
 report.petuiFiles=exactTree(join(pc,'skills/petui'),join(resources,'skills/petui'));
-for(const [name,version] of [['firmware.bin','0.7.104-p4'],['firmware-v3.bin','0.7.105-p4']]) {
+for(const [name,version] of [['firmware.bin','0.7.104-p4'],['firmware-v3.bin','0.7.106-p4']]) {
   const bytes=readFileSync(join(resources,'firmware/esp32-p4',name));
   assert.equal(sha(bytes),sha(readFileSync(join(pc,'src-tauri/firmware/esp32-p4',name))));
   assert.ok(bytes.includes(Buffer.from(version)));
