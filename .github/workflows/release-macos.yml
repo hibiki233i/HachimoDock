@@ -63,6 +63,11 @@ jobs:
             echo "PET_MANAGER_FFMPEG_LICENSE=$dir/ffmpeg.LICENSE"
             echo "PET_MANAGER_FFMPEG_SOURCE_ARCHIVE=$dir/ffmpeg-8.1.2.tar.xz"
           } >> "$GITHUB_ENV"
+      - name: Install the build-time FFmpeg
+        # Encodes the built-in device assets with libx264. It is not shipped; the App carries the LGPL set above.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: brew install ffmpeg
       - run: npm ci
         working-directory: pc
       - run: npm ci --omit=dev --ignore-scripts
